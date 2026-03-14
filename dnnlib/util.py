@@ -57,6 +57,7 @@ class Logger(object):
 
     def __init__(self, file_name: Optional[str] = None, file_mode: str = "w", should_flush: bool = True):
         self.file = None
+        self._stdout_disabled = False
 
         if file_name is not None:
             self.file = open(file_name, file_mode)
@@ -84,7 +85,18 @@ class Logger(object):
         if self.file is not None:
             self.file.write(text)
 
-        self.stdout.write(text)
+        if not self._stdout_disabled:
+            try:
+                self.stdout.write(text)
+            except OSError as err:
+                # Prevent training from crashing if Slurm stdout/stderr hits quota
+                # (common on small HOME partitions). Keep writing to run_dir log file.
+                if err.errno in (28, 122):
+                    self._stdout_disabled = True
+                    if self.file is not None:
+                        self.file.write(f"\n[Logger WARN] Disabled stdout mirroring after write failure: {err}\n")
+                else:
+                    raise
 
         if self.should_flush:
             self.flush()
@@ -94,7 +106,17 @@ class Logger(object):
         if self.file is not None:
             self.file.flush()
 
-        self.stdout.flush()
+        if not self._stdout_disabled:
+            try:
+                self.stdout.flush()
+            except OSError as err:
+                if err.errno in (28, 122):
+                    self._stdout_disabled = True
+                    if self.file is not None:
+                        self.file.write(f"\n[Logger WARN] Disabled stdout mirroring after flush failure: {err}\n")
+                        self.file.flush()
+                else:
+                    raise
 
     def close(self) -> None:
         """Flush, close possible files, and remove stdout/stderr mirroring."""

@@ -29,10 +29,10 @@ class EDMLossAdv:
                  P_mean=-1.2,
                  P_std=1.2,
                  sigma_data=0.5,
-                 adv_steps=2,        
-                 adv_step_size=0.1,  
+                 adv_steps=2,
+                 adv_step_size=0.1,
                  adv_eps=None,
-                 adv_mix=0.5,        
+                 adv_mix=0.5,
                  ):
         self.P_mean = P_mean
         self.P_std = P_std
@@ -50,7 +50,7 @@ class EDMLossAdv:
         n = torch.randn_like(y) * sigma
         base_noisy = y + n
 
-        
+
         batch_size = images.shape[0]
         delta = torch.zeros_like(base_noisy, requires_grad=True)
 
@@ -75,7 +75,7 @@ class EDMLossAdv:
                 delta = delta.clamp(-self.adv_eps, self.adv_eps)
 
             delta = delta.detach()
-        
+
         D_clean = net(base_noisy, sigma, labels, augment_labels=augment_labels)
         loss_clean = weight * ((D_clean - y) ** 2)
 

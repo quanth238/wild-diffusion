@@ -1,16 +1,26 @@
-import os
-import time
 import copy
 import json
+import os
 import pickle
-import psutil
+import time
+
+import dnnlib
 import numpy as np
 import torch
-import dnnlib
-from torch_utils import distributed as dist
-from torch_utils import training_stats
-from torch_utils import misc
 import torch.distributed as dist_torch
+from torch_utils import distributed as dist
+from torch_utils import misc
+from torch_utils import training_stats
+
+from training.wdro_utils import (
+    _delta_to_bw_uint8,
+    _images_to_uint8,
+    _run_quick_eval,
+    _safe_cpu_mem_gb,
+    _save_image_grid,
+    _save_individual_images,
+    _save_triplet_rows_grid,
+)
 
 #----------------------------------------------------------------------------
 
@@ -37,8 +47,22 @@ def training_loop(
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
+    wdro_warmup_ratio   = 0.4,      # WDRO warmup ratio Sw/S.
+    wdro_m_epochs       = 100,      # WDRO refresh interval in epochs.
+    wdro_k              = 2,        # WDRO inner ascent steps.
+    wdro_step_size      = 1e-3,     # WDRO inner ascent step size.
+    wdro_gamma          = 1.0,      # WDRO penalty coefficient.
+    wdro_p_adv          = 0.3,      # Probability of generating adversarial batch.
+    debug_eval_enable   = False,    # Run quick eval at init and each WDRO interval.
+    debug_eval_init     = True,     # Run quick eval before main training iterations.
+    debug_eval_num_images = 512,    # Number of generated images for quick FID.
+    debug_eval_steps    = 18,       # Sampling steps for quick eval generation.
+    debug_eval_batch_size = 64,     # Batch size for quick eval generation/FID.
+    debug_eval_num_visual = 32,     # Number of sample images to save per quick eval.
+    debug_eval_ref_path = None,     # Optional local .npz for reference stats.
+    debug_adv_num_visual = 16,      # Number of adversarial/raw debug images per WDRO refresh.
     device              = torch.device('cuda'),
-):  
+):
     # Initialize.
     start_time = time.time()
     np.random.seed((seed * dist.get_world_size() + dist.get_rank()) % (1 << 31))
@@ -107,7 +131,10 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
+        resume_next_wdro_kimg = int(data['next_wdro_kimg']) if 'next_wdro_kimg' in data else None
         del data # conserve memory
+    else:
+        resume_next_wdro_kimg = None
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
@@ -119,20 +146,62 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    debug_eval_state = dict(
+        detector_net=None,
+        mu_ref=None,
+        sigma_ref=None,
+        seed_base=int(seed),
+        num_workers=int(data_loader_kwargs.get('num_workers', 2)),
+        prefetch_factor=int(data_loader_kwargs.get('prefetch_factor', 2)),
+    )
 
-    # wdro_start_kimg = 50                 
-    wdro_start_kimg = int(0.4*total_kimg)         
+    wdro_start_kimg = int(wdro_warmup_ratio * total_kimg)
     if run_dir is None:
         run_dir = '.'
     wdro_dataset_path = os.path.join(run_dir, 'combined_dataset.pt')
     dist.print0(f"[WDRO] cur_path={wdro_dataset_path}, starting WDRO augmentation...")
 
-
-    wdro_interval_kimg = int(100*len(dataset_obj)/1000)  
-    next_wdro_kimg = wdro_start_kimg
+    wdro_interval_kimg = max(int(wdro_m_epochs * len(dataset_obj) / 1000), 1)
+    if resume_next_wdro_kimg is not None:
+        # Prefer exact scheduler state from checkpoint when available.
+        next_wdro_kimg = max(resume_next_wdro_kimg, wdro_start_kimg)
+    elif cur_nimg >= wdro_start_kimg * 1000:
+        # On resume from older checkpoints, skip already-passed WDRO intervals
+        # to avoid expensive "catch-up" refreshes every single step.
+        cur_kimg = cur_nimg // 1000
+        passed_intervals = max((cur_kimg - wdro_start_kimg) // wdro_interval_kimg, 0)
+        next_wdro_kimg = wdro_start_kimg + (passed_intervals + 1) * wdro_interval_kimg
+    else:
+        next_wdro_kimg = wdro_start_kimg
     n = len(dataset_obj)
     p_now = 0.12 if n >= 40000 else (0.15 if n >= 20000 else 0.18)
     augment_pipe.p = p_now
+    dist.print0(f"[WDRO] schedule start/interval/next (kimg): {wdro_start_kimg}/{wdro_interval_kimg}/{next_wdro_kimg}")
+    if debug_eval_enable:
+        dist.print0(f"[QuickEval] enabled. init={debug_eval_init}, num={debug_eval_num_images}, steps={debug_eval_steps}, batch={debug_eval_batch_size}, visual={debug_eval_num_visual}, adv_visual={debug_adv_num_visual}")
+
+    if debug_eval_enable and debug_eval_init:
+        if dist.get_world_size() > 1 and dist.get_rank() != 0:
+            dist_torch.barrier()
+        if dist.get_rank() == 0:
+            try:
+                _run_quick_eval(
+                    ema=ema,
+                    run_dir=run_dir,
+                    dataset_path=dataset_kwargs['path'],
+                    cur_nimg=cur_nimg,
+                    device=device,
+                    state=debug_eval_state,
+                    num_images=debug_eval_num_images,
+                    num_steps=debug_eval_steps,
+                    batch_size=debug_eval_batch_size,
+                    num_visual=debug_eval_num_visual,
+                    ref_path=debug_eval_ref_path,
+                )
+            except Exception as err:
+                dist.print0(f"[QuickEval][WARN] init evaluation failed: {err}")
+        if dist.get_world_size() > 1:
+            dist_torch.barrier()
 
     while True:
         if cur_nimg >= next_wdro_kimg * 1000:
@@ -151,14 +220,30 @@ def training_loop(
                     dataset_obj, batch_size=batch_gpu, shuffle=False, **data_loader_kwargs
                 )
                 all_images, all_labels = [], []
+                adv_debug_orig = []
+                adv_debug_adv = []
+                adv_debug_left = max(int(debug_adv_num_visual), 0)
 
                 net.eval()
-                p_adv = 0.3
                 for images, labels in raw_loader:
                     images = images.to(device).to(torch.float32) / 127.5 - 1
                     labels = labels.to(device)
-                    if torch.rand(1).item() < p_adv:
-                        adv_images = wdro_attack(images, labels, model=net, loss_fn=loss_fn, augment_pipe=augment_pipe)
+                    if wdro_p_adv >= 1.0 or torch.rand(1).item() < wdro_p_adv:
+                        adv_images = wdro_attack(
+                            images,
+                            labels,
+                            model=net,
+                            loss_fn=loss_fn,
+                            augment_pipe=augment_pipe,
+                            gamma=wdro_gamma,
+                            alpha=wdro_step_size,
+                            iters=wdro_k,
+                        )
+                        if adv_debug_left > 0:
+                            take = min(adv_debug_left, images.shape[0])
+                            adv_debug_orig.append(images[:take].detach().cpu())
+                            adv_debug_adv.append(adv_images[:take].detach().cpu())
+                            adv_debug_left -= take
                         all_images.append(adv_images.cpu())
                         all_labels.append(labels.cpu())
                     all_images.append(images.cpu())
@@ -171,6 +256,45 @@ def training_loop(
 
                 torch.save((combined_images, combined_labels), wdro_dataset_path)
                 dist.print0(f"[WDRO] Augmented dataset saved to {wdro_dataset_path}")
+
+                if len(adv_debug_orig) > 0 and len(adv_debug_adv) > 0:
+                    adv_orig = torch.cat(adv_debug_orig, dim=0)
+                    adv_gen = torch.cat(adv_debug_adv, dim=0)
+                    orig_u8 = _images_to_uint8(adv_orig)
+                    adv_u8 = _images_to_uint8(adv_gen)
+                    delta_u8 = _delta_to_bw_uint8(adv_orig, adv_gen)
+                    adv_dir = os.path.join(run_dir, 'quick_eval', 'adv_debug', f'kimg-{cur_nimg // 1000:06d}')
+                    _save_image_grid(orig_u8, os.path.join(adv_dir, 'orig_grid.png'), ncols=8)
+                    _save_image_grid(adv_u8, os.path.join(adv_dir, 'adv_grid.png'), ncols=8)
+                    _save_image_grid(delta_u8, os.path.join(adv_dir, 'delta_grid.png'), ncols=8)
+                    _save_triplet_rows_grid(
+                        orig_u8,
+                        adv_u8,
+                        delta_u8,
+                        os.path.join(adv_dir, 'triplet_grid_3row.png'),
+                        max_cols=8,
+                    )
+                    _save_individual_images(orig_u8, os.path.join(adv_dir, 'orig_images'), prefix='orig')
+                    _save_individual_images(adv_u8, os.path.join(adv_dir, 'adv_images'), prefix='adv')
+                    dist.print0(f"[QuickEval] Saved adversarial debug visuals to {adv_dir}")
+
+                if debug_eval_enable:
+                    try:
+                        _run_quick_eval(
+                            ema=ema,
+                            run_dir=run_dir,
+                            dataset_path=dataset_kwargs['path'],
+                            cur_nimg=cur_nimg,
+                            device=device,
+                            state=debug_eval_state,
+                            num_images=debug_eval_num_images,
+                            num_steps=debug_eval_steps,
+                            batch_size=debug_eval_batch_size,
+                            num_visual=debug_eval_num_visual,
+                            ref_path=debug_eval_ref_path,
+                        )
+                    except Exception as err:
+                        dist.print0(f"[QuickEval][WARN] interval evaluation failed at kimg={cur_nimg // 1000}: {err}")
                 net.train()
 
             dist_torch.barrier()
@@ -183,14 +307,19 @@ def training_loop(
                 loss_fn=loss_fn
             )
 
-            next_wdro_kimg += wdro_interval_kimg  
+            next_wdro_kimg += wdro_interval_kimg
 
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
-                images = images.to(device).to(torch.float32) 
+                # Raw dataset batches are uint8 [0,255], while WDRO combined batches are
+                # already float in [-1,1]. Normalize only raw uint8 to avoid scale mismatch.
+                if images.dtype == torch.uint8:
+                    images = images.to(device).to(torch.float32) / 127.5 - 1
+                else:
+                    images = images.to(device).to(torch.float32)
                 labels = labels.to(device)
                 loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
                 training_stats.report('Loss/loss', loss)
@@ -227,7 +356,7 @@ def training_loop(
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
         fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
-        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
+        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', _safe_cpu_mem_gb()):<6.2f}"]
         fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
         fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
         torch.cuda.reset_peak_memory_stats()
@@ -255,7 +384,14 @@ def training_loop(
 
         # Save full dump of the training state.
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            torch.save(
+                dict(
+                    net=net,
+                    optimizer_state=optimizer.state_dict(),
+                    next_wdro_kimg=next_wdro_kimg,
+                ),
+                os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt')
+            )
 
         # Update logs.
         training_stats.default_collector.update()
@@ -299,7 +435,7 @@ def wdro_attack(
 ):
     x_adv = images.detach().clone().requires_grad_(True)
 
-    model.eval()                          
+    model.eval()
     for _ in range(iters):
         with torch.enable_grad():
             loss_cls = loss_fn(net=model,
@@ -307,11 +443,12 @@ def wdro_attack(
                                labels=labels,
                                augment_pipe=augment_pipe)
 
-            C = (x_adv - images).view(images.size(0), -1).norm(p=2, dim=1).mean()
+            delta = (x_adv - images).view(images.size(0), -1)
+            C = 0.5 * (delta.pow(2).sum(dim=1)).mean()
             loss = loss_cls.mean() - gamma * C
         grad = torch.autograd.grad(loss, x_adv)[0]
         x_adv = x_adv + alpha * grad
-        x_adv = torch.clamp(x_adv, *clamp)            
+        x_adv = torch.clamp(x_adv, *clamp)
         x_adv = x_adv.detach().requires_grad_(True)
 
     return x_adv.detach()

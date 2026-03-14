@@ -31,11 +31,19 @@ def calculate_inception_stats(
     # Load Inception-v3 model.
     # This is a direct PyTorch translation of http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
     dist.print0('Loading Inception-v3 model...')
+    detector_path = os.environ.get('FID_DETECTOR_PATH', '').strip()
     detector_url = 'https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/metrics/inception-2015-12-05.pkl'
     detector_kwargs = dict(return_features=True)
     feature_dim = 2048
-    with dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
-        detector_net = pickle.load(f).to(device)
+    if detector_path:
+        if not os.path.isfile(detector_path):
+            raise click.ClickException(f'FID_DETECTOR_PATH does not exist: {detector_path}')
+        dist.print0(f'Using local detector from FID_DETECTOR_PATH="{detector_path}"')
+        with open(detector_path, 'rb') as f:
+            detector_net = pickle.load(f).to(device)
+    else:
+        with dnnlib.util.open_url(detector_url, verbose=(dist.get_rank() == 0)) as f:
+            detector_net = pickle.load(f).to(device)
 
     # List images.
     dist.print0(f'Loading images from "{image_path}"...')

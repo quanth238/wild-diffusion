@@ -37,6 +37,20 @@ def parse_int_list(s):
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm',       type=click.Choice(['wdroedm', 'advedm']), default='wdroedm', show_default=True)
+@click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
+@click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
+@click.option('--wdro-k',        help='WDRO inner ascent steps (K)', metavar='INT',                    type=click.IntRange(min=1), default=2, show_default=True)
+@click.option('--wdro-step-size',help='WDRO inner ascent step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=1e-3, show_default=True)
+@click.option('--wdro-gamma',    help='WDRO penalty gamma', metavar='FLOAT',                           type=click.FloatRange(min=0), default=1.0, show_default=True)
+@click.option('--wdro-p-adv',    help='Probability of generating adversarial batch', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.3, show_default=True)
+@click.option('--debug-eval',    help='Run quick debug evaluation at init and each WDRO interval', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--debug-eval-init', help='Run quick debug evaluation at training start', metavar='BOOL', type=bool, default=True, show_default=True)
+@click.option('--debug-eval-num', help='Number of generated images for quick FID', metavar='INT', type=click.IntRange(min=2), default=512, show_default=True)
+@click.option('--debug-eval-steps', help='Sampling steps for quick eval generation', metavar='INT', type=click.IntRange(min=1), default=18, show_default=True)
+@click.option('--debug-eval-batch', help='Batch size for quick eval generation/FID', metavar='INT', type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--debug-eval-visual', help='Number of generated preview images to save each eval', metavar='INT', type=click.IntRange(min=1), default=32, show_default=True)
+@click.option('--debug-eval-ref', help='Optional local .npz file for reference FID stats', metavar='NPZ', type=str, default='')
+@click.option('--debug-adv-visual', help='Number of adversarial/raw debug images to save per WDRO refresh', metavar='INT', type=click.IntRange(min=0), default=16, show_default=True)
 
 # Hyperparameters.
 @click.option('--duration',      help='Training duration', metavar='MIMG',                          type=click.FloatRange(min=0, min_open=True), default=200, show_default=True)
@@ -140,6 +154,22 @@ def main(**kwargs):
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
+    c.update(
+        wdro_warmup_ratio=opts.wdro_warmup_ratio,
+        wdro_m_epochs=opts.wdro_m_epochs,
+        wdro_k=opts.wdro_k,
+        wdro_step_size=opts.wdro_step_size,
+        wdro_gamma=opts.wdro_gamma,
+        wdro_p_adv=opts.wdro_p_adv,
+        debug_eval_enable=opts.debug_eval,
+        debug_eval_init=opts.debug_eval_init,
+        debug_eval_num_images=opts.debug_eval_num,
+        debug_eval_steps=opts.debug_eval_steps,
+        debug_eval_batch_size=opts.debug_eval_batch,
+        debug_eval_num_visual=opts.debug_eval_visual,
+        debug_eval_ref_path=(opts.debug_eval_ref if opts.debug_eval_ref else None),
+        debug_adv_num_visual=opts.debug_adv_visual,
+    )
 
     # Random seed.
     if opts.seed is not None:
@@ -195,6 +225,14 @@ def main(**kwargs):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
+    dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
+    dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
+    dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
+    dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
+    if c.debug_eval_enable:
+        dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
+        dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
+        dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
