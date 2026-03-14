@@ -34,6 +34,7 @@ ARCH="${ARCH:-ddpmpp}"
 PRECOND="${PRECOND:-wdroedm}"
 FP16="${FP16:-1}"
 RESUME="${RESUME:-}"
+TRANSFER_PKL="${TRANSFER_PKL:-}"
 WDRO_WARMUP_RATIO="${WDRO_WARMUP_RATIO:-0.2}"
 WDRO_M_EPOCHS="${WDRO_M_EPOCHS:-20}"
 WDRO_K="${WDRO_K:-5}"
@@ -48,6 +49,7 @@ DEBUG_EVAL_BATCH="${DEBUG_EVAL_BATCH:-64}"
 DEBUG_EVAL_VISUAL="${DEBUG_EVAL_VISUAL:-32}"
 DEBUG_EVAL_REF="${DEBUG_EVAL_REF:-}"
 DEBUG_ADV_VISUAL="${DEBUG_ADV_VISUAL:-16}"
+SEED="${SEED:-}"
 # Limited-data setting: use only 20% of CIFAR-10 by default (10,000 images).
 CIFAR_TRAIN_PERCENT="${CIFAR_TRAIN_PERCENT:-20}"  # 1..100
 CIFAR_TRAIN_SEED="${CIFAR_TRAIN_SEED:-0}"
@@ -63,6 +65,10 @@ CIFAR_DOWNLOAD_RETRIES="${CIFAR_DOWNLOAD_RETRIES:-3}"
 CIFAR_DOWNLOAD_TIMEOUT="${CIFAR_DOWNLOAD_TIMEOUT:-30}"  # seconds
 
 if [[ -n "${RESUME}" ]]; then
+  if [[ -n "${TRANSFER_PKL}" ]]; then
+    echo "[ERROR] RESUME and TRANSFER_PKL cannot be set at the same time."
+    exit 1
+  fi
   if [[ ! -f "${RESUME}" ]]; then
     echo "[ERROR] RESUME file not found: ${RESUME}"
     exit 1
@@ -76,6 +82,16 @@ if [[ -n "${RESUME}" ]]; then
   echo "       ${OUTDIR}"
 fi
 
+if [[ -n "${TRANSFER_PKL}" ]]; then
+  if [[ "${TRANSFER_PKL}" != http://* && "${TRANSFER_PKL}" != https://* ]]; then
+    if [[ ! -f "${TRANSFER_PKL}" ]]; then
+      echo "[ERROR] TRANSFER_PKL file not found: ${TRANSFER_PKL}"
+      exit 1
+    fi
+  fi
+  echo "[INFO] Transfer mode enabled from: ${TRANSFER_PKL}"
+fi
+
 python - <<PY
 try:
     pct = int("${CIFAR_TRAIN_PERCENT}")
@@ -87,6 +103,11 @@ try:
     int("${CIFAR_TRAIN_SEED}")
 except Exception:
     raise SystemExit("[ERROR] CIFAR_TRAIN_SEED must be an integer.")
+if "${SEED}":
+    try:
+        int("${SEED}")
+    except Exception:
+        raise SystemExit("[ERROR] SEED must be an integer when provided.")
 PY
 
 if [[ -z "${TRAIN_CIFAR_DIR}" ]]; then
@@ -404,8 +425,16 @@ if [[ -n "${RESUME}" ]]; then
   train_cmd+=("--resume=${RESUME}")
 fi
 
+if [[ -n "${TRANSFER_PKL}" ]]; then
+  train_cmd+=("--transfer=${TRANSFER_PKL}")
+fi
+
 if [[ -n "${BATCH_GPU}" ]]; then
   train_cmd+=("--batch-gpu=${BATCH_GPU}")
+fi
+
+if [[ -n "${SEED}" ]]; then
+  train_cmd+=("--seed=${SEED}")
 fi
 
 exec "${train_cmd[@]}"
