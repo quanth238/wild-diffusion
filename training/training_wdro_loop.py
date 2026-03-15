@@ -53,6 +53,10 @@ def training_loop(
     wdro_step_size      = 1e-3,     # WDRO inner ascent step size.
     wdro_gamma          = 1.0,      # WDRO penalty coefficient.
     wdro_p_adv          = 0.3,      # Probability of generating adversarial batch.
+    wdro_attack_mode    = 'single', # WDRO attack mode: single or casual.
+    wdro_m_times        = 4,        # Number of attacked timesteps per sample (casual mode).
+    wdro_time_bins      = 40,       # Number of discretized timestep bins (casual mode).
+    wdro_time_chunk     = 1,        # Number of attacked timesteps processed together.
     debug_eval_enable   = False,    # Run quick eval at init and each WDRO interval.
     debug_eval_init     = True,     # Run quick eval before main training iterations.
     debug_eval_num_images = 512,    # Number of generated images for quick FID.
@@ -71,6 +75,17 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
+    wdro_attack_mode = str(wdro_attack_mode).lower()
+    if wdro_attack_mode == 'causal':
+        wdro_attack_mode = 'casual'
+    if wdro_attack_mode not in ['single', 'casual']:
+        raise ValueError(f'Unsupported wdro_attack_mode="{wdro_attack_mode}". Expected one of: single, casual.')
+    wdro_m_times = int(max(wdro_m_times, 1))
+    wdro_time_bins = int(max(wdro_time_bins, 2))
+    wdro_time_chunk = int(max(wdro_time_chunk, 1))
+    if wdro_attack_mode == 'casual' and wdro_m_times > wdro_time_bins:
+        raise ValueError(f'wdro_m_times ({wdro_m_times}) must be <= wdro_time_bins ({wdro_time_bins}).')
 
     # Select batch size per GPU.
     batch_gpu_total = batch_size // dist.get_world_size()
@@ -177,6 +192,7 @@ def training_loop(
     p_now = 0.12 if n >= 40000 else (0.15 if n >= 20000 else 0.18)
     augment_pipe.p = p_now
     dist.print0(f"[WDRO] schedule start/interval/next (kimg): {wdro_start_kimg}/{wdro_interval_kimg}/{next_wdro_kimg}")
+    dist.print0(f"[WDRO] attack mode={wdro_attack_mode}, m_times={wdro_m_times}, time_bins={wdro_time_bins}, time_chunk={wdro_time_chunk}")
     if debug_eval_enable:
         dist.print0(f"[QuickEval] enabled. init={debug_eval_init}, num={debug_eval_num_images}, steps={debug_eval_steps}, batch={debug_eval_batch_size}, visual={debug_eval_num_visual}, adv_visual={debug_adv_num_visual}")
 
@@ -223,29 +239,52 @@ def training_loop(
                 adv_debug_orig = []
                 adv_debug_adv = []
                 adv_debug_left = max(int(debug_adv_num_visual), 0)
+                refresh_t0 = time.time()
+                clean_count = 0
+                adv_count = 0
 
                 net.eval()
                 for images, labels in raw_loader:
                     images = images.to(device).to(torch.float32) / 127.5 - 1
                     labels = labels.to(device)
+                    clean_count += int(images.shape[0])
                     if wdro_p_adv >= 1.0 or torch.rand(1).item() < wdro_p_adv:
-                        adv_images = wdro_attack(
-                            images,
-                            labels,
-                            model=net,
-                            loss_fn=loss_fn,
-                            augment_pipe=augment_pipe,
-                            gamma=wdro_gamma,
-                            alpha=wdro_step_size,
-                            iters=wdro_k,
-                        )
+                        if wdro_attack_mode == 'casual':
+                            adv_image_list = wdro_attack_multitime(
+                                images,
+                                labels,
+                                model=net,
+                                loss_fn=loss_fn,
+                                augment_pipe=augment_pipe,
+                                gamma=wdro_gamma,
+                                alpha=wdro_step_size,
+                                iters=wdro_k,
+                                m_times=wdro_m_times,
+                                time_bins=wdro_time_bins,
+                                time_chunk=wdro_time_chunk,
+                            )
+                        else:
+                            adv_image_list = [wdro_attack(
+                                images,
+                                labels,
+                                model=net,
+                                loss_fn=loss_fn,
+                                augment_pipe=augment_pipe,
+                                gamma=wdro_gamma,
+                                alpha=wdro_step_size,
+                                iters=wdro_k,
+                            )]
+
                         if adv_debug_left > 0:
                             take = min(adv_debug_left, images.shape[0])
                             adv_debug_orig.append(images[:take].detach().cpu())
-                            adv_debug_adv.append(adv_images[:take].detach().cpu())
+                            adv_debug_adv.append(adv_image_list[0][:take].detach().cpu())
                             adv_debug_left -= take
-                        all_images.append(adv_images.cpu())
-                        all_labels.append(labels.cpu())
+
+                        for adv_images in adv_image_list:
+                            all_images.append(adv_images.cpu())
+                            all_labels.append(labels.cpu())
+                            adv_count += int(adv_images.shape[0])
                     all_images.append(images.cpu())
                     all_labels.append(labels.cpu())
 
@@ -256,6 +295,32 @@ def training_loop(
 
                 torch.save((combined_images, combined_labels), wdro_dataset_path)
                 dist.print0(f"[WDRO] Augmented dataset saved to {wdro_dataset_path}")
+                refresh_sec = time.time() - refresh_t0
+                total_count = int(combined_images.shape[0])
+                ratio = (adv_count / max(clean_count, 1))
+                dist.print0(
+                    f"[WDRO] refresh stats: mode={wdro_attack_mode} "
+                    f"clean={clean_count} adv={adv_count} total={total_count} "
+                    f"adv/clean={ratio:.3f} sec={refresh_sec:.2f}"
+                )
+                try:
+                    metrics = dict(
+                        kimg=int(cur_nimg // 1000),
+                        mode=wdro_attack_mode,
+                        m_times=int(wdro_m_times),
+                        time_bins=int(wdro_time_bins),
+                        time_chunk=int(wdro_time_chunk),
+                        clean_count=int(clean_count),
+                        adv_count=int(adv_count),
+                        total_count=int(total_count),
+                        adv_to_clean_ratio=float(ratio),
+                        refresh_sec=float(refresh_sec),
+                    )
+                    metrics_path = os.path.join(run_dir, "casual_refresh_metrics.jsonl")
+                    with open(metrics_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(metrics) + "\\n")
+                except Exception as err:
+                    dist.print0(f"[WDRO][WARN] failed to write refresh metrics: {err}")
 
                 if len(adv_debug_orig) > 0 and len(adv_debug_adv) > 0:
                     adv_orig = torch.cat(adv_debug_orig, dim=0)
@@ -428,6 +493,106 @@ def switch_to_wdro_dataset(wdro_dataset_path, batch_size, data_loader_kwargs, de
         **data_loader_kwargs
     )
     return iter(dataloader)
+
+def _build_edm_sigma_grid(device, time_bins, sigma_min=0.002, sigma_max=80.0, rho=7.0):
+    steps = int(max(time_bins, 2))
+    idx = torch.arange(steps, device=device, dtype=torch.float32)
+    t_steps = (sigma_max ** (1 / rho) + idx / (steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+    return t_steps
+
+def _sample_distinct_time_indices(batch_size, m_times, time_bins, device):
+    if m_times > time_bins:
+        raise ValueError(f'm_times ({m_times}) must be <= time_bins ({time_bins})')
+    # Uniform-without-replacement per sample.
+    rand = torch.rand(batch_size, time_bins, device=device)
+    return rand.argsort(dim=1)[:, :m_times]
+
+def wdro_attack_fixed_sigma(
+    images, labels, model, loss_fn, augment_pipe,
+    *, sigma_values, gamma=1.0, alpha=1e-3, iters=2, clamp=(-1, 1)
+):
+    sigma_values = torch.as_tensor(sigma_values, device=images.device, dtype=torch.float32).reshape(-1)
+    if sigma_values.shape[0] != images.shape[0]:
+        raise ValueError(f"sigma_values batch ({sigma_values.shape[0]}) must match images batch ({images.shape[0]}).")
+
+    x_adv = images.detach().clone().requires_grad_(True)
+    fixed_noise = torch.randn_like(images) * sigma_values.reshape(-1, 1, 1, 1)
+
+    model.eval()
+    for _ in range(iters):
+        with torch.enable_grad():
+            loss_cls = loss_fn(
+                net=model,
+                images=x_adv,
+                labels=labels,
+                augment_pipe=augment_pipe,
+                sigma_override=sigma_values,
+                noise_override=fixed_noise,
+            )
+            delta = (x_adv - images).view(images.size(0), -1)
+            C = 0.5 * (delta.pow(2).sum(dim=1)).mean()
+            loss = loss_cls.mean() - gamma * C
+        grad = torch.autograd.grad(loss, x_adv)[0]
+        x_adv = x_adv + alpha * grad
+        x_adv = torch.clamp(x_adv, *clamp)
+        x_adv = x_adv.detach().requires_grad_(True)
+
+    return x_adv.detach()
+
+def wdro_attack_multitime(
+    images, labels, model, loss_fn, augment_pipe,
+    *, gamma=1.0, alpha=1e-3, iters=2, m_times=4, time_bins=40, time_chunk=1,
+    clamp=(-1, 1), sigma_min=0.002, sigma_max=80.0, rho=7.0
+):
+    batch_size = images.shape[0]
+    m_times = int(max(m_times, 1))
+    time_chunk = int(max(time_chunk, 1))
+    if m_times > time_bins:
+        raise ValueError(f'm_times ({m_times}) must be <= time_bins ({time_bins})')
+
+    sigma_grid = _build_edm_sigma_grid(
+        device=images.device,
+        time_bins=time_bins,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+        rho=rho,
+    )
+    time_idx = _sample_distinct_time_indices(
+        batch_size=batch_size,
+        m_times=m_times,
+        time_bins=time_bins,
+        device=images.device,
+    )
+    selected_sigmas = sigma_grid[time_idx]  # [B, M]
+
+    adv_image_list = []
+    for start in range(0, m_times, time_chunk):
+        end = min(start + time_chunk, m_times)
+        chunk = selected_sigmas[:, start:end]  # [B, Mc]
+        mc = chunk.shape[1]
+
+        # Repeat by timestep-chunk block so (images, sigma) pairs stay aligned:
+        # [j0: all B samples], [j1: all B samples], ...
+        images_rep = images.repeat(mc, 1, 1, 1)
+        labels_rep = labels.repeat(mc, 1)
+        sigma_rep = chunk.transpose(0, 1).reshape(-1)
+        adv_rep = wdro_attack_fixed_sigma(
+            images_rep,
+            labels_rep,
+            model=model,
+            loss_fn=loss_fn,
+            augment_pipe=augment_pipe,
+            sigma_values=sigma_rep,
+            gamma=gamma,
+            alpha=alpha,
+            iters=iters,
+            clamp=clamp,
+        )
+        adv_chunk = adv_rep.reshape(mc, batch_size, *images.shape[1:])
+        for idx in range(mc):
+            adv_image_list.append(adv_chunk[idx])
+
+    return adv_image_list
 
 def wdro_attack(
     images, labels, model, loss_fn, augment_pipe,

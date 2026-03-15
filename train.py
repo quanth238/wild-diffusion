@@ -43,6 +43,10 @@ def parse_int_list(s):
 @click.option('--wdro-step-size',help='WDRO inner ascent step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=1e-3, show_default=True)
 @click.option('--wdro-gamma',    help='WDRO penalty gamma', metavar='FLOAT',                           type=click.FloatRange(min=0), default=1.0, show_default=True)
 @click.option('--wdro-p-adv',    help='Probability of generating adversarial batch', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.3, show_default=True)
+@click.option('--wdro-attack-mode', help='WDRO attack variant', metavar='single|casual|causal',       type=click.Choice(['single', 'casual', 'causal']), default='single', show_default=True)
+@click.option('--wdro-m-times',  help='Number of attacked timesteps per sample in casual mode', metavar='INT', type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--wdro-time-bins',help='Discrete timestep bins for casual mode', metavar='INT',         type=click.IntRange(min=2), default=40, show_default=True)
+@click.option('--wdro-time-chunk',help='Casual mode attacked timesteps processed together (OOM guard)', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
 @click.option('--debug-eval',    help='Run quick debug evaluation at init and each WDRO interval', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--debug-eval-init', help='Run quick debug evaluation at training start', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--debug-eval-num', help='Number of generated images for quick FID', metavar='INT', type=click.IntRange(min=2), default=512, show_default=True)
@@ -161,6 +165,10 @@ def main(**kwargs):
         wdro_step_size=opts.wdro_step_size,
         wdro_gamma=opts.wdro_gamma,
         wdro_p_adv=opts.wdro_p_adv,
+        wdro_attack_mode=('casual' if opts.wdro_attack_mode in ['casual', 'causal'] else 'single'),
+        wdro_m_times=opts.wdro_m_times,
+        wdro_time_bins=opts.wdro_time_bins,
+        wdro_time_chunk=opts.wdro_time_chunk,
         debug_eval_enable=opts.debug_eval,
         debug_eval_init=opts.debug_eval_init,
         debug_eval_num_images=opts.debug_eval_num,
@@ -228,6 +236,9 @@ def main(**kwargs):
     dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
     dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
     dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
+    dist.print0(f'WDRO attack mode:        {c.wdro_attack_mode}')
+    if c.wdro_attack_mode == 'casual':
+        dist.print0(f'WDRO casual M/T/chunk:   {c.wdro_m_times}/{c.wdro_time_bins}/{c.wdro_time_chunk}')
     dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
     if c.debug_eval_enable:
         dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
