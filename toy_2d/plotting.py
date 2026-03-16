@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def save_scatter_comparison(
+    *,
+    path: Path,
+    real_points: np.ndarray,
+    generated_points: np.ndarray,
+    title: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+    _scatter(axes[0], real_points, "Real data")
+    _scatter(axes[1], generated_points, "Generated samples")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_adversarial_debug(
+    *,
+    path: Path,
+    original_points: np.ndarray,
+    adversarial_points: np.ndarray,
+    title: str,
+    mean_l2_shift: float,
+    max_l2_shift: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4))
+    bounds = _shared_bounds(original_points, adversarial_points)
+    viz_scale = _compute_viz_scale(original_points, adversarial_points)
+    _scatter(axes[0], original_points, "Original points", color="#1f77b4", bounds=bounds)
+    _scatter(axes[1], adversarial_points, "Adversarial points", color="#d62728", bounds=bounds)
+    _scatter_overlay(axes[2], original_points, adversarial_points, bounds=bounds)
+    _scatter_amplified_overlay(
+        axes[3],
+        original_points,
+        adversarial_points,
+        viz_scale=viz_scale,
+    )
+    fig.suptitle(
+        f"{title} | mean L2 shift={mean_l2_shift:.4f}, max L2 shift={max_l2_shift:.4f}, viz x{viz_scale:.1f}"
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_training_curves(
+    *,
+    path: Path,
+    loss_history: list[float],
+    eval_history: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(loss_history, color="#1f77b4", linewidth=1.6)
+    axes[0].set_title("Training loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("EDM loss")
+    axes[0].grid(alpha=0.2)
+
+    if eval_history:
+        epochs = [item["epoch"] for item in eval_history]
+        mmd = [item["mmd_rbf"] for item in eval_history]
+        sw = [item["sliced_wasserstein"] for item in eval_history]
+        axes[1].plot(epochs, mmd, label="MMD", color="#2ca02c", linewidth=1.6)
+        axes[1].plot(epochs, sw, label="SWD", color="#ff7f0e", linewidth=1.6)
+        axes[1].legend(frameon=False)
+    axes[1].set_title("Eval metrics")
+    axes[1].set_xlabel("Epoch")
+    axes[1].grid(alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _shared_bounds(*arrays: np.ndarray) -> tuple[float, float, float, float]:
+    stacked = np.concatenate(arrays, axis=0)
+    x_min, y_min = stacked.min(axis=0)
+    x_max, y_max = stacked.max(axis=0)
+    pad_x = max(0.05 * (x_max - x_min), 0.1)
+    pad_y = max(0.05 * (y_max - y_min), 0.1)
+    return x_min - pad_x, x_max + pad_x, y_min - pad_y, y_max + pad_y
+
+
+def _scatter(
+    ax,
+    points: np.ndarray,
+    title: str,
+    color: str = "#1f77b4",
+    bounds: tuple[float, float, float, float] | None = None,
+) -> None:
+    ax.scatter(points[:, 0], points[:, 1], s=8, alpha=0.55, color=color, edgecolors="none")
+    ax.set_title(title)
+    ax.set_aspect("equal", adjustable="box")
+    if bounds is not None:
+        x_min, x_max, y_min, y_max = bounds
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    ax.grid(alpha=0.15)
+
+
+def _scatter_overlay(
+    ax,
+    original_points: np.ndarray,
+    adversarial_points: np.ndarray,
+    *,
+    bounds: tuple[float, float, float, float] | None = None,
+) -> None:
+    ax.scatter(original_points[:, 0], original_points[:, 1], s=8, alpha=0.35, color="#1f77b4", edgecolors="none", label="orig")
+    ax.scatter(adversarial_points[:, 0], adversarial_points[:, 1], s=8, alpha=0.35, color="#d62728", edgecolors="none", label="adv")
+
+    deltas = adversarial_points - original_points
+    n_show = min(64, original_points.shape[0])
+    if n_show > 0:
+        ax.quiver(
+            original_points[:n_show, 0],
+            original_points[:n_show, 1],
+            deltas[:n_show, 0],
+            deltas[:n_show, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.003,
+            alpha=0.65,
+            color="#2f2f2f",
+        )
+
+    ax.set_title("Overlay + displacement")
+    ax.set_aspect("equal", adjustable="box")
+    if bounds is not None:
+        x_min, x_max, y_min, y_max = bounds
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    ax.legend(frameon=False, loc="upper right")
+    ax.grid(alpha=0.15)
+
+
+def _scatter_amplified_overlay(
+    ax,
+    original_points: np.ndarray,
+    adversarial_points: np.ndarray,
+    *,
+    viz_scale: float,
+) -> None:
+    deltas = adversarial_points - original_points
+    amplified_points = original_points + viz_scale * deltas
+    bounds = _shared_bounds(original_points, amplified_points)
+
+    ax.scatter(original_points[:, 0], original_points[:, 1], s=8, alpha=0.35, color="#1f77b4", edgecolors="none", label="orig")
+    ax.scatter(amplified_points[:, 0], amplified_points[:, 1], s=8, alpha=0.35, color="#ff7f0e", edgecolors="none", label="adv x scale")
+
+    n_show = min(64, original_points.shape[0])
+    if n_show > 0:
+        scaled = viz_scale * deltas[:n_show]
+        ax.quiver(
+            original_points[:n_show, 0],
+            original_points[:n_show, 1],
+            scaled[:, 0],
+            scaled[:, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.003,
+            alpha=0.65,
+            color="#2f2f2f",
+        )
+
+    x_min, x_max, y_min, y_max = bounds
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.set_title(f"Amplified displacement x{viz_scale:.1f}")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(frameon=False, loc="upper right")
+    ax.grid(alpha=0.15)
+
+
+def _compute_viz_scale(original_points: np.ndarray, adversarial_points: np.ndarray) -> float:
+    deltas = adversarial_points - original_points
+    shift = np.linalg.norm(deltas, axis=1)
+    mean_shift = float(np.mean(shift)) if shift.size > 0 else 0.0
+    if mean_shift <= 1e-12:
+        return 1.0
+
+    x_min, x_max, y_min, y_max = _shared_bounds(original_points)
+    span = max(x_max - x_min, y_max - y_min)
+    target_shift = max(0.15 * span, 0.1)
+    viz_scale = target_shift / mean_shift
+    return float(np.clip(viz_scale, 1.0, 50.0))

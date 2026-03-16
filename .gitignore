@@ -124,3 +124,6 @@ ENV/
 env/
 env.bak/
 venv.bak/
+
+# Local toy experiment outputs
+toy-runs/
