@@ -87,6 +87,84 @@ def save_training_curves(
     plt.close(fig)
 
 
+def save_process_snapshots(
+    *,
+    path: Path,
+    rows: list[dict],
+    title: str,
+    bounds: tuple[float, float, float, float] | None = None,
+    bounds_mode: str = "global",
+) -> None:
+    if not rows:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    all_snapshots = [snapshot for row in rows for snapshot in row["snapshots"]]
+    n_rows = len(rows)
+    n_cols = max(len(row["snapshots"]) for row in rows)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.2 * n_cols, 3.2 * n_rows), squeeze=False)
+
+    global_bounds = bounds
+    column_bounds: list[tuple[float, float, float, float] | None] | None = None
+    if bounds_mode == "global":
+        if global_bounds is None:
+            global_bounds = _shared_bounds(*all_snapshots)
+    elif bounds_mode == "per_column":
+        column_bounds = []
+        for col_idx in range(n_cols):
+            column_snapshots = []
+            for row in rows:
+                if col_idx < len(row["snapshots"]):
+                    column_snapshots.append(row["snapshots"][col_idx])
+            column_bounds.append(_shared_bounds(*column_snapshots) if column_snapshots else None)
+    elif bounds_mode == "per_group_column":
+        grouped_bounds: dict[tuple[str, int], tuple[float, float, float, float] | None] = {}
+        groups = {str(row.get("bounds_group", row_idx)) for row_idx, row in enumerate(rows)}
+        for group in groups:
+            for col_idx in range(n_cols):
+                column_snapshots = []
+                for row_idx, row in enumerate(rows):
+                    row_group = str(row.get("bounds_group", row_idx))
+                    if row_group != group or col_idx >= len(row["snapshots"]):
+                        continue
+                    column_snapshots.append(row["snapshots"][col_idx])
+                grouped_bounds[(group, col_idx)] = _shared_bounds(*column_snapshots) if column_snapshots else None
+    elif bounds_mode != "per_panel":
+        raise ValueError(f"Unsupported bounds_mode: {bounds_mode}")
+
+    for row_idx, row in enumerate(rows):
+        color = row.get("color", "#1f77b4")
+        row_title = row.get("row_title")
+        snapshots = row["snapshots"]
+        subtitles = row["titles"]
+
+        for col_idx in range(n_cols):
+            ax = axes[row_idx, col_idx]
+            if col_idx >= len(snapshots):
+                ax.axis("off")
+                continue
+            panel_bounds = global_bounds
+            if bounds_mode == "per_column" and column_bounds is not None:
+                panel_bounds = column_bounds[col_idx]
+            elif bounds_mode == "per_group_column":
+                row_group = str(row.get("bounds_group", row_idx))
+                panel_bounds = grouped_bounds[(row_group, col_idx)]
+            elif bounds_mode == "per_panel":
+                panel_bounds = _shared_bounds(snapshots[col_idx])
+            _scatter(ax, snapshots[col_idx], subtitles[col_idx], color=color, bounds=panel_bounds)
+            if row_title is not None and col_idx == 0:
+                ax.set_ylabel(row_title)
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def compute_plot_bounds(*arrays: np.ndarray) -> tuple[float, float, float, float]:
+    return _shared_bounds(*arrays)
+
+
 def _shared_bounds(*arrays: np.ndarray) -> tuple[float, float, float, float]:
     stacked = np.concatenate(arrays, axis=0)
     x_min, y_min = stacked.min(axis=0)

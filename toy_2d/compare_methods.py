@@ -43,10 +43,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-p-adv", type=float, default=WDRO_CORE_DEFAULTS["p_adv"])
     parser.add_argument("--wdro-warmup-epochs", type=int, default=25)
     parser.add_argument("--wdro-refresh-every", type=int, default=10)
+    parser.add_argument("--causal-warmup-epochs", type=int, default=CAUSAL_WDRO_DEFAULTS["warmup_epochs"])
     parser.add_argument("--causal-path-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["path_steps"])
     parser.add_argument("--causal-inner-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["inner_steps"])
     parser.add_argument("--causal-step-size", type=float, default=CAUSAL_WDRO_DEFAULTS["step_size"])
     parser.add_argument("--causal-gamma", type=float, default=CAUSAL_WDRO_DEFAULTS["gamma"])
+    parser.add_argument("--causal-total-budget", type=float, default=CAUSAL_WDRO_DEFAULTS["total_budget"])
+    parser.add_argument(
+        "--causal-budget-mode",
+        type=str,
+        default=CAUSAL_WDRO_DEFAULTS["budget_mode"],
+        choices=("fixed", "match_wdro", "match_wdro_run"),
+    )
+    parser.add_argument(
+        "--causal-exact-budget-split",
+        action=argparse.BooleanOptionalAction,
+        default=CAUSAL_WDRO_DEFAULTS["exact_budget_split"],
+    )
     parser.add_argument(
         "--causal-sigma-schedule",
         type=str,
@@ -54,6 +67,9 @@ def parse_args() -> argparse.Namespace:
         choices=("edm_random", "edm_quantiles", "karras_grid"),
     )
     parser.add_argument("--sampler-steps", type=int, default=20)
+    parser.add_argument("--save-eval-checkpoints", action="store_true")
+    parser.add_argument("--figure-epoch-mode", type=str, default="last", choices=("best", "last", "fixed"))
+    parser.add_argument("--figure-fixed-epoch", type=int, default=None)
     return parser.parse_args()
 
 
@@ -64,14 +80,17 @@ def main() -> None:
     method_configs = load_method_configs(args.method_configs)
 
     jobs = build_jobs(args=args, root=root, method_configs=method_configs)
-    results = []
-    with futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        for item in executor.map(run_job, jobs):
-            results.append(item)
+    results = run_jobs(jobs=jobs, workers=args.workers)
 
     aggregate = aggregate_results(results=results, args=args, method_configs=method_configs)
     write_outputs(outdir=args.outdir, aggregate=aggregate)
-    export_figures(outdir=args.outdir, aggregate=aggregate, figure_seed=args.figure_seed)
+    export_figures(
+        outdir=args.outdir,
+        aggregate=aggregate,
+        figure_seed=args.figure_seed,
+        epoch_mode=args.figure_epoch_mode,
+        fixed_epoch=args.figure_fixed_epoch,
+    )
     if args.cleanup_runs:
         cleanup_run_dirs(outdir=args.outdir, datasets=args.datasets)
     print(json.dumps(aggregate["summary"], indent=2))
@@ -79,6 +98,12 @@ def main() -> None:
 
 def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str, dict]) -> list[dict]:
     jobs = []
+    wdro_reference_config = method_configs.get("wdro", {})
+    if any(
+        str(method_configs.get("causal_wdro", {}).get("causal_budget_mode", args.causal_budget_mode)) == "match_wdro_run"
+        for _ in [0]
+    ) and "wdro" not in args.methods:
+        raise ValueError("causal_budget_mode=match_wdro_run requires wdro to be included in --methods.")
     for dataset in args.datasets:
         for fraction in args.fractions:
             num_samples = max(64, int(round(args.full_samples * fraction)))
@@ -86,6 +111,12 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
             for method in args.methods:
                 method_config = method_configs.get(method, {})
                 for seed in args.seeds:
+                    requested_causal_budget_mode = str(
+                        get_config_value(method_config, "causal_budget_mode", args.causal_budget_mode)
+                    )
+                    resolved_causal_budget_mode = (
+                        "fixed" if requested_causal_budget_mode == "match_wdro_run" else requested_causal_budget_mode
+                    )
                     outdir = args.outdir / dataset / fraction_tag / method / f"seed{seed}"
                     command = [
                         sys.executable,
@@ -135,17 +166,46 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
                         str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
                         "--causal-path-steps",
                         str(get_config_value(method_config, "causal_path_steps", args.causal_path_steps)),
+                        "--causal-warmup-epochs",
+                        str(get_config_value(method_config, "causal_warmup_epochs", args.causal_warmup_epochs)),
                         "--causal-inner-steps",
                         str(get_config_value(method_config, "causal_inner_steps", args.causal_inner_steps)),
                         "--causal-step-size",
                         str(get_config_value(method_config, "causal_step_size", args.causal_step_size)),
                         "--causal-gamma",
                         str(get_config_value(method_config, "causal_gamma", args.causal_gamma)),
+                        "--causal-total-budget",
+                        str(get_config_value(method_config, "causal_total_budget", args.causal_total_budget)),
+                        "--causal-budget-mode",
+                        resolved_causal_budget_mode,
+                        "--causal-exact-budget-split"
+                        if bool(get_config_value(method_config, "causal_exact_budget_split", args.causal_exact_budget_split))
+                        else "--no-causal-exact-budget-split",
                         "--causal-sigma-schedule",
                         str(get_config_value(method_config, "causal_sigma_schedule", args.causal_sigma_schedule)),
+                        "--causal-reference-wdro-k",
+                        str(get_config_value(method_config, "causal_reference_wdro_k", get_config_value(wdro_reference_config, "wdro_k", args.wdro_k))),
+                        "--causal-reference-wdro-step-size",
+                        str(
+                            get_config_value(
+                                method_config,
+                                "causal_reference_wdro_step_size",
+                                get_config_value(wdro_reference_config, "wdro_step_size", args.wdro_step_size),
+                            )
+                        ),
+                        "--causal-reference-wdro-gamma",
+                        str(
+                            get_config_value(
+                                method_config,
+                                "causal_reference_wdro_gamma",
+                                get_config_value(wdro_reference_config, "wdro_gamma", args.wdro_gamma),
+                            )
+                        ),
                         "--sampler-steps",
                         str(get_config_value(method_config, "sampler_steps", args.sampler_steps)),
                     ]
+                    if args.save_eval_checkpoints:
+                        command.append("--save-eval-checkpoints")
                     jobs.append(
                         {
                             "root": root,
@@ -157,16 +217,50 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
                             "method": method,
                             "seed": seed,
                             "command": command,
+                            "requested_causal_budget_mode": requested_causal_budget_mode if method == "causal_wdro" else None,
+                            "reference_wdro_outdir": (
+                                args.outdir / dataset / fraction_tag / "wdro" / f"seed{seed}" if method == "causal_wdro" else None
+                            ),
                         }
                     )
     return jobs
 
 
+def run_jobs(*, jobs: list[dict], workers: int) -> list[dict]:
+    dependent_causal_jobs = [
+        job
+        for job in jobs
+        if job["method"] == "causal_wdro" and job.get("requested_causal_budget_mode") == "match_wdro_run"
+    ]
+    phase_one_jobs = [job for job in jobs if job not in dependent_causal_jobs]
+
+    results: list[dict] = []
+    if phase_one_jobs:
+        with futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for item in executor.map(run_job, phase_one_jobs):
+                results.append(item)
+    if dependent_causal_jobs:
+        with futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            for item in executor.map(run_job, dependent_causal_jobs):
+                results.append(item)
+    return results
+
+
 def run_job(job: dict) -> dict:
     summary_path = job["outdir"] / "summary.json"
     if not summary_path.is_file():
+        command = list(job["command"])
+        if job["method"] == "causal_wdro" and job.get("requested_causal_budget_mode") == "match_wdro_run":
+            ref_summary_path = Path(job["reference_wdro_outdir"]) / "summary.json"
+            if not ref_summary_path.is_file():
+                raise FileNotFoundError(f"Missing WDRO reference summary for causal budget match: {ref_summary_path}")
+            ref_summary = json.loads(ref_summary_path.read_text(encoding="utf-8"))
+            epsilon = ref_summary["last_eval"].get(
+                "total_transport_cost", ref_summary["last_eval"].get("mean_transport_cost", 0.0)
+            )
+            replace_command_arg(command, "--causal-total-budget", str(epsilon))
         subprocess.run(
-            job["command"],
+            command,
             cwd=job["root"],
             check=True,
             stdout=subprocess.DEVNULL,
@@ -182,6 +276,7 @@ def run_job(job: dict) -> dict:
         "seed": job["seed"],
         "best_swd": summary["best_sliced_wasserstein"],
         "best_epoch": summary.get("best_epoch"),
+        "last_epoch": summary["last_eval"]["epoch"],
         "last_swd": summary["last_eval"]["sliced_wasserstein"],
         "mmd": summary["last_eval"]["mmd_rbf"],
         "mean_transport_cost": summary["last_eval"].get("mean_transport_cost", 0.0),
@@ -189,6 +284,7 @@ def run_job(job: dict) -> dict:
         "total_transport_cost": summary["last_eval"].get(
             "total_transport_cost", summary["last_eval"].get("mean_transport_cost", 0.0)
         ),
+        "target_total_budget": summary["last_eval"].get("causal_target_total_budget"),
         "max_total_transport_cost": summary["last_eval"].get(
             "max_total_transport_cost", summary["last_eval"].get("max_transport_cost", 0.0)
         ),
@@ -219,6 +315,8 @@ def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_c
                 row[f"{method}_mean_transport_cost"] = mean(item["mean_transport_cost"] for item in method_rows)
                 row[f"{method}_max_transport_cost"] = mean(item["max_transport_cost"] for item in method_rows)
                 row[f"{method}_total_transport_cost"] = mean(item["total_transport_cost"] for item in method_rows)
+                target_budgets = [item["target_total_budget"] for item in method_rows if item["target_total_budget"] is not None]
+                row[f"{method}_target_total_budget"] = mean(target_budgets) if target_budgets else None
                 row[f"{method}_max_total_transport_cost"] = mean(
                     item["max_total_transport_cost"] for item in method_rows
                 )
@@ -244,6 +342,13 @@ def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_c
                     row[f"{method}_runtime_overhead_pct"] = percent_overhead(
                         baseline_runtime, row[f"{method}_runtime_min"]
                     )
+                if "wdro" in args.methods and "causal_wdro" in args.methods:
+                    wdro_cost = row["wdro_total_transport_cost"]
+                    causal_cost = row["causal_wdro_total_transport_cost"]
+                    causal_target = row["causal_wdro_target_total_budget"]
+                    row["causal_vs_wdro_total_cost_gap_pct"] = percent_overhead(wdro_cost, causal_cost)
+                    if causal_target is not None:
+                        row["causal_target_vs_wdro_gap_pct"] = percent_overhead(wdro_cost, causal_target)
 
             summary_rows.append(row)
 
@@ -273,11 +378,18 @@ def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_c
             "wdro_warmup_epochs": args.wdro_warmup_epochs,
             "wdro_refresh_every": args.wdro_refresh_every,
             "causal_path_steps": args.causal_path_steps,
+            "causal_warmup_epochs": args.causal_warmup_epochs,
             "causal_inner_steps": args.causal_inner_steps,
             "causal_step_size": args.causal_step_size,
             "causal_gamma": args.causal_gamma,
+            "causal_total_budget": args.causal_total_budget,
+            "causal_budget_mode": args.causal_budget_mode,
+            "causal_exact_budget_split": args.causal_exact_budget_split,
             "causal_sigma_schedule": args.causal_sigma_schedule,
             "sampler_steps": args.sampler_steps,
+            "save_eval_checkpoints": args.save_eval_checkpoints,
+            "figure_epoch_mode": args.figure_epoch_mode,
+            "figure_fixed_epoch": args.figure_fixed_epoch,
         },
         "runs": results,
         "summary": summary_rows,
@@ -298,6 +410,17 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     swd_header = ["Dataset", "Data"] + [f"{format_method_name(method)} SWD" for method in methods]
     swd_header += [f"{format_method_name(method)} Delta" for method in methods if method != "baseline"]
     lines = [
+        "## Last SWD",
+        "",
+        markdown_header(swd_header),
+    ]
+    for row in aggregate["summary"]:
+        cells = [row["dataset"], row["fraction_tag"]]
+        cells.extend(f"{row[f'{method}_last_swd']:.4f}" for method in methods)
+        cells.extend(f"{row[f'{method}_last_swd_delta_pct']:.2f}%" for method in methods if method != "baseline")
+        lines.append(markdown_row(cells))
+    lines += [
+        "",
         "## Best SWD",
         "",
         markdown_header(swd_header),
@@ -332,6 +455,37 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_total_transport_cost']:.4f}" for method in methods)
         lines.append(markdown_row(cells))
+    if "wdro" in methods and "causal_wdro" in methods:
+        lines += [
+            "",
+            "## Budget Match",
+            "",
+            markdown_header(
+                [
+                    "Dataset",
+                    "Data",
+                    "WDRO Cost",
+                    "Causal Target",
+                    "Causal Realized",
+                    "Target Gap",
+                    "Realized Gap",
+                ]
+            ),
+        ]
+        for row in aggregate["summary"]:
+            target_budget = row["causal_wdro_target_total_budget"]
+            cells = [
+                row["dataset"],
+                row["fraction_tag"],
+                f"{row['wdro_total_transport_cost']:.4f}",
+                "n/a" if target_budget is None else f"{target_budget:.4f}",
+                f"{row['causal_wdro_total_transport_cost']:.4f}",
+                "n/a"
+                if target_budget is None
+                else f"{row['causal_target_vs_wdro_gap_pct']:.2f}%",
+                f"{row['causal_vs_wdro_total_cost_gap_pct']:.2f}%",
+            ]
+            lines.append(markdown_row(cells))
     lines += [
         "",
         "## Mean Per-Step Transport Cost",
@@ -372,14 +526,21 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
             writer.writerow({key: row[key] for key in fieldnames})
 
 
-def export_figures(*, outdir: Path, aggregate: dict, figure_seed: int) -> None:
+def export_figures(
+    *,
+    outdir: Path,
+    aggregate: dict,
+    figure_seed: int,
+    epoch_mode: str,
+    fixed_epoch: int | None,
+) -> None:
     figures_dir = outdir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
     lines = [
         "# Figure Index",
         "",
-        f"Representative sample plots for `seed={figure_seed}` at the best-eval epoch of each run.",
+        figure_caption(epoch_mode=epoch_mode, figure_seed=figure_seed, fixed_epoch=fixed_epoch),
         "",
     ]
 
@@ -396,15 +557,18 @@ def export_figures(*, outdir: Path, aggregate: dict, figure_seed: int) -> None:
         lines.append("")
         for method in aggregate["config"]["methods"]:
             row = run_lookup.get((dataset, fraction, method, figure_seed))
-            if row is None or row["best_epoch"] is None:
+            if row is None:
                 continue
-            src = Path(row["run_dir"]) / "plots" / f"samples_epoch_{int(row['best_epoch']):04d}.png"
+            figure_epoch = resolve_figure_epoch(row=row, epoch_mode=epoch_mode, fixed_epoch=fixed_epoch)
+            if figure_epoch is None:
+                continue
+            src = Path(row["run_dir"]) / "plots" / f"samples_epoch_{int(figure_epoch):04d}.png"
             if not src.is_file():
                 continue
             dst_name = f"{dataset}_{fraction_tag}_{method}.png"
             dst = figures_dir / dst_name
             shutil.copy2(src, dst)
-            lines.append(f"- `{method}`: [{dst_name}]({dst.as_posix()})")
+            lines.append(f"- `{method}`: [{dst_name}]({dst_name})")
         lines.append("")
 
     (figures_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
@@ -448,6 +612,16 @@ def get_config_value(method_config: dict, key: str, fallback):
     return method_config.get(key, fallback)
 
 
+def replace_command_arg(command: list[str], flag: str, value: str) -> None:
+    try:
+        index = command.index(flag)
+    except ValueError as exc:
+        raise ValueError(f"Flag {flag} not found in command.") from exc
+    if index + 1 >= len(command):
+        raise ValueError(f"Flag {flag} is missing its value.")
+    command[index + 1] = value
+
+
 def format_method_name(method: str) -> str:
     if method == "baseline":
         return "Baseline"
@@ -456,6 +630,26 @@ def format_method_name(method: str) -> str:
     if method == "causal_wdro":
         return "Causal WDRO"
     return method.replace("_", " ").title()
+
+
+def resolve_figure_epoch(*, row: dict, epoch_mode: str, fixed_epoch: int | None) -> int | None:
+    if epoch_mode == "best":
+        return row.get("best_epoch")
+    if epoch_mode == "last":
+        return row.get("last_epoch")
+    if epoch_mode == "fixed":
+        return fixed_epoch
+    raise ValueError(f"Unsupported epoch_mode: {epoch_mode}")
+
+
+def figure_caption(*, epoch_mode: str, figure_seed: int, fixed_epoch: int | None) -> str:
+    if epoch_mode == "best":
+        return f"Representative sample plots for `seed={figure_seed}` at each method's best-eval epoch."
+    if epoch_mode == "last":
+        return f"Representative sample plots for `seed={figure_seed}` at the final eval epoch."
+    if epoch_mode == "fixed":
+        return f"Representative sample plots for `seed={figure_seed}` at shared eval epoch `{fixed_epoch}`."
+    raise ValueError(f"Unsupported epoch_mode: {epoch_mode}")
 
 
 def markdown_header(columns: list[str]) -> str:

@@ -13,11 +13,12 @@ class CausalBatchStats:
     max_transport_cost: float
     mean_total_transport_cost: float
     max_total_transport_cost: float
+    target_total_budget: float | None
 
 
 def causal_wdro_loss(
     *,
-    net,
+    train_net,
     clean_points: torch.Tensor,
     p_mean: float,
     p_std: float,
@@ -28,8 +29,11 @@ def causal_wdro_loss(
     inner_steps: int,
     step_size: float,
     gamma: float,
+    total_budget: float | None = None,
+    exact_budget_split: bool = False,
     shared_noise: bool = False,
     sigma_schedule: str = "karras_grid",
+    attack_net=None,
 ) -> tuple[torch.Tensor, CausalBatchStats]:
     sigmas = sample_path_sigmas(
         batch_size=clean_points.shape[0],
@@ -45,15 +49,17 @@ def causal_wdro_loss(
     )
     reference_path = build_forward_path(clean_points=clean_points, sigmas=sigmas, shared_noise=shared_noise)
     final_path = solve_causal_path_attack(
-        net=net,
+        attack_net=attack_net if attack_net is not None else train_net,
         clean_points=clean_points,
         reference_path=reference_path,
         sigmas=sigmas,
         inner_steps=inner_steps,
         step_size=step_size,
         gamma=gamma,
+        total_budget=total_budget,
+        exact_budget_split=exact_budget_split,
     )
-    outer_loss = _per_time_losses(net=net, clean_points=clean_points, adv_path=final_path, sigmas=sigmas).mean()
+    outer_loss = _per_time_losses(net=train_net, clean_points=clean_points, adv_path=final_path, sigmas=sigmas).mean()
     displacement = (final_path - reference_path).detach()
     norms = displacement.norm(dim=2)
     per_step_transport_cost = 0.5 * displacement.square().sum(dim=2)
@@ -65,6 +71,7 @@ def causal_wdro_loss(
         max_transport_cost=float(per_step_transport_cost.max().item()),
         mean_total_transport_cost=float(total_transport_cost.mean().item()),
         max_total_transport_cost=float(total_transport_cost.max().item()),
+        target_total_budget=total_budget,
     )
     return outer_loss, stats
 
@@ -181,13 +188,15 @@ def build_forward_path(*, clean_points: torch.Tensor, sigmas: torch.Tensor, shar
 
 def solve_causal_path_attack(
     *,
-    net,
+    attack_net,
     clean_points: torch.Tensor,
     reference_path: torch.Tensor,
     sigmas: torch.Tensor,
     inner_steps: int,
     step_size: float,
     gamma: float,
+    total_budget: float | None = None,
+    exact_budget_split: bool = False,
 ) -> torch.Tensor:
     batch_size = clean_points.shape[0]
     sigma_matrix = expand_sigmas(sigmas=sigmas, batch_size=batch_size)
@@ -197,6 +206,14 @@ def solve_causal_path_attack(
 
     adv_states: list[torch.Tensor] = []
     prev_adv = clean_points.detach()
+    used_transport_cost = torch.zeros(batch_size, device=clean_points.device, dtype=clean_points.dtype)
+    per_step_budget = None
+    if total_budget is not None and reference_path.shape[1] > 0:
+        per_step_budget = float(total_budget) / float(reference_path.shape[1])
+
+    use_hard_budget_only = total_budget is not None and exact_budget_split
+    was_training = attack_net.training
+    attack_net.eval()
 
     for step_idx in range(reference_path.shape[1]):
         sigma_step = sigma_matrix[:, step_idx]
@@ -211,24 +228,81 @@ def solve_causal_path_attack(
             control.requires_grad_(True)
             candidate = prev_adv + base_increment + control
             step_loss = _single_time_losses(
-                net=net,
+                net=attack_net,
                 clean_points=clean_points,
                 adv_points=candidate,
                 sigma=sigma_step,
             ).mean()
             displacement = candidate - reference_state
             transport = 0.5 * displacement.square().sum(dim=1).mean()
-            objective = step_loss - gamma * transport
+            objective = step_loss if use_hard_budget_only else step_loss - gamma * transport
             grad = torch.autograd.grad(objective, control)[0]
-            grad_flat = grad.view(grad.shape[0], -1)
-            grad_norm = grad_flat.norm(dim=1, keepdim=True).clamp_min(1e-12)
-            normalized_grad = grad / grad_norm.view(-1, 1)
-            control = (control + step_size * normalized_grad).detach()
+            control = (control + step_size * grad).detach()
+            if total_budget is not None:
+                candidate = prev_adv + base_increment + control
+                if exact_budget_split and per_step_budget is not None:
+                    candidate = project_to_step_budget(
+                        candidate=candidate,
+                        reference_state=reference_state,
+                        step_budget=per_step_budget,
+                        exact=True,
+                    )
+                else:
+                    candidate = project_to_remaining_budget(
+                        candidate=candidate,
+                        reference_state=reference_state,
+                        used_transport_cost=used_transport_cost,
+                        total_budget=float(total_budget),
+                    )
+                control = (candidate - (prev_adv + base_increment)).detach()
 
         prev_adv = (prev_adv + base_increment + control).detach()
+        used_transport_cost = used_transport_cost + 0.5 * (prev_adv - reference_state).square().sum(dim=1)
         adv_states.append(prev_adv)
 
+    if was_training:
+        attack_net.train()
     return torch.stack(adv_states, dim=1)
+
+
+def project_to_remaining_budget(
+    *,
+    candidate: torch.Tensor,
+    reference_state: torch.Tensor,
+    used_transport_cost: torch.Tensor,
+    total_budget: float,
+) -> torch.Tensor:
+    remaining_budget = torch.clamp(candidate.new_full(used_transport_cost.shape, total_budget) - used_transport_cost, min=0.0)
+    displacement = candidate - reference_state
+    displacement_flat = displacement.view(displacement.shape[0], -1)
+    displacement_norm = displacement_flat.norm(dim=1)
+    max_norm = torch.sqrt(torch.clamp(2.0 * remaining_budget, min=0.0))
+    scale = torch.ones_like(displacement_norm)
+    overspent = displacement_norm > max_norm
+    scale[overspent] = max_norm[overspent] / displacement_norm[overspent].clamp_min(1e-12)
+    return reference_state + displacement * scale.view(-1, 1)
+
+
+def project_to_step_budget(
+    *,
+    candidate: torch.Tensor,
+    reference_state: torch.Tensor,
+    step_budget: float,
+    exact: bool,
+) -> torch.Tensor:
+    displacement = candidate - reference_state
+    displacement_flat = displacement.view(displacement.shape[0], -1)
+    displacement_norm = displacement_flat.norm(dim=1)
+    target_norm = torch.full_like(displacement_norm, float(max(step_budget, 0.0) * 2.0) ** 0.5)
+    scale = torch.ones_like(displacement_norm)
+    positive = displacement_norm > 1e-12
+    if exact:
+        scale[positive] = target_norm[positive] / displacement_norm[positive]
+        scale[~positive] = 0.0
+    else:
+        overspent = displacement_norm > target_norm
+        scale[overspent] = target_norm[overspent] / displacement_norm[overspent]
+    return reference_state + displacement * scale.view(-1, 1)
 
 
 def _per_time_losses(*, net, clean_points: torch.Tensor, adv_path: torch.Tensor, sigmas: torch.Tensor) -> torch.Tensor:

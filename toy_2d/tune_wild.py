@@ -108,10 +108,14 @@ def build_trial_configs(*, args: argparse.Namespace, method: str) -> list[dict]:
             "depth": 4,
             "embedding_dim": 64,
             "sampler_steps": 20,
+            "causal_warmup_epochs": CAUSAL_WDRO_DEFAULTS["warmup_epochs"],
             "causal_path_steps": CAUSAL_WDRO_DEFAULTS["path_steps"],
             "causal_inner_steps": CAUSAL_WDRO_DEFAULTS["inner_steps"],
             "causal_step_size": CAUSAL_WDRO_DEFAULTS["step_size"],
             "causal_gamma": CAUSAL_WDRO_DEFAULTS["gamma"],
+            "causal_total_budget": CAUSAL_WDRO_DEFAULTS["total_budget"],
+            "causal_budget_mode": CAUSAL_WDRO_DEFAULTS["budget_mode"],
+            "causal_exact_budget_split": CAUSAL_WDRO_DEFAULTS["exact_budget_split"],
             "causal_sigma_schedule": CAUSAL_WDRO_DEFAULTS["sigma_schedule"],
         }
         search_space = {
@@ -203,9 +207,13 @@ def run_trial(payload: tuple[int, str, dict, argparse.Namespace]) -> dict:
         append_optional_arg(command, "--wdro-warmup-epochs", config, "wdro_warmup_epochs")
         append_optional_arg(command, "--wdro-refresh-every", config, "wdro_refresh_every")
         append_optional_arg(command, "--causal-path-steps", config, "causal_path_steps")
+        append_optional_arg(command, "--causal-warmup-epochs", config, "causal_warmup_epochs")
         append_optional_arg(command, "--causal-inner-steps", config, "causal_inner_steps")
         append_optional_arg(command, "--causal-step-size", config, "causal_step_size")
         append_optional_arg(command, "--causal-gamma", config, "causal_gamma")
+        append_optional_arg(command, "--causal-total-budget", config, "causal_total_budget")
+        append_optional_arg(command, "--causal-budget-mode", config, "causal_budget_mode")
+        append_bool_arg(command, "--causal-exact-budget-split", "--no-causal-exact-budget-split", config, "causal_exact_budget_split")
         append_optional_arg(command, "--causal-sigma-schedule", config, "causal_sigma_schedule")
         subprocess.run(command, cwd=root_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -252,6 +260,11 @@ def append_jsonl(path: Path, payload: dict) -> None:
 def append_optional_arg(command: list[str], flag: str, config: dict, key: str) -> None:
     if key in config:
         command.extend([flag, str(config[key])])
+
+
+def append_bool_arg(command: list[str], true_flag: str, false_flag: str, config: dict, key: str) -> None:
+    if key in config:
+        command.append(true_flag if bool(config[key]) else false_flag)
 
 
 if __name__ == "__main__":

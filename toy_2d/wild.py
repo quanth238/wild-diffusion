@@ -17,6 +17,31 @@ class WdroRefreshResult:
     max_transport_cost: float
 
 
+def estimate_wdro_transport_budget(
+    points: torch.Tensor,
+    model,
+    loss_fn,
+    *,
+    gamma: float,
+    step_size: float,
+    iters: int,
+    clamp_min: torch.Tensor,
+    clamp_max: torch.Tensor,
+) -> float:
+    adv_points = wdro_attack(
+        points,
+        model,
+        loss_fn,
+        gamma=gamma,
+        step_size=step_size,
+        iters=iters,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    )
+    delta = adv_points - points
+    return float((0.5 * delta.square().sum(dim=1)).mean().item())
+
+
 def wdro_attack(
     points: torch.Tensor,
     model,
