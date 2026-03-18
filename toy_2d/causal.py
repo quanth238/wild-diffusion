@@ -211,7 +211,6 @@ def solve_causal_path_attack(
     if total_budget is not None and reference_path.shape[1] > 0:
         per_step_budget = float(total_budget) / float(reference_path.shape[1])
 
-    use_hard_budget_only = total_budget is not None and exact_budget_split
     was_training = attack_net.training
     attack_net.eval()
 
@@ -222,8 +221,8 @@ def solve_causal_path_attack(
         control = torch.zeros_like(prev_adv)
 
         # Solve the control sequentially so u_i only uses the current path prefix.
-        # The penalty uses accumulated path displacement so the total path budget
-        # can be matched directly against x0-only WDRO.
+        # With exact_budget_split=False, this is the same WDRO quadratic transport
+        # penalty, just applied at each attacked time along the path.
         for _ in range(inner_steps):
             control.requires_grad_(True)
             candidate = prev_adv + base_increment + control
@@ -235,7 +234,7 @@ def solve_causal_path_attack(
             ).mean()
             displacement = candidate - reference_state
             transport = 0.5 * displacement.square().sum(dim=1).mean()
-            objective = step_loss if use_hard_budget_only else step_loss - gamma * transport
+            objective = step_loss - gamma * transport
             grad = torch.autograd.grad(objective, control)[0]
             control = (control + step_size * grad).detach()
             if total_budget is not None:

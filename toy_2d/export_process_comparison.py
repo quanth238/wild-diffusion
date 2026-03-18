@@ -294,7 +294,10 @@ def resolve_causal_budget(*, clean_points: torch.Tensor, causal_bundle: dict, da
         )
     if config.get("causal_total_budget") is None:
         return None
-    return float(config["causal_total_budget"])
+    total_budget = float(config["causal_total_budget"])
+    if total_budget <= 0.0:
+        return None
+    return total_budget
 
 
 def build_rows(

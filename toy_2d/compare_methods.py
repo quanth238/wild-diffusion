@@ -455,7 +455,9 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_total_transport_cost']:.4f}" for method in methods)
         lines.append(markdown_row(cells))
-    if "wdro" in methods and "causal_wdro" in methods:
+    if "wdro" in methods and "causal_wdro" in methods and any(
+        row.get("causal_wdro_target_total_budget") is not None for row in aggregate["summary"]
+    ):
         lines += [
             "",
             "## Budget Match",

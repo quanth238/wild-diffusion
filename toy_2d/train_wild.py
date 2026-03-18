@@ -396,7 +396,10 @@ def train_one_epoch(
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
         if method == "causal_wdro" and causal_attack_active:
-            total_budget = causal_kwargs["total_budget"]
+            total_budget = normalize_causal_total_budget(
+                total_budget=causal_kwargs["total_budget"],
+                budget_mode=causal_kwargs["budget_mode"],
+            )
             if causal_kwargs["budget_mode"] == "match_wdro":
                 total_budget = estimate_wdro_transport_budget(
                     batch,
@@ -597,6 +600,10 @@ def save_causal_debug_process(
     )
     reference_path = build_forward_path(clean_points=clean_points, sigmas=sigmas, shared_noise=False)
     total_budget = float(causal_debug["total_budget"])
+    total_budget = normalize_causal_total_budget(
+        total_budget=total_budget,
+        budget_mode=str(causal_debug["budget_mode"]),
+    )
     if causal_debug["budget_mode"] == "match_wdro":
         total_budget = estimate_wdro_transport_budget(
             clean_points,
@@ -744,6 +751,16 @@ def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def normalize_causal_total_budget(*, total_budget: float | None, budget_mode: str) -> float | None:
+    if budget_mode != "fixed":
+        return total_budget
+    if total_budget is None:
+        return None
+    if float(total_budget) <= 0.0:
+        return None
+    return float(total_budget)
 
 
 if __name__ == "__main__":
