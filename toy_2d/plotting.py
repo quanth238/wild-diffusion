@@ -87,6 +87,55 @@ def save_training_curves(
     plt.close(fig)
 
 
+def save_method_training_metric_comparison(
+    *,
+    path: Path,
+    dataset: str,
+    fraction_tag: str,
+    seed: int,
+    method_histories: dict[str, list[dict]],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+
+    method_colors = {
+        "baseline": "#1f77b4",
+        "wdro": "#ff7f0e",
+        "causal_wdro": "#d62728",
+    }
+    metric_specs = [
+        ("train_loss", "Training loss"),
+        ("sliced_wasserstein", "SWD"),
+        ("mmd_rbf", "MMD"),
+    ]
+
+    for ax, (metric_key, title) in zip(axes, metric_specs):
+        for method, history in method_histories.items():
+            if not history:
+                continue
+            epochs = [item["epoch"] for item in history]
+            values = [item[metric_key] for item in history]
+            ax.plot(
+                epochs,
+                values,
+                label=method,
+                color=method_colors.get(method, "#444444"),
+                linewidth=1.8,
+                marker="o",
+                markersize=3.5,
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.2)
+
+    axes[0].set_ylabel("Value")
+    axes[1].legend(frameon=False, loc="best")
+    fig.suptitle(f"{dataset} | {fraction_tag} | seed {seed} | Baseline vs WDRO vs Causal WDRO")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def save_process_snapshots(
     *,
     path: Path,
