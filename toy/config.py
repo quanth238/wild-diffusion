@@ -7,6 +7,7 @@ class ToyConfig:
     exp_name: str = "energy_only_v1"
     seed: int = 0
     device: str = "auto"  # auto|cpu|cuda
+    dataset_kind: str = "toy_gmm"  # extension point: add image dataset backends later.
 
     # Training.
     steps: int = 3000
@@ -45,8 +46,15 @@ class ToyConfig:
     p_mean: float = -1.2
     p_std: float = 1.2
 
-    # Energy-only robust objective.
+    # Constrained robust objective (v2): hard per-step control radius.
+    # Deprecated in v2 (kept for backward CLI compatibility only).
     lambda_energy: float = 0.2
+    control_radius_kappa: float = 0.3
+    use_time_dependent_kappa: bool = False
+    kappa_low_multiplier: float = 1.0
+    kappa_mid_multiplier: float = 1.0
+    kappa_high_multiplier: float = 1.0
+    kappa_preserve_l2_budget: bool = True
     outer_attack_weight: float = 1.0
     outer_clean_weight: float = 0.0
     warmup_clean_steps: int = 0
@@ -56,7 +64,8 @@ class ToyConfig:
     collapse_diagnostics_enabled: bool = True
     collapse_diag_every: int = 100
     collapse_gap_ratio_tol: float = 0.05
-    collapse_v_l2_tol: float = 0.05
+    collapse_delta_ratio_tol: float = 0.05
+    constraint_saturation_threshold: float = 0.98
 
     # Baseline acceptance gate (must pass before attack training).
     baseline_gate_enabled: bool = True

@@ -5,17 +5,22 @@ import numpy as np
 
 
 def plot_training_curves(history_baseline: Dict[str, list], history_robust: Dict[str, list], out_path: str) -> None:
+    """Plot baseline/robust training curves for quick optimization diagnostics."""
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     axes[0].plot(history_baseline["loss"], label="baseline")
-    axes[0].plot(history_robust["outer_loss"], label="trajectory_robust_energy")
+    axes[0].plot(history_robust["outer_loss"], label="trajectory_robust_constrained")
     axes[0].set_title("Outer Loss")
     axes[0].set_xlabel("Step")
     axes[0].set_ylabel("Weighted MSE")
     axes[0].legend()
 
     axes[1].plot(history_robust["inner_obj"], label="inner_obj")
-    axes[1].plot(history_robust["energy"], label="energy")
+    if "delta_norm_ratio_mean" in history_robust:
+        axes[1].plot(history_robust["delta_norm_ratio_mean"], label="delta_norm_ratio_mean")
+    elif "energy" in history_robust:
+        axes[1].plot(history_robust["energy"], label="energy")
     axes[1].set_title("Inner Terms")
     axes[1].set_xlabel("Step")
     axes[1].legend()
@@ -32,6 +37,8 @@ def plot_sample_scatter(
     centers: np.ndarray,
     out_path: str,
 ) -> None:
+    """Compare real, baseline-generated, and robust-generated sample clouds."""
+
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     panels = [
         ("Real Data", real_samples),
@@ -58,6 +65,8 @@ def plot_trajectory_examples(
     out_path: str,
     n_show: int = 12,
 ) -> None:
+    """Overlay a few forward trajectories: reference vs controlled rollout."""
+
     fig, ax = plt.subplots(1, 1, figsize=(6, 6))
     n = min(n_show, ref_paths.shape[0])
     for i in range(n):
@@ -83,6 +92,8 @@ def plot_forward_timestep_clouds(
     out_path: str,
     max_panels: int = 8,
 ) -> None:
+    """4-row timestep cloud view: fwd/bwd for reference and attack terminals."""
+
     n_steps = fwd_baseline_paths.shape[1]
     n_show = min(max_panels, n_steps)
     idx_fwd = np.linspace(0, n_steps - 1, n_show, dtype=int)
@@ -132,6 +143,8 @@ def plot_generated_reverse_timestep_clouds(
     out_path: str,
     max_panels: int = 8,
 ) -> None:
+    """Visualize reverse trajectories from Gaussian prior for baseline vs robust models."""
+
     n_steps = baseline_rev_paths.shape[1]
     n_show = min(max_panels, n_steps)
     idx_rev = np.linspace(n_steps - 1, 0, n_show, dtype=int)
@@ -165,6 +178,8 @@ def plot_per_sample_trajectories(
     out_path: str,
     n_show: int = 12,
 ) -> None:
+    """Small multiples of per-sample forward paths for fine-grained debugging."""
+
     n = min(n_show, ref_paths.shape[0])
     ncols = 4
     nrows = (n + ncols - 1) // ncols
@@ -197,6 +212,8 @@ def plot_per_sample_trajectories(
 
 
 def plot_denoise_error_curves(curves: Dict[str, list], out_path: str) -> None:
+    """Plot denoising MSE versus forward timestep for all model/path pairings."""
+
     steps = curves["step"]
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     ax.plot(steps, curves["baseline_on_forward_baseline"], label="Baseline on Forward Baseline", linewidth=2.0)
@@ -221,6 +238,8 @@ def plot_debug_losses(
     recovery_attack_curve: Dict[str, list],
     out_path: str,
 ) -> None:
+    """Combined 2x2 debug panel for losses, inner stats, and recovery curves."""
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     ax00, ax01 = axes[0]
     ax10, ax11 = axes[1]
@@ -234,7 +253,10 @@ def plot_debug_losses(
     ax00.legend()
 
     ax01.plot(history_robust["inner_obj"], label="inner_obj", linewidth=1.8)
-    ax01.plot(history_robust["energy"], label="energy", linewidth=1.8)
+    if "delta_norm_ratio_mean" in history_robust:
+        ax01.plot(history_robust["delta_norm_ratio_mean"], label="delta_norm_ratio_mean", linewidth=1.8)
+    elif "energy" in history_robust:
+        ax01.plot(history_robust["energy"], label="energy", linewidth=1.8)
     ax01.set_title("Inner Objective Debug")
     ax01.set_xlabel("Step")
     ax01.grid(alpha=0.25)
