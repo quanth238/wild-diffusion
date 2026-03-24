@@ -1,0 +1,6 @@
+# Non-PyTorch dependencies for the toy_2d workflows.
+# PyTorch is installed separately so callers can choose CPU-only or CUDA wheels.
+numpy>=2.0
+matplotlib>=3.9
+scipy>=1.14
+pillow>=11.0

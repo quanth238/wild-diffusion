@@ -2,6 +2,19 @@
 
 This directory provides a CPU-friendly baseline for continuous-data experiments before moving to the full image pipeline.
 
+Quick setup:
+
+```bash
+bash scripts/setup_toy_2d_env.sh
+bash scripts/smoke_test_toy_2d.sh
+```
+
+Notes:
+- The setup script creates a local `.venv` and installs the `toy_2d` dependencies.
+- The setup script defaults to the CPU PyTorch wheel so the toy workflow comes up quickly.
+- You can override the wheel source for a CUDA-specific build:
+  `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 bash scripts/setup_toy_2d_env.sh`
+
 What it includes:
 - synthetic 2D datasets: `eight_gaussians`, `two_moons`, `spiral`
 - a tiny EDM-style denoiser MLP
