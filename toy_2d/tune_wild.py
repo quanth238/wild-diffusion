@@ -10,7 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from toy_2d.robust_defaults import CAUSAL_WDRO_DEFAULTS, CAUSAL_WDRO_TUNING_SPACE, WDRO_CORE_DEFAULTS, WDRO_CORE_TUNING_SPACE
+from toy_2d import normalize_method_names
+from toy_2d.robust_defaults import CDRO_DEFAULTS, CDRO_TUNING_SPACE, WDRO_CORE_DEFAULTS, WDRO_CORE_TUNING_SPACE
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +33,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.methods = normalize_method_names(args.methods)
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     payloads = []
@@ -100,7 +102,7 @@ def build_trial_configs(*, args: argparse.Namespace, method: str) -> list[dict]:
             "wdro_warmup_epochs": [0, 2, 3, 5],
             "wdro_refresh_every": [1, 2, 3, 5],
         }
-    elif method == "causal_wdro":
+    elif method == "cdro":
         baseline = {
             "lr": 1e-3,
             "ema_decay": 0.99,
@@ -108,15 +110,15 @@ def build_trial_configs(*, args: argparse.Namespace, method: str) -> list[dict]:
             "depth": 4,
             "embedding_dim": 64,
             "sampler_steps": 20,
-            "causal_warmup_epochs": CAUSAL_WDRO_DEFAULTS["warmup_epochs"],
-            "causal_path_steps": CAUSAL_WDRO_DEFAULTS["path_steps"],
-            "causal_inner_steps": CAUSAL_WDRO_DEFAULTS["inner_steps"],
-            "causal_step_size": CAUSAL_WDRO_DEFAULTS["step_size"],
-            "causal_gamma": CAUSAL_WDRO_DEFAULTS["gamma"],
-            "causal_total_budget": CAUSAL_WDRO_DEFAULTS["total_budget"],
-            "causal_budget_mode": CAUSAL_WDRO_DEFAULTS["budget_mode"],
-            "causal_exact_budget_split": CAUSAL_WDRO_DEFAULTS["exact_budget_split"],
-            "causal_sigma_schedule": CAUSAL_WDRO_DEFAULTS["sigma_schedule"],
+            "cdro_warmup_epochs": CDRO_DEFAULTS["warmup_epochs"],
+            "cdro_path_steps": CDRO_DEFAULTS["path_steps"],
+            "cdro_inner_steps": CDRO_DEFAULTS["inner_steps"],
+            "cdro_step_size": CDRO_DEFAULTS["step_size"],
+            "cdro_gamma": CDRO_DEFAULTS["gamma"],
+            "cdro_total_budget": CDRO_DEFAULTS["total_budget"],
+            "cdro_budget_mode": CDRO_DEFAULTS["budget_mode"],
+            "cdro_exact_budget_split": CDRO_DEFAULTS["exact_budget_split"],
+            "cdro_sigma_schedule": CDRO_DEFAULTS["sigma_schedule"],
         }
         search_space = {
             "lr": [5e-4, 1e-3, 2e-3],
@@ -125,7 +127,7 @@ def build_trial_configs(*, args: argparse.Namespace, method: str) -> list[dict]:
             "depth": [4],
             "embedding_dim": [64],
             "sampler_steps": [20, 60],
-            **CAUSAL_WDRO_TUNING_SPACE,
+            **CDRO_TUNING_SPACE,
         }
     else:
         raise ValueError(f"Unsupported method: {method}")
@@ -206,15 +208,15 @@ def run_trial(payload: tuple[int, str, dict, argparse.Namespace]) -> dict:
         append_optional_arg(command, "--wdro-p-adv", config, "wdro_p_adv")
         append_optional_arg(command, "--wdro-warmup-epochs", config, "wdro_warmup_epochs")
         append_optional_arg(command, "--wdro-refresh-every", config, "wdro_refresh_every")
-        append_optional_arg(command, "--causal-path-steps", config, "causal_path_steps")
-        append_optional_arg(command, "--causal-warmup-epochs", config, "causal_warmup_epochs")
-        append_optional_arg(command, "--causal-inner-steps", config, "causal_inner_steps")
-        append_optional_arg(command, "--causal-step-size", config, "causal_step_size")
-        append_optional_arg(command, "--causal-gamma", config, "causal_gamma")
-        append_optional_arg(command, "--causal-total-budget", config, "causal_total_budget")
-        append_optional_arg(command, "--causal-budget-mode", config, "causal_budget_mode")
-        append_bool_arg(command, "--causal-exact-budget-split", "--no-causal-exact-budget-split", config, "causal_exact_budget_split")
-        append_optional_arg(command, "--causal-sigma-schedule", config, "causal_sigma_schedule")
+        append_optional_arg(command, "--cdro-path-steps", config, "cdro_path_steps")
+        append_optional_arg(command, "--cdro-warmup-epochs", config, "cdro_warmup_epochs")
+        append_optional_arg(command, "--cdro-inner-steps", config, "cdro_inner_steps")
+        append_optional_arg(command, "--cdro-step-size", config, "cdro_step_size")
+        append_optional_arg(command, "--cdro-gamma", config, "cdro_gamma")
+        append_optional_arg(command, "--cdro-total-budget", config, "cdro_total_budget")
+        append_optional_arg(command, "--cdro-budget-mode", config, "cdro_budget_mode")
+        append_bool_arg(command, "--cdro-exact-budget-split", "--no-cdro-exact-budget-split", config, "cdro_exact_budget_split")
+        append_optional_arg(command, "--cdro-sigma-schedule", config, "cdro_sigma_schedule")
         subprocess.run(command, cwd=root_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         dataset_results.append(

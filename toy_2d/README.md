@@ -18,9 +18,9 @@ Notes:
 What it includes:
 - synthetic 2D datasets: `eight_gaussians`, `two_moons`, `spiral`
 - a tiny EDM-style denoiser MLP
-- `baseline`, WILD-style `wdro`, and a first `causal_wdro` prototype
-- `causal_wdro` now attacks a discretized sigma path with sequential no-lookahead controls
-- causal transport cost is reported both per step and as accumulated path cost
+- `baseline`, WILD-style `wdro`, and a first `cdro` prototype
+- `cdro` now attacks a discretized sigma path with sequential no-lookahead controls
+- `cdro` transport cost is reported both per step and as accumulated path cost
 - plots, checkpoints, and simple sample-quality metrics
 
 Recommended first run:

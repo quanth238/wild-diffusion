@@ -10,7 +10,7 @@ import torch
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from toy_2d.causal import build_forward_path, sample_path_sigmas, solve_causal_path_attack
+from toy_2d.cdro import CdroConfig, solve_cdro_attack
 from toy_2d.datasets import build_dataset
 from toy_2d.losses import EDMLoss2D
 from toy_2d.model import EDMPrecondMLP
@@ -23,10 +23,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export shared-scale process comparison plots.")
     parser.add_argument("--baseline-checkpoint", type=Path, default=None)
     parser.add_argument("--wdro-checkpoint", type=Path, default=None)
-    parser.add_argument("--causal-checkpoint", type=Path, default=None)
+    parser.add_argument("--cdro-checkpoint", type=Path, default=None)
     parser.add_argument("--baseline-run-dir", type=Path, default=None)
     parser.add_argument("--wdro-run-dir", type=Path, default=None)
-    parser.add_argument("--causal-run-dir", type=Path, default=None)
+    parser.add_argument("--cdro-run-dir", type=Path, default=None)
     parser.add_argument("--checkpoint-mode", type=str, default="last", choices=("best", "last", "fixed"))
     parser.add_argument("--fixed-epoch", type=int, default=None)
     parser.add_argument("--outdir", type=Path, required=True)
@@ -61,10 +61,10 @@ def main() -> None:
         ),
         device=device,
     )
-    causal_bundle = load_checkpoint_bundle(
+    cdro_bundle = load_checkpoint_bundle(
         resolve_checkpoint_path(
-            explicit_path=args.causal_checkpoint,
-            run_dir=args.causal_run_dir,
+            explicit_path=args.cdro_checkpoint,
+            run_dir=args.cdro_run_dir,
             checkpoint_mode=args.checkpoint_mode,
             fixed_epoch=args.fixed_epoch,
         ),
@@ -86,22 +86,22 @@ def main() -> None:
         device=device,
     )
 
-    causal_cfg = causal_bundle["config"]
-    sigmas = sample_path_sigmas(
-        batch_size=clean_points.shape[0],
-        num_steps=int(causal_cfg["causal_path_steps"]),
-        p_mean=float(causal_cfg["p_mean"]),
-        p_std=float(causal_cfg["p_std"]),
-        sigma_min=float(causal_cfg["sigma_min"]),
-        sigma_max=float(causal_cfg["sigma_max"]),
-        rho=float(causal_cfg["rho"]),
-        device=device,
-        dtype=clean_points.dtype,
-        schedule=str(causal_cfg["causal_sigma_schedule"]),
-    )
+    cdro_cfg = CdroConfig.from_dict(cdro_bundle["config"])
 
     torch.manual_seed(args.seed)
-    reference_path = build_forward_path(clean_points=clean_points, sigmas=sigmas, shared_noise=False)
+    cdro_result = solve_cdro_attack(
+        attack_net=cdro_bundle["model"],
+        clean_points=clean_points,
+        config=cdro_cfg.with_total_budget(
+            resolve_cdro_budget(
+                clean_points=clean_points,
+                cdro_bundle=cdro_bundle,
+                dataset=dataset,
+            )
+        ),
+        shared_noise=False,
+    )
+    reference_path = cdro_result.reference_path
     baseline_path = reference_path
 
     wdro_attack_points = wdro_attack(
@@ -116,21 +116,7 @@ def main() -> None:
     )
     wdro_path = reference_path + (wdro_attack_points - clean_points)[:, None, :]
 
-    causal_path = solve_causal_path_attack(
-        attack_net=causal_bundle["model"],
-        clean_points=clean_points,
-        reference_path=reference_path,
-        sigmas=sigmas,
-        inner_steps=int(causal_cfg["causal_inner_steps"]),
-        step_size=float(causal_cfg["causal_step_size"]),
-        gamma=float(causal_cfg["causal_gamma"]),
-        total_budget=resolve_causal_budget(
-            clean_points=clean_points,
-            causal_bundle=causal_bundle,
-            dataset=dataset,
-        ),
-        exact_budget_split=bool(causal_cfg.get("causal_exact_budget_split", False)),
-    )
+    cdro_path = cdro_result.adv_path
 
     baseline_reverse = sample_reverse(
         model=baseline_bundle["model"],
@@ -144,15 +130,15 @@ def main() -> None:
         config=wdro_bundle["config"],
         device=device,
     )
-    causal_reverse = sample_reverse(
-        model=causal_bundle["model"],
-        initial_points=causal_path[:, -1, :],
-        config=causal_bundle["config"],
+    cdro_reverse = sample_reverse(
+        model=cdro_bundle["model"],
+        initial_points=cdro_path[:, -1, :],
+        config=cdro_bundle["config"],
         device=device,
     )
 
     sigma_labels = torch.cat(
-        [torch.zeros(1, device=device, dtype=clean_points.dtype), sigmas.mean(dim=0)]
+        [torch.zeros(1, device=device, dtype=clean_points.dtype), cdro_result.sigmas.mean(dim=0)]
     ).cpu()
 
     forward_indices = select_snapshot_indices(total_count=baseline_path.shape[1] + 1, num_snapshots=args.num_snapshots)
@@ -167,10 +153,10 @@ def main() -> None:
         wdro_start=wdro_attack_points,
         baseline_path=baseline_path,
         wdro_path=wdro_path,
-        causal_path=causal_path,
+        cdro_path=cdro_path,
         baseline_reverse=baseline_reverse,
         wdro_reverse=wdro_reverse,
-        causal_reverse=causal_reverse,
+        cdro_reverse=cdro_reverse,
         sigma_labels=sigma_labels,
         forward_indices=forward_indices,
         reverse_indices=reverse_indices,
@@ -180,25 +166,25 @@ def main() -> None:
     save_process_snapshots(
         path=args.outdir / "process_comparison_full.png",
         rows=rows,
-        title=f"{dataset.name} | Baseline vs WDRO vs Causal WDRO",
+        title=f"{dataset.name} | Baseline vs WDRO vs CDRO",
     )
     save_process_snapshots(
         path=args.outdir / "process_comparison_step_autofit.png",
         rows=rows,
-        title=f"{dataset.name} | Baseline vs WDRO vs Causal WDRO (per-step auto-fit by stage)",
+        title=f"{dataset.name} | Baseline vs WDRO vs CDRO (per-step auto-fit by stage)",
         bounds_mode="per_group_column",
     )
 
     early_forward_arrays = []
     early_forward_arrays.append(dataset.destandardize(clean_points.detach().cpu()).numpy())
     early_forward_arrays.append(dataset.destandardize(wdro_attack_points.detach().cpu()).numpy())
-    for path_tensor in (baseline_path, wdro_path, causal_path):
+    for path_tensor in (baseline_path, wdro_path, cdro_path):
         for step_idx in range(min(args.zoom_forward_steps, path_tensor.shape[1])):
             early_forward_arrays.append(dataset.destandardize(path_tensor[:, step_idx, :].detach().cpu()).numpy())
     save_process_snapshots(
         path=args.outdir / "process_comparison_zoom_start.png",
         rows=rows,
-        title=f"{dataset.name} | Baseline vs WDRO vs Causal WDRO (zoom near start)",
+        title=f"{dataset.name} | Baseline vs WDRO vs CDRO (zoom near start)",
         bounds=compute_plot_bounds(*early_forward_arrays),
     )
 
@@ -278,23 +264,23 @@ def sample_reverse(*, model, initial_points: torch.Tensor, config: dict, device:
     return {"trajectory": trajectory, "sigmas": sigmas}
 
 
-def resolve_causal_budget(*, clean_points: torch.Tensor, causal_bundle: dict, dataset) -> float | None:
-    config = causal_bundle["config"]
-    budget_mode = str(config.get("causal_budget_mode", "fixed"))
+def resolve_cdro_budget(*, clean_points: torch.Tensor, cdro_bundle: dict, dataset) -> float | None:
+    config = cdro_bundle["config"]
+    budget_mode = str(config.get("cdro_budget_mode", "fixed"))
     if budget_mode == "match_wdro":
         return estimate_wdro_transport_budget(
             clean_points,
-            causal_bundle["model"],
-            causal_bundle["loss_fn"],
-            gamma=float(config.get("causal_reference_wdro_gamma", config["wdro_gamma"])),
-            step_size=float(config.get("causal_reference_wdro_step_size", config["wdro_step_size"])),
-            iters=int(config.get("causal_reference_wdro_k", config["wdro_k"])),
+            cdro_bundle["model"],
+            cdro_bundle["loss_fn"],
+            gamma=float(config.get("cdro_reference_wdro_gamma", config["wdro_gamma"])),
+            step_size=float(config.get("cdro_reference_wdro_step_size", config["wdro_step_size"])),
+            iters=int(config.get("cdro_reference_wdro_k", config["wdro_k"])),
             clamp_min=dataset.bounds_min.to(clean_points.device),
             clamp_max=dataset.bounds_max.to(clean_points.device),
         )
-    if config.get("causal_total_budget") is None:
+    if config.get("cdro_total_budget") is None:
         return None
-    total_budget = float(config["causal_total_budget"])
+    total_budget = float(config["cdro_total_budget"])
     if total_budget <= 0.0:
         return None
     return total_budget
@@ -307,10 +293,10 @@ def build_rows(
     wdro_start: torch.Tensor,
     baseline_path: torch.Tensor,
     wdro_path: torch.Tensor,
-    causal_path: torch.Tensor,
+    cdro_path: torch.Tensor,
     baseline_reverse: dict,
     wdro_reverse: dict,
-    causal_reverse: dict,
+    cdro_reverse: dict,
     sigma_labels: torch.Tensor,
     forward_indices: list[int],
     reverse_indices: list[int],
@@ -318,26 +304,26 @@ def build_rows(
     method_paths = {
         "Baseline": baseline_path,
         "WDRO": wdro_path,
-        "Causal WDRO": causal_path,
+        "CDRO": cdro_path,
     }
     method_starts = {
         "Baseline": clean_points.detach().cpu(),
         "WDRO": wdro_start.detach().cpu(),
-        "Causal WDRO": clean_points.detach().cpu(),
+        "CDRO": clean_points.detach().cpu(),
     }
     reverse_paths = {
         "Baseline": baseline_reverse,
         "WDRO": wdro_reverse,
-        "Causal WDRO": causal_reverse,
+        "CDRO": cdro_reverse,
     }
     colors = {
         "Baseline": "#1f77b4",
         "WDRO": "#ff7f0e",
-        "Causal WDRO": "#d62728",
+        "CDRO": "#d62728",
     }
 
     rows: list[dict] = []
-    for method_name in ("Baseline", "WDRO", "Causal WDRO"):
+    for method_name in ("Baseline", "WDRO", "CDRO"):
         path_tensor = method_paths[method_name]
         forward_stack = [method_starts[method_name]] + [
             path_tensor[:, step_idx, :].detach().cpu() for step_idx in range(path_tensor.shape[1])

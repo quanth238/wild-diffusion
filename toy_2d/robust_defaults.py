@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-# Keep causal WDRO on the same scale as standard WDRO so comparisons stay meaningful.
+# Keep CDRO on the same scale as standard WDRO so comparisons stay meaningful.
 WDRO_CORE_DEFAULTS = {
     "k": 5,
     "step_size": 0.05,
@@ -14,7 +14,7 @@ WDRO_CORE_TUNING_SPACE = {
     "gamma": [0.1, 0.3, 1.0, 3.0],
 }
 
-CAUSAL_WDRO_DEFAULTS = {
+CDRO_DEFAULTS = {
     "warmup_epochs": 5,
     "path_steps": 8,
     "inner_steps": 2,
@@ -26,13 +26,13 @@ CAUSAL_WDRO_DEFAULTS = {
     "sigma_schedule": "edm_quantiles",
 }
 
-CAUSAL_WDRO_TUNING_SPACE = {
-    "causal_warmup_epochs": [0, 5, 10],
-    "causal_path_steps": [4, 8, 12, 16],
-    "causal_inner_steps": [1, 2],
-    "causal_step_size": [2e-4, 5e-4, 1e-3, 2e-3],
-    "causal_gamma": list(WDRO_CORE_TUNING_SPACE["gamma"]),
-    "causal_budget_mode": [CAUSAL_WDRO_DEFAULTS["budget_mode"]],
-    "causal_exact_budget_split": [CAUSAL_WDRO_DEFAULTS["exact_budget_split"]],
-    "causal_sigma_schedule": ["edm_quantiles", "karras_grid"],
+CDRO_TUNING_SPACE = {
+    "cdro_warmup_epochs": [0, 5, 10],
+    "cdro_path_steps": [4, 8, 12, 16],
+    "cdro_inner_steps": [1, 2],
+    "cdro_step_size": [2e-4, 5e-4, 1e-3, 2e-3],
+    "cdro_gamma": list(WDRO_CORE_TUNING_SPACE["gamma"]),
+    "cdro_budget_mode": [CDRO_DEFAULTS["budget_mode"]],
+    "cdro_exact_budget_split": [CDRO_DEFAULTS["exact_budget_split"]],
+    "cdro_sigma_schedule": ["edm_quantiles", "karras_grid"],
 }

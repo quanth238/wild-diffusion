@@ -101,7 +101,7 @@ def save_method_training_metric_comparison(
     method_colors = {
         "baseline": "#1f77b4",
         "wdro": "#ff7f0e",
-        "causal_wdro": "#d62728",
+        "cdro": "#d62728",
     }
     metric_specs = [
         ("train_loss", "Training loss"),
@@ -130,7 +130,7 @@ def save_method_training_metric_comparison(
 
     axes[0].set_ylabel("Value")
     axes[1].legend(frameon=False, loc="best")
-    fig.suptitle(f"{dataset} | {fraction_tag} | seed {seed} | Baseline vs WDRO vs Causal WDRO")
+    fig.suptitle(f"{dataset} | {fraction_tag} | seed {seed} | Baseline vs WDRO vs CDRO")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)

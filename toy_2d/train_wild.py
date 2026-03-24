@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 import json
 import sys
 import time
@@ -14,8 +15,9 @@ from torch.utils.data import DataLoader, TensorDataset
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from toy_2d import METHOD_CHOICES, normalize_method_name
+from toy_2d.cdro import CdroConfig, cdro_loss, solve_cdro_attack
 from toy_2d.datasets import available_datasets, build_dataset
-from toy_2d.causal import build_forward_path, causal_wdro_loss, sample_path_sigmas, solve_causal_path_attack
 from toy_2d.losses import EDMLoss2D
 from toy_2d.metrics import mmd_rbf, sliced_wasserstein
 from toy_2d.model import EDMPrecondMLP
@@ -26,15 +28,34 @@ from toy_2d.plotting import (
     save_scatter_comparison,
     save_training_curves,
 )
-from toy_2d.robust_defaults import CAUSAL_WDRO_DEFAULTS, WDRO_CORE_DEFAULTS
+from toy_2d.robust_defaults import CDRO_DEFAULTS, WDRO_CORE_DEFAULTS
 from toy_2d.sampler import sample_edm, sample_edm_trajectory
 from toy_2d.wild import build_wdro_dataset, estimate_wdro_transport_budget
+
+
+@dataclass(frozen=True)
+class CdroBudgetConfig:
+    mode: str
+    fixed_total_budget: float | None
+    reference_wdro_k: int
+    reference_wdro_step_size: float
+    reference_wdro_gamma: float
+    clamp_min: torch.Tensor
+    clamp_max: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CdroDebugConfig:
+    num_snapshots: int
+    num_points: int
+    cdro_config: CdroConfig
+    budget_config: CdroBudgetConfig
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a toy 2D WILD-style diffusion baseline on CPU or GPU.")
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "wild_2d")
-    parser.add_argument("--method", type=str, default="wdro", choices=("baseline", "wdro", "causal_wdro"))
+    parser.add_argument("--method", type=str, default="wdro", choices=METHOD_CHOICES)
     parser.add_argument("--dataset", type=str, default="eight_gaussians", choices=available_datasets())
     parser.add_argument("--num-samples", type=int, default=4096)
     parser.add_argument("--noise", type=float, default=0.08)
@@ -70,32 +91,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-p-adv", type=float, default=WDRO_CORE_DEFAULTS["p_adv"])
     parser.add_argument("--wdro-debug-points", type=int, default=256)
 
-    parser.add_argument("--causal-path-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["path_steps"])
-    parser.add_argument("--causal-warmup-epochs", type=int, default=CAUSAL_WDRO_DEFAULTS["warmup_epochs"])
-    parser.add_argument("--causal-inner-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["inner_steps"])
-    parser.add_argument("--causal-step-size", type=float, default=CAUSAL_WDRO_DEFAULTS["step_size"])
-    parser.add_argument("--causal-gamma", type=float, default=CAUSAL_WDRO_DEFAULTS["gamma"])
-    parser.add_argument("--causal-total-budget", type=float, default=CAUSAL_WDRO_DEFAULTS["total_budget"])
+    parser.add_argument("--cdro-path-steps", type=int, default=CDRO_DEFAULTS["path_steps"])
+    parser.add_argument("--cdro-warmup-epochs", type=int, default=CDRO_DEFAULTS["warmup_epochs"])
+    parser.add_argument("--cdro-inner-steps", type=int, default=CDRO_DEFAULTS["inner_steps"])
+    parser.add_argument("--cdro-step-size", type=float, default=CDRO_DEFAULTS["step_size"])
+    parser.add_argument("--cdro-gamma", type=float, default=CDRO_DEFAULTS["gamma"])
+    parser.add_argument("--cdro-total-budget", type=float, default=CDRO_DEFAULTS["total_budget"])
     parser.add_argument(
-        "--causal-budget-mode",
+        "--cdro-budget-mode",
         type=str,
-        default=CAUSAL_WDRO_DEFAULTS["budget_mode"],
+        default=CDRO_DEFAULTS["budget_mode"],
         choices=("fixed", "match_wdro"),
     )
     parser.add_argument(
-        "--causal-exact-budget-split",
+        "--cdro-exact-budget-split",
         action=argparse.BooleanOptionalAction,
-        default=CAUSAL_WDRO_DEFAULTS["exact_budget_split"],
+        default=CDRO_DEFAULTS["exact_budget_split"],
     )
-    parser.add_argument("--causal-reference-wdro-k", type=int, default=None)
-    parser.add_argument("--causal-reference-wdro-step-size", type=float, default=None)
-    parser.add_argument("--causal-reference-wdro-gamma", type=float, default=None)
-    parser.add_argument("--causal-debug-snapshots", type=int, default=0)
-    parser.add_argument("--causal-debug-points", type=int, default=256)
+    parser.add_argument("--cdro-reference-wdro-k", type=int, default=None)
+    parser.add_argument("--cdro-reference-wdro-step-size", type=float, default=None)
+    parser.add_argument("--cdro-reference-wdro-gamma", type=float, default=None)
+    parser.add_argument("--cdro-debug-snapshots", type=int, default=0)
+    parser.add_argument("--cdro-debug-points", type=int, default=256)
     parser.add_argument(
-        "--causal-sigma-schedule",
+        "--cdro-sigma-schedule",
         type=str,
-        default=CAUSAL_WDRO_DEFAULTS["sigma_schedule"],
+        default=CDRO_DEFAULTS["sigma_schedule"],
         choices=("edm_random", "edm_quantiles", "karras_grid"),
     )
 
@@ -108,6 +129,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.method = normalize_method_name(args.method)
     device = resolve_device(args.device)
     set_seed(args.seed)
 
@@ -138,13 +160,17 @@ def main() -> None:
     clamp_min = dataset.bounds_min.to(device)
     clamp_max = dataset.bounds_max.to(device)
     rng = np.random.default_rng(args.seed + 1)
+    cdro_config = CdroConfig.from_args(args) if args.method == "cdro" else None
+    cdro_budget_config = (
+        build_cdro_budget_config(args=args, clamp_min=clamp_min, clamp_max=clamp_max) if args.method == "cdro" else None
+    )
 
     loss_history: list[float] = []
     eval_history: list[dict] = []
     latest_adv_snapshot: tuple[np.ndarray, np.ndarray] | None = None
     latest_adv_stats: dict | None = None
     latest_adv_plot_stats: tuple[float, float] | None = None
-    latest_causal_stats: dict | None = None
+    latest_cdro_stats: dict | None = None
     best_swd = float("inf")
     best_epoch: int | None = None
     best_eval: dict | None = None
@@ -199,38 +225,13 @@ def main() -> None:
             grad_clip=args.grad_clip,
             ema_decay=args.ema_decay,
             method=args.method,
-            causal_attack_active=epoch_idx >= args.causal_warmup_epochs,
-            causal_kwargs={
-                "warmup_epochs": args.causal_warmup_epochs,
-                "sigma_min": args.sigma_min,
-                "sigma_max": args.sigma_max,
-                "rho": args.rho,
-                "p_mean": args.p_mean,
-                "p_std": args.p_std,
-                "path_steps": args.causal_path_steps,
-                "inner_steps": args.causal_inner_steps,
-                "step_size": args.causal_step_size,
-                "gamma": args.causal_gamma,
-                "total_budget": args.causal_total_budget,
-                "budget_mode": args.causal_budget_mode,
-                "exact_budget_split": args.causal_exact_budget_split,
-                "sigma_schedule": args.causal_sigma_schedule,
-                "reference_wdro_k": args.causal_reference_wdro_k if args.causal_reference_wdro_k is not None else args.wdro_k,
-                "reference_wdro_step_size": (
-                    args.causal_reference_wdro_step_size
-                    if args.causal_reference_wdro_step_size is not None
-                    else args.wdro_step_size
-                ),
-                "reference_wdro_gamma": (
-                    args.causal_reference_wdro_gamma if args.causal_reference_wdro_gamma is not None else args.wdro_gamma
-                ),
-                "clamp_min": clamp_min,
-                "clamp_max": clamp_max,
-            },
+            cdro_attack_active=epoch_idx >= args.cdro_warmup_epochs,
+            cdro_config=cdro_config,
+            cdro_budget_config=cdro_budget_config,
         )
         loss_history.append(mean_loss)
-        if args.method == "causal_wdro":
-            latest_causal_stats = train_stats
+        if args.method == "cdro":
+            latest_cdro_stats = train_stats
 
         if epoch == 1 or epoch % args.eval_every == 0 or epoch == args.epochs:
             metrics = evaluate(
@@ -246,7 +247,15 @@ def main() -> None:
                 rho=args.rho,
                 sampler_steps=args.sampler_steps,
                 seed=args.seed,
-                causal_debug=build_causal_debug_config(args=args) if args.method == "causal_wdro" else None,
+                cdro_debug=(
+                    build_cdro_debug_config(
+                        args=args,
+                        cdro_config=cdro_config,
+                        cdro_budget_config=cdro_budget_config,
+                    )
+                    if args.method == "cdro" and cdro_config is not None and cdro_budget_config is not None
+                    else None
+                ),
             )
             metrics["train_loss"] = mean_loss
             metrics["dataset_size"] = int(current_points.shape[0])
@@ -263,20 +272,20 @@ def main() -> None:
                 metrics["wdro_max_transport_cost"] = latest_adv_stats["max_transport_cost"]
                 metrics["wdro_total_transport_cost"] = latest_adv_stats["mean_total_transport_cost"]
                 metrics["wdro_max_total_transport_cost"] = latest_adv_stats["max_total_transport_cost"]
-            if latest_causal_stats is not None:
-                metrics["causal_mean_l2_shift"] = latest_causal_stats["mean_l2_shift"]
-                metrics["causal_max_l2_shift"] = latest_causal_stats["max_l2_shift"]
-                metrics["causal_mean_transport_cost"] = latest_causal_stats["mean_transport_cost"]
-                metrics["causal_max_transport_cost"] = latest_causal_stats["max_transport_cost"]
-                metrics["causal_total_transport_cost"] = latest_causal_stats["mean_total_transport_cost"]
-                metrics["causal_max_total_transport_cost"] = latest_causal_stats["max_total_transport_cost"]
-                metrics["causal_target_total_budget"] = latest_causal_stats["target_total_budget"]
-                metrics["mean_l2_shift"] = latest_causal_stats["mean_l2_shift"]
-                metrics["max_l2_shift"] = latest_causal_stats["max_l2_shift"]
-                metrics["mean_transport_cost"] = latest_causal_stats["mean_transport_cost"]
-                metrics["max_transport_cost"] = latest_causal_stats["max_transport_cost"]
-                metrics["total_transport_cost"] = latest_causal_stats["mean_total_transport_cost"]
-                metrics["max_total_transport_cost"] = latest_causal_stats["max_total_transport_cost"]
+            if latest_cdro_stats is not None:
+                metrics["cdro_mean_l2_shift"] = latest_cdro_stats["mean_l2_shift"]
+                metrics["cdro_max_l2_shift"] = latest_cdro_stats["max_l2_shift"]
+                metrics["cdro_mean_transport_cost"] = latest_cdro_stats["mean_transport_cost"]
+                metrics["cdro_max_transport_cost"] = latest_cdro_stats["max_transport_cost"]
+                metrics["cdro_total_transport_cost"] = latest_cdro_stats["mean_total_transport_cost"]
+                metrics["cdro_max_total_transport_cost"] = latest_cdro_stats["max_total_transport_cost"]
+                metrics["cdro_target_total_budget"] = latest_cdro_stats["target_total_budget"]
+                metrics["mean_l2_shift"] = latest_cdro_stats["mean_l2_shift"]
+                metrics["max_l2_shift"] = latest_cdro_stats["max_l2_shift"]
+                metrics["mean_transport_cost"] = latest_cdro_stats["mean_transport_cost"]
+                metrics["max_transport_cost"] = latest_cdro_stats["max_transport_cost"]
+                metrics["total_transport_cost"] = latest_cdro_stats["mean_total_transport_cost"]
+                metrics["max_total_transport_cost"] = latest_cdro_stats["max_total_transport_cost"]
             metrics["method"] = args.method
             eval_history.append(metrics)
             append_jsonl(args.outdir / "metrics.jsonl", metrics)
@@ -380,62 +389,43 @@ def train_one_epoch(
     grad_clip: float,
     ema_decay: float,
     method: str,
-    causal_attack_active: bool,
-    causal_kwargs: dict,
+    cdro_attack_active: bool,
+    cdro_config: CdroConfig | None,
+    cdro_budget_config: CdroBudgetConfig | None,
 ) -> tuple[float, dict | None]:
     model.train()
     losses: list[float] = []
-    causal_mean_norms: list[float] = []
-    causal_max_norms: list[float] = []
-    causal_mean_costs: list[float] = []
-    causal_max_costs: list[float] = []
-    causal_mean_total_costs: list[float] = []
-    causal_max_total_costs: list[float] = []
-    causal_target_budgets: list[float] = []
+    cdro_mean_norms: list[float] = []
+    cdro_max_norms: list[float] = []
+    cdro_mean_costs: list[float] = []
+    cdro_max_costs: list[float] = []
+    cdro_mean_total_costs: list[float] = []
+    cdro_max_total_costs: list[float] = []
+    cdro_target_budgets: list[float] = []
     for (batch,) in loader:
         batch = batch.to(device)
         optimizer.zero_grad(set_to_none=True)
-        if method == "causal_wdro" and causal_attack_active:
-            total_budget = normalize_causal_total_budget(
-                total_budget=causal_kwargs["total_budget"],
-                budget_mode=causal_kwargs["budget_mode"],
+        if method == "cdro" and cdro_attack_active and cdro_config is not None and cdro_budget_config is not None:
+            total_budget = resolve_cdro_total_budget(
+                clean_points=batch,
+                attack_net=ema,
+                loss_fn=loss_fn,
+                budget_config=cdro_budget_config,
             )
-            if causal_kwargs["budget_mode"] == "match_wdro":
-                total_budget = estimate_wdro_transport_budget(
-                    batch,
-                    ema,
-                    loss_fn,
-                    gamma=float(causal_kwargs["reference_wdro_gamma"]),
-                    step_size=float(causal_kwargs["reference_wdro_step_size"]),
-                    iters=int(causal_kwargs["reference_wdro_k"]),
-                    clamp_min=causal_kwargs["clamp_min"],
-                    clamp_max=causal_kwargs["clamp_max"],
-                )
-            loss, stats = causal_wdro_loss(
+            loss, stats = cdro_loss(
                 train_net=model,
                 attack_net=ema,
                 clean_points=batch,
-                p_mean=causal_kwargs["p_mean"],
-                p_std=causal_kwargs["p_std"],
-                sigma_min=causal_kwargs["sigma_min"],
-                sigma_max=causal_kwargs["sigma_max"],
-                rho=causal_kwargs["rho"],
-                path_steps=causal_kwargs["path_steps"],
-                inner_steps=causal_kwargs["inner_steps"],
-                step_size=causal_kwargs["step_size"],
-                gamma=causal_kwargs["gamma"],
-                total_budget=total_budget,
-                exact_budget_split=bool(causal_kwargs["exact_budget_split"]),
-                sigma_schedule=causal_kwargs["sigma_schedule"],
+                config=cdro_config.with_total_budget(total_budget),
             )
-            causal_mean_norms.append(stats.mean_delta_norm)
-            causal_max_norms.append(stats.max_delta_norm)
-            causal_mean_costs.append(stats.mean_transport_cost)
-            causal_max_costs.append(stats.max_transport_cost)
-            causal_mean_total_costs.append(stats.mean_total_transport_cost)
-            causal_max_total_costs.append(stats.max_total_transport_cost)
+            cdro_mean_norms.append(stats.mean_delta_norm)
+            cdro_max_norms.append(stats.max_delta_norm)
+            cdro_mean_costs.append(stats.mean_transport_cost)
+            cdro_max_costs.append(stats.max_transport_cost)
+            cdro_mean_total_costs.append(stats.mean_total_transport_cost)
+            cdro_max_total_costs.append(stats.max_total_transport_cost)
             if stats.target_total_budget is not None:
-                causal_target_budgets.append(float(stats.target_total_budget))
+                cdro_target_budgets.append(float(stats.target_total_budget))
         else:
             loss = loss_fn(model, batch).mean()
         loss.backward()
@@ -445,15 +435,15 @@ def train_one_epoch(
         update_ema(ema=ema, model=model, decay=ema_decay)
         losses.append(float(loss.item()))
     stats = None
-    if method == "causal_wdro" and causal_mean_norms:
+    if method == "cdro" and cdro_mean_norms:
         stats = {
-            "mean_l2_shift": float(np.mean(causal_mean_norms)),
-            "max_l2_shift": float(np.max(causal_max_norms)),
-            "mean_transport_cost": float(np.mean(causal_mean_costs)),
-            "max_transport_cost": float(np.max(causal_max_costs)),
-            "mean_total_transport_cost": float(np.mean(causal_mean_total_costs)),
-            "max_total_transport_cost": float(np.max(causal_max_total_costs)),
-            "target_total_budget": float(np.mean(causal_target_budgets)) if causal_target_budgets else None,
+            "mean_l2_shift": float(np.mean(cdro_mean_norms)),
+            "max_l2_shift": float(np.max(cdro_max_norms)),
+            "mean_transport_cost": float(np.mean(cdro_mean_costs)),
+            "max_transport_cost": float(np.max(cdro_max_costs)),
+            "mean_total_transport_cost": float(np.mean(cdro_mean_total_costs)),
+            "max_total_transport_cost": float(np.max(cdro_max_total_costs)),
+            "target_total_budget": float(np.mean(cdro_target_budgets)) if cdro_target_budgets else None,
         }
     return float(np.mean(losses)) if losses else float("nan"), stats
 
@@ -480,7 +470,7 @@ def evaluate(
     rho: float,
     sampler_steps: int,
     seed: int,
-    causal_debug: dict | None,
+    cdro_debug: CdroDebugConfig | None,
 ) -> dict:
     model.eval()
     generated_std = sample_edm(
@@ -522,8 +512,8 @@ def evaluate(
         generated=fake_metric.numpy(),
         generated_full=generated.numpy(),
     )
-    if causal_debug is not None and causal_debug["num_snapshots"] > 0:
-        save_causal_debug_process(
+    if cdro_debug is not None and cdro_debug.num_snapshots > 0:
+        save_cdro_debug_process(
             dataset=dataset,
             model=model,
             outdir=outdir,
@@ -534,36 +524,50 @@ def evaluate(
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             rho=rho,
-            causal_debug=causal_debug,
+            cdro_debug=cdro_debug,
         )
     return metrics
 
 
-def build_causal_debug_config(*, args: argparse.Namespace) -> dict:
-    return {
-        "num_snapshots": args.causal_debug_snapshots,
-        "num_points": args.causal_debug_points,
-        "p_mean": args.p_mean,
-        "p_std": args.p_std,
-        "path_steps": args.causal_path_steps,
-        "inner_steps": args.causal_inner_steps,
-        "step_size": args.causal_step_size,
-        "gamma": args.causal_gamma,
-        "total_budget": args.causal_total_budget,
-        "budget_mode": args.causal_budget_mode,
-        "exact_budget_split": args.causal_exact_budget_split,
-        "sigma_schedule": args.causal_sigma_schedule,
-        "reference_wdro_k": args.causal_reference_wdro_k if args.causal_reference_wdro_k is not None else args.wdro_k,
-        "reference_wdro_step_size": (
-            args.causal_reference_wdro_step_size if args.causal_reference_wdro_step_size is not None else args.wdro_step_size
+def build_cdro_budget_config(
+    *,
+    args: argparse.Namespace,
+    clamp_min: torch.Tensor,
+    clamp_max: torch.Tensor,
+) -> CdroBudgetConfig:
+    return CdroBudgetConfig(
+        mode=args.cdro_budget_mode,
+        fixed_total_budget=normalize_cdro_total_budget(
+            total_budget=args.cdro_total_budget,
+            budget_mode=args.cdro_budget_mode,
         ),
-        "reference_wdro_gamma": (
-            args.causal_reference_wdro_gamma if args.causal_reference_wdro_gamma is not None else args.wdro_gamma
+        reference_wdro_k=args.cdro_reference_wdro_k if args.cdro_reference_wdro_k is not None else args.wdro_k,
+        reference_wdro_step_size=(
+            args.cdro_reference_wdro_step_size if args.cdro_reference_wdro_step_size is not None else args.wdro_step_size
         ),
-    }
+        reference_wdro_gamma=(
+            args.cdro_reference_wdro_gamma if args.cdro_reference_wdro_gamma is not None else args.wdro_gamma
+        ),
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    )
 
 
-def save_causal_debug_process(
+def build_cdro_debug_config(
+    *,
+    args: argparse.Namespace,
+    cdro_config: CdroConfig,
+    cdro_budget_config: CdroBudgetConfig,
+) -> CdroDebugConfig:
+    return CdroDebugConfig(
+        num_snapshots=args.cdro_debug_snapshots,
+        num_points=args.cdro_debug_points,
+        cdro_config=cdro_config,
+        budget_config=cdro_budget_config,
+    )
+
+
+def save_cdro_debug_process(
     *,
     dataset,
     model,
@@ -575,9 +579,9 @@ def save_causal_debug_process(
     sigma_min: float,
     sigma_max: float,
     rho: float,
-    causal_debug: dict,
+    cdro_debug: CdroDebugConfig,
 ) -> None:
-    num_points = min(int(causal_debug["num_points"]), int(dataset.train_points.shape[0]))
+    num_points = min(int(cdro_debug.num_points), int(dataset.train_points.shape[0]))
     if num_points <= 0:
         return
 
@@ -585,60 +589,41 @@ def save_causal_debug_process(
     generator.manual_seed(seed)
     indices = torch.randperm(dataset.train_points.shape[0], generator=generator)[:num_points]
     clean_points = dataset.train_points[indices].to(device)
-
-    sigmas = sample_path_sigmas(
-        batch_size=clean_points.shape[0],
-        num_steps=int(causal_debug["path_steps"]),
-        p_mean=float(causal_debug["p_mean"]),
-        p_std=float(causal_debug["p_std"]),
-        sigma_min=sigma_min,
-        sigma_max=sigma_max,
-        rho=rho,
-        device=device,
-        dtype=clean_points.dtype,
-        schedule=str(causal_debug["sigma_schedule"]),
-    )
-    reference_path = build_forward_path(clean_points=clean_points, sigmas=sigmas, shared_noise=False)
-    total_budget = float(causal_debug["total_budget"])
-    total_budget = normalize_causal_total_budget(
-        total_budget=total_budget,
-        budget_mode=str(causal_debug["budget_mode"]),
-    )
-    if causal_debug["budget_mode"] == "match_wdro":
-        total_budget = estimate_wdro_transport_budget(
-            clean_points,
-            model,
-            EDMLoss2D(
-                p_mean=float(causal_debug["p_mean"]),
-                p_std=float(causal_debug["p_std"]),
-                sigma_data=float(model.sigma_data),
-            ),
-            gamma=float(causal_debug["reference_wdro_gamma"]),
-            step_size=float(causal_debug["reference_wdro_step_size"]),
-            iters=int(causal_debug["reference_wdro_k"]),
+    total_budget = resolve_cdro_total_budget(
+        clean_points=clean_points,
+        attack_net=model,
+        loss_fn=EDMLoss2D(
+            p_mean=float(cdro_debug.cdro_config.p_mean),
+            p_std=float(cdro_debug.cdro_config.p_std),
+            sigma_data=float(model.sigma_data),
+        ),
+        budget_config=CdroBudgetConfig(
+            mode=cdro_debug.budget_config.mode,
+            fixed_total_budget=cdro_debug.budget_config.fixed_total_budget,
+            reference_wdro_k=cdro_debug.budget_config.reference_wdro_k,
+            reference_wdro_step_size=cdro_debug.budget_config.reference_wdro_step_size,
+            reference_wdro_gamma=cdro_debug.budget_config.reference_wdro_gamma,
             clamp_min=dataset.bounds_min.to(device),
             clamp_max=dataset.bounds_max.to(device),
-        )
-    adv_path = solve_causal_path_attack(
+        ),
+    )
+    attack_result = solve_cdro_attack(
         attack_net=model,
         clean_points=clean_points,
-        reference_path=reference_path,
-        sigmas=sigmas,
-        inner_steps=int(causal_debug["inner_steps"]),
-        step_size=float(causal_debug["step_size"]),
-        gamma=float(causal_debug["gamma"]),
-        total_budget=total_budget,
-        exact_budget_split=bool(causal_debug["exact_budget_split"]),
+        config=cdro_debug.cdro_config.with_total_budget(total_budget),
+        shared_noise=False,
     )
 
     sigma_labels = torch.cat(
         [
             torch.zeros(1, device=device, dtype=clean_points.dtype),
-            sigmas.mean(dim=0),
+            attack_result.sigmas.mean(dim=0),
         ]
     ).cpu()
-    forward_states = [clean_points.detach().cpu()] + [adv_path[:, step_idx, :].detach().cpu() for step_idx in range(adv_path.shape[1])]
-    forward_indices = select_snapshot_indices(total_count=len(forward_states), num_snapshots=int(causal_debug["num_snapshots"]))
+    forward_states = [clean_points.detach().cpu()] + [
+        attack_result.adv_path[:, step_idx, :].detach().cpu() for step_idx in range(attack_result.adv_path.shape[1])
+    ]
+    forward_indices = select_snapshot_indices(total_count=len(forward_states), num_snapshots=int(cdro_debug.num_snapshots))
     forward_snapshots = [dataset.destandardize(forward_states[idx]).numpy() for idx in forward_indices]
     forward_titles = [
         f"step {idx}/{len(forward_states) - 1}\nσ={float(sigma_labels[idx]):.3f}" for idx in forward_indices
@@ -652,16 +637,16 @@ def save_causal_debug_process(
         rho=rho,
         num_steps=sampler_steps,
         device=device,
-        initial_points=adv_path[:, -1, :].detach(),
+        initial_points=attack_result.adv_path[:, -1, :].detach(),
     )
-    reverse_indices = select_snapshot_indices(total_count=len(reverse_states), num_snapshots=int(causal_debug["num_snapshots"]))
+    reverse_indices = select_snapshot_indices(total_count=len(reverse_states), num_snapshots=int(cdro_debug.num_snapshots))
     reverse_snapshots = [dataset.destandardize(reverse_states[idx]).numpy() for idx in reverse_indices]
     reverse_titles = [
         f"step {idx}/{len(reverse_states) - 1}\nσ={float(reverse_sigmas[idx]):.3f}" for idx in reverse_indices
     ]
 
     save_process_snapshots(
-        path=outdir / "plots" / f"causal_process_epoch_{epoch:04d}.png",
+        path=outdir / "plots" / f"cdro_process_epoch_{epoch:04d}.png",
         rows=[
             {
                 "row_title": "Noising",
@@ -676,12 +661,12 @@ def save_causal_debug_process(
                 "color": "#2ca02c",
             },
         ],
-        title=f"Causal WDRO debug | epoch {epoch}",
+        title=f"CDRO debug | epoch {epoch}",
     )
 
     early_forward = [dataset.destandardize(state).numpy() for state in forward_states[: min(3, len(forward_states))]]
     save_process_snapshots(
-        path=outdir / "plots" / f"causal_process_zoom_start_epoch_{epoch:04d}.png",
+        path=outdir / "plots" / f"cdro_process_zoom_start_epoch_{epoch:04d}.png",
         rows=[
             {
                 "row_title": "Noising",
@@ -696,7 +681,7 @@ def save_causal_debug_process(
                 "color": "#2ca02c",
             },
         ],
-        title=f"Causal WDRO debug (zoom near start) | epoch {epoch}",
+        title=f"CDRO debug (zoom near start) | epoch {epoch}",
         bounds=compute_plot_bounds(*early_forward),
     )
 
@@ -753,7 +738,28 @@ def _json_default(value):
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def normalize_causal_total_budget(*, total_budget: float | None, budget_mode: str) -> float | None:
+def resolve_cdro_total_budget(
+    *,
+    clean_points: torch.Tensor,
+    attack_net,
+    loss_fn,
+    budget_config: CdroBudgetConfig,
+) -> float | None:
+    if budget_config.mode == "match_wdro":
+        return estimate_wdro_transport_budget(
+            clean_points,
+            attack_net,
+            loss_fn,
+            gamma=float(budget_config.reference_wdro_gamma),
+            step_size=float(budget_config.reference_wdro_step_size),
+            iters=int(budget_config.reference_wdro_k),
+            clamp_min=budget_config.clamp_min,
+            clamp_max=budget_config.clamp_max,
+        )
+    return budget_config.fixed_total_budget
+
+
+def normalize_cdro_total_budget(*, total_budget: float | None, budget_mode: str) -> float | None:
     if budget_mode != "fixed":
         return total_budget
     if total_budget is None:

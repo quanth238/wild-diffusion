@@ -64,7 +64,7 @@ run python -m toy_2d.train_wild \
   --outdir "${OUT_ROOT}/wdro"
 
 run python -m toy_2d.train_wild \
-  --method causal_wdro \
+  --method cdro \
   --dataset two_moons \
   --device cpu \
   --epochs 2 \
@@ -73,17 +73,17 @@ run python -m toy_2d.train_wild \
   --num-eval-samples 256 \
   --metric-samples 256 \
   --batch-size 64 \
-  --causal-warmup-epochs 0 \
-  --causal-inner-steps 1 \
-  --causal-path-steps 4 \
-  --causal-debug-points 64 \
-  --outdir "${OUT_ROOT}/causal_wdro"
+  --cdro-warmup-epochs 0 \
+  --cdro-inner-steps 1 \
+  --cdro-path-steps 4 \
+  --cdro-debug-points 64 \
+  --outdir "${OUT_ROOT}/cdro"
 
 run python -m toy_2d.compare_methods \
   --outdir "${OUT_ROOT}/compare_methods" \
   --datasets two_moons \
   --fractions 0.2 \
-  --methods baseline wdro causal_wdro \
+  --methods baseline wdro cdro \
   --full-samples 256 \
   --seeds 0 \
   --workers 1 \
@@ -96,9 +96,9 @@ run python -m toy_2d.compare_methods \
   --wdro-k 1 \
   --wdro-warmup-epochs 0 \
   --wdro-refresh-every 1 \
-  --causal-warmup-epochs 0 \
-  --causal-inner-steps 1 \
-  --causal-path-steps 4
+  --cdro-warmup-epochs 0 \
+  --cdro-inner-steps 1 \
+  --cdro-path-steps 4
 
 echo
 echo "[INFO] toy_2d smoke test completed successfully."

@@ -10,7 +10,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from toy_2d.robust_defaults import CAUSAL_WDRO_DEFAULTS, WDRO_CORE_DEFAULTS
+from toy_2d import normalize_method_config_keys, normalize_method_names
+from toy_2d.robust_defaults import CDRO_DEFAULTS, WDRO_CORE_DEFAULTS
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "method_table")
     parser.add_argument("--method-configs", type=Path, default=None)
     parser.add_argument("--datasets", nargs="+", default=["eight_gaussians", "spiral", "two_moons"])
-    parser.add_argument("--methods", nargs="+", default=["baseline", "wdro", "causal_wdro"])
+    parser.add_argument("--methods", nargs="+", default=["baseline", "wdro", "cdro"])
     parser.add_argument("--fractions", nargs="+", type=float, default=[0.2, 0.5, 1.0])
     parser.add_argument("--full-samples", type=int, default=2000)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -43,27 +44,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-p-adv", type=float, default=WDRO_CORE_DEFAULTS["p_adv"])
     parser.add_argument("--wdro-warmup-epochs", type=int, default=25)
     parser.add_argument("--wdro-refresh-every", type=int, default=10)
-    parser.add_argument("--causal-warmup-epochs", type=int, default=CAUSAL_WDRO_DEFAULTS["warmup_epochs"])
-    parser.add_argument("--causal-path-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["path_steps"])
-    parser.add_argument("--causal-inner-steps", type=int, default=CAUSAL_WDRO_DEFAULTS["inner_steps"])
-    parser.add_argument("--causal-step-size", type=float, default=CAUSAL_WDRO_DEFAULTS["step_size"])
-    parser.add_argument("--causal-gamma", type=float, default=CAUSAL_WDRO_DEFAULTS["gamma"])
-    parser.add_argument("--causal-total-budget", type=float, default=CAUSAL_WDRO_DEFAULTS["total_budget"])
+    parser.add_argument("--cdro-warmup-epochs", type=int, default=CDRO_DEFAULTS["warmup_epochs"])
+    parser.add_argument("--cdro-path-steps", type=int, default=CDRO_DEFAULTS["path_steps"])
+    parser.add_argument("--cdro-inner-steps", type=int, default=CDRO_DEFAULTS["inner_steps"])
+    parser.add_argument("--cdro-step-size", type=float, default=CDRO_DEFAULTS["step_size"])
+    parser.add_argument("--cdro-gamma", type=float, default=CDRO_DEFAULTS["gamma"])
+    parser.add_argument("--cdro-total-budget", type=float, default=CDRO_DEFAULTS["total_budget"])
     parser.add_argument(
-        "--causal-budget-mode",
+        "--cdro-budget-mode",
         type=str,
-        default=CAUSAL_WDRO_DEFAULTS["budget_mode"],
+        default=CDRO_DEFAULTS["budget_mode"],
         choices=("fixed", "match_wdro", "match_wdro_run"),
     )
     parser.add_argument(
-        "--causal-exact-budget-split",
+        "--cdro-exact-budget-split",
         action=argparse.BooleanOptionalAction,
-        default=CAUSAL_WDRO_DEFAULTS["exact_budget_split"],
+        default=CDRO_DEFAULTS["exact_budget_split"],
     )
     parser.add_argument(
-        "--causal-sigma-schedule",
+        "--cdro-sigma-schedule",
         type=str,
-        default=CAUSAL_WDRO_DEFAULTS["sigma_schedule"],
+        default=CDRO_DEFAULTS["sigma_schedule"],
         choices=("edm_random", "edm_quantiles", "karras_grid"),
     )
     parser.add_argument("--sampler-steps", type=int, default=20)
@@ -75,6 +76,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.methods = normalize_method_names(args.methods)
     root = Path(__file__).resolve().parents[1]
     args.outdir.mkdir(parents=True, exist_ok=True)
     method_configs = load_method_configs(args.method_configs)
@@ -100,10 +102,10 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
     jobs = []
     wdro_reference_config = method_configs.get("wdro", {})
     if any(
-        str(method_configs.get("causal_wdro", {}).get("causal_budget_mode", args.causal_budget_mode)) == "match_wdro_run"
+        str(method_configs.get("cdro", {}).get("cdro_budget_mode", args.cdro_budget_mode)) == "match_wdro_run"
         for _ in [0]
     ) and "wdro" not in args.methods:
-        raise ValueError("causal_budget_mode=match_wdro_run requires wdro to be included in --methods.")
+        raise ValueError("cdro_budget_mode=match_wdro_run requires wdro to be included in --methods.")
     for dataset in args.datasets:
         for fraction in args.fractions:
             num_samples = max(64, int(round(args.full_samples * fraction)))
@@ -111,11 +113,11 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
             for method in args.methods:
                 method_config = method_configs.get(method, {})
                 for seed in args.seeds:
-                    requested_causal_budget_mode = str(
-                        get_config_value(method_config, "causal_budget_mode", args.causal_budget_mode)
+                    requested_cdro_budget_mode = str(
+                        get_config_value(method_config, "cdro_budget_mode", args.cdro_budget_mode)
                     )
-                    resolved_causal_budget_mode = (
-                        "fixed" if requested_causal_budget_mode == "match_wdro_run" else requested_causal_budget_mode
+                    resolved_cdro_budget_mode = (
+                        "fixed" if requested_cdro_budget_mode == "match_wdro_run" else requested_cdro_budget_mode
                     )
                     outdir = args.outdir / dataset / fraction_tag / method / f"seed{seed}"
                     command = [
@@ -164,40 +166,40 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
                         str(get_config_value(method_config, "wdro_warmup_epochs", args.wdro_warmup_epochs)),
                         "--wdro-refresh-every",
                         str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
-                        "--causal-path-steps",
-                        str(get_config_value(method_config, "causal_path_steps", args.causal_path_steps)),
-                        "--causal-warmup-epochs",
-                        str(get_config_value(method_config, "causal_warmup_epochs", args.causal_warmup_epochs)),
-                        "--causal-inner-steps",
-                        str(get_config_value(method_config, "causal_inner_steps", args.causal_inner_steps)),
-                        "--causal-step-size",
-                        str(get_config_value(method_config, "causal_step_size", args.causal_step_size)),
-                        "--causal-gamma",
-                        str(get_config_value(method_config, "causal_gamma", args.causal_gamma)),
-                        "--causal-total-budget",
-                        str(get_config_value(method_config, "causal_total_budget", args.causal_total_budget)),
-                        "--causal-budget-mode",
-                        resolved_causal_budget_mode,
-                        "--causal-exact-budget-split"
-                        if bool(get_config_value(method_config, "causal_exact_budget_split", args.causal_exact_budget_split))
-                        else "--no-causal-exact-budget-split",
-                        "--causal-sigma-schedule",
-                        str(get_config_value(method_config, "causal_sigma_schedule", args.causal_sigma_schedule)),
-                        "--causal-reference-wdro-k",
-                        str(get_config_value(method_config, "causal_reference_wdro_k", get_config_value(wdro_reference_config, "wdro_k", args.wdro_k))),
-                        "--causal-reference-wdro-step-size",
+                        "--cdro-path-steps",
+                        str(get_config_value(method_config, "cdro_path_steps", args.cdro_path_steps)),
+                        "--cdro-warmup-epochs",
+                        str(get_config_value(method_config, "cdro_warmup_epochs", args.cdro_warmup_epochs)),
+                        "--cdro-inner-steps",
+                        str(get_config_value(method_config, "cdro_inner_steps", args.cdro_inner_steps)),
+                        "--cdro-step-size",
+                        str(get_config_value(method_config, "cdro_step_size", args.cdro_step_size)),
+                        "--cdro-gamma",
+                        str(get_config_value(method_config, "cdro_gamma", args.cdro_gamma)),
+                        "--cdro-total-budget",
+                        str(get_config_value(method_config, "cdro_total_budget", args.cdro_total_budget)),
+                        "--cdro-budget-mode",
+                        resolved_cdro_budget_mode,
+                        "--cdro-exact-budget-split"
+                        if bool(get_config_value(method_config, "cdro_exact_budget_split", args.cdro_exact_budget_split))
+                        else "--no-cdro-exact-budget-split",
+                        "--cdro-sigma-schedule",
+                        str(get_config_value(method_config, "cdro_sigma_schedule", args.cdro_sigma_schedule)),
+                        "--cdro-reference-wdro-k",
+                        str(get_config_value(method_config, "cdro_reference_wdro_k", get_config_value(wdro_reference_config, "wdro_k", args.wdro_k))),
+                        "--cdro-reference-wdro-step-size",
                         str(
                             get_config_value(
                                 method_config,
-                                "causal_reference_wdro_step_size",
+                                "cdro_reference_wdro_step_size",
                                 get_config_value(wdro_reference_config, "wdro_step_size", args.wdro_step_size),
                             )
                         ),
-                        "--causal-reference-wdro-gamma",
+                        "--cdro-reference-wdro-gamma",
                         str(
                             get_config_value(
                                 method_config,
-                                "causal_reference_wdro_gamma",
+                                "cdro_reference_wdro_gamma",
                                 get_config_value(wdro_reference_config, "wdro_gamma", args.wdro_gamma),
                             )
                         ),
@@ -217,9 +219,9 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
                             "method": method,
                             "seed": seed,
                             "command": command,
-                            "requested_causal_budget_mode": requested_causal_budget_mode if method == "causal_wdro" else None,
+                            "requested_cdro_budget_mode": requested_cdro_budget_mode if method == "cdro" else None,
                             "reference_wdro_outdir": (
-                                args.outdir / dataset / fraction_tag / "wdro" / f"seed{seed}" if method == "causal_wdro" else None
+                                args.outdir / dataset / fraction_tag / "wdro" / f"seed{seed}" if method == "cdro" else None
                             ),
                         }
                     )
@@ -227,21 +229,21 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
 
 
 def run_jobs(*, jobs: list[dict], workers: int) -> list[dict]:
-    dependent_causal_jobs = [
+    dependent_cdro_jobs = [
         job
         for job in jobs
-        if job["method"] == "causal_wdro" and job.get("requested_causal_budget_mode") == "match_wdro_run"
+        if job["method"] == "cdro" and job.get("requested_cdro_budget_mode") == "match_wdro_run"
     ]
-    phase_one_jobs = [job for job in jobs if job not in dependent_causal_jobs]
+    phase_one_jobs = [job for job in jobs if job not in dependent_cdro_jobs]
 
     results: list[dict] = []
     if phase_one_jobs:
         with futures.ThreadPoolExecutor(max_workers=workers) as executor:
             for item in executor.map(run_job, phase_one_jobs):
                 results.append(item)
-    if dependent_causal_jobs:
+    if dependent_cdro_jobs:
         with futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            for item in executor.map(run_job, dependent_causal_jobs):
+            for item in executor.map(run_job, dependent_cdro_jobs):
                 results.append(item)
     return results
 
@@ -250,15 +252,15 @@ def run_job(job: dict) -> dict:
     summary_path = job["outdir"] / "summary.json"
     if not summary_path.is_file():
         command = list(job["command"])
-        if job["method"] == "causal_wdro" and job.get("requested_causal_budget_mode") == "match_wdro_run":
+        if job["method"] == "cdro" and job.get("requested_cdro_budget_mode") == "match_wdro_run":
             ref_summary_path = Path(job["reference_wdro_outdir"]) / "summary.json"
             if not ref_summary_path.is_file():
-                raise FileNotFoundError(f"Missing WDRO reference summary for causal budget match: {ref_summary_path}")
+                raise FileNotFoundError(f"Missing WDRO reference summary for CDRO budget match: {ref_summary_path}")
             ref_summary = json.loads(ref_summary_path.read_text(encoding="utf-8"))
             epsilon = ref_summary["last_eval"].get(
                 "total_transport_cost", ref_summary["last_eval"].get("mean_transport_cost", 0.0)
             )
-            replace_command_arg(command, "--causal-total-budget", str(epsilon))
+            replace_command_arg(command, "--cdro-total-budget", str(epsilon))
         subprocess.run(
             command,
             cwd=job["root"],
@@ -284,7 +286,7 @@ def run_job(job: dict) -> dict:
         "total_transport_cost": summary["last_eval"].get(
             "total_transport_cost", summary["last_eval"].get("mean_transport_cost", 0.0)
         ),
-        "target_total_budget": summary["last_eval"].get("causal_target_total_budget"),
+        "target_total_budget": summary["last_eval"].get("cdro_target_total_budget"),
         "max_total_transport_cost": summary["last_eval"].get(
             "max_total_transport_cost", summary["last_eval"].get("max_transport_cost", 0.0)
         ),
@@ -342,13 +344,13 @@ def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_c
                     row[f"{method}_runtime_overhead_pct"] = percent_overhead(
                         baseline_runtime, row[f"{method}_runtime_min"]
                     )
-                if "wdro" in args.methods and "causal_wdro" in args.methods:
+                if "wdro" in args.methods and "cdro" in args.methods:
                     wdro_cost = row["wdro_total_transport_cost"]
-                    causal_cost = row["causal_wdro_total_transport_cost"]
-                    causal_target = row["causal_wdro_target_total_budget"]
-                    row["causal_vs_wdro_total_cost_gap_pct"] = percent_overhead(wdro_cost, causal_cost)
-                    if causal_target is not None:
-                        row["causal_target_vs_wdro_gap_pct"] = percent_overhead(wdro_cost, causal_target)
+                    cdro_cost = row["cdro_total_transport_cost"]
+                    cdro_target = row["cdro_target_total_budget"]
+                    row["cdro_vs_wdro_total_cost_gap_pct"] = percent_overhead(wdro_cost, cdro_cost)
+                    if cdro_target is not None:
+                        row["cdro_target_vs_wdro_gap_pct"] = percent_overhead(wdro_cost, cdro_target)
 
             summary_rows.append(row)
 
@@ -377,15 +379,15 @@ def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_c
             "wdro_p_adv": args.wdro_p_adv,
             "wdro_warmup_epochs": args.wdro_warmup_epochs,
             "wdro_refresh_every": args.wdro_refresh_every,
-            "causal_path_steps": args.causal_path_steps,
-            "causal_warmup_epochs": args.causal_warmup_epochs,
-            "causal_inner_steps": args.causal_inner_steps,
-            "causal_step_size": args.causal_step_size,
-            "causal_gamma": args.causal_gamma,
-            "causal_total_budget": args.causal_total_budget,
-            "causal_budget_mode": args.causal_budget_mode,
-            "causal_exact_budget_split": args.causal_exact_budget_split,
-            "causal_sigma_schedule": args.causal_sigma_schedule,
+            "cdro_path_steps": args.cdro_path_steps,
+            "cdro_warmup_epochs": args.cdro_warmup_epochs,
+            "cdro_inner_steps": args.cdro_inner_steps,
+            "cdro_step_size": args.cdro_step_size,
+            "cdro_gamma": args.cdro_gamma,
+            "cdro_total_budget": args.cdro_total_budget,
+            "cdro_budget_mode": args.cdro_budget_mode,
+            "cdro_exact_budget_split": args.cdro_exact_budget_split,
+            "cdro_sigma_schedule": args.cdro_sigma_schedule,
             "sampler_steps": args.sampler_steps,
             "save_eval_checkpoints": args.save_eval_checkpoints,
             "figure_epoch_mode": args.figure_epoch_mode,
@@ -455,8 +457,8 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_total_transport_cost']:.4f}" for method in methods)
         lines.append(markdown_row(cells))
-    if "wdro" in methods and "causal_wdro" in methods and any(
-        row.get("causal_wdro_target_total_budget") is not None for row in aggregate["summary"]
+    if "wdro" in methods and "cdro" in methods and any(
+        row.get("cdro_target_total_budget") is not None for row in aggregate["summary"]
     ):
         lines += [
             "",
@@ -467,25 +469,25 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
                     "Dataset",
                     "Data",
                     "WDRO Cost",
-                    "Causal Target",
-                    "Causal Realized",
+                    "CDRO Target",
+                    "CDRO Realized",
                     "Target Gap",
                     "Realized Gap",
                 ]
             ),
         ]
         for row in aggregate["summary"]:
-            target_budget = row["causal_wdro_target_total_budget"]
+            target_budget = row["cdro_target_total_budget"]
             cells = [
                 row["dataset"],
                 row["fraction_tag"],
                 f"{row['wdro_total_transport_cost']:.4f}",
                 "n/a" if target_budget is None else f"{target_budget:.4f}",
-                f"{row['causal_wdro_total_transport_cost']:.4f}",
+                f"{row['cdro_total_transport_cost']:.4f}",
                 "n/a"
                 if target_budget is None
-                else f"{row['causal_target_vs_wdro_gap_pct']:.2f}%",
-                f"{row['causal_vs_wdro_total_cost_gap_pct']:.2f}%",
+                else f"{row['cdro_target_vs_wdro_gap_pct']:.2f}%",
+                f"{row['cdro_vs_wdro_total_cost_gap_pct']:.2f}%",
             ]
             lines.append(markdown_row(cells))
     lines += [
@@ -607,7 +609,7 @@ def percent_overhead(baseline: float, candidate: float) -> float:
 def load_method_configs(path: Path | None) -> dict[str, dict]:
     if path is None:
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    return normalize_method_config_keys(json.loads(path.read_text(encoding="utf-8")))
 
 
 def get_config_value(method_config: dict, key: str, fallback):
@@ -629,8 +631,8 @@ def format_method_name(method: str) -> str:
         return "Baseline"
     if method == "wdro":
         return "WDRO"
-    if method == "causal_wdro":
-        return "Causal WDRO"
+    if method == "cdro":
+        return "CDRO"
     return method.replace("_", " ").title()
 
 

@@ -33,9 +33,9 @@ python -m toy_2d.train_wild `
   --outdir toy-runs\_sum_probe_wdro
 ```
 
-## 2. Causal Budget Probe
+## 2. CDRO Budget Probe
 
-Probe `causal_wdro` over a small grid of `path_steps` and `gamma` values.
+Probe `cdro` over a small grid of `path_steps` and `gamma` values.
 
 ```powershell
 $pathSteps = 8,16,24
@@ -45,7 +45,7 @@ foreach ($t in $pathSteps) {
     $tag = "t${t}_g${g}".Replace('.','p')
     python -m toy_2d.train_wild `
       --dataset two_moons `
-      --method causal_wdro `
+      --method cdro `
       --epochs 3 `
       --num-samples 512 `
       --batch-size 128 `
@@ -60,11 +60,11 @@ foreach ($t in $pathSteps) {
       --depth 4 `
       --embedding-dim 64 `
       --sampler-steps 20 `
-      --causal-path-steps $t `
-      --causal-inner-steps 2 `
-      --causal-step-size 0.0005 `
-      --causal-gamma $g `
-      --causal-sigma-schedule karras_grid `
+      --cdro-path-steps $t `
+      --cdro-inner-steps 2 `
+      --cdro-step-size 0.0005 `
+      --cdro-gamma $g `
+      --cdro-sigma-schedule karras_grid `
       --outdir "toy-runs\_sum_probe_$tag"
   }
 }
@@ -78,7 +78,7 @@ foreach ($s in $steps) {
   $tag = "s${s}".Replace('.','p')
   python -m toy_2d.train_wild `
     --dataset two_moons `
-    --method causal_wdro `
+    --method cdro `
     --epochs 3 `
     --num-samples 512 `
     --batch-size 128 `
@@ -93,24 +93,24 @@ foreach ($s in $steps) {
     --depth 4 `
     --embedding-dim 64 `
     --sampler-steps 20 `
-    --causal-path-steps 16 `
-    --causal-inner-steps 2 `
-    --causal-step-size $s `
-    --causal-gamma 10 `
-    --causal-sigma-schedule karras_grid `
+    --cdro-path-steps 16 `
+    --cdro-inner-steps 2 `
+    --cdro-step-size $s `
+    --cdro-gamma 10 `
+    --cdro-sigma-schedule karras_grid `
     --outdir "toy-runs\_sum_probe_$tag"
 }
 ```
 
-## 3. Coarse Causal Tuning Sweep
+## 3. Coarse CDRO Tuning Sweep
 
-This is the main coarse tuning pass for the accumulated-cost `causal_wdro`.
+This is the main coarse tuning pass for the accumulated-cost `cdro`.
 
 ```powershell
 python -m toy_2d.tune_wild `
   --outdir toy-runs\tuning_path_sumcost_tmp `
   --datasets eight_gaussians spiral two_moons `
-  --methods causal_wdro `
+  --methods cdro `
   --trials 12 `
   --workers 4 `
   --epochs 20 `
@@ -131,7 +131,7 @@ Get-Content toy-runs\tuning_path_sumcost_tmp\best_config.json
 
 ## 4. Update Method Configs
 
-After selecting the causal config, update the local comparison config files:
+After selecting the `cdro` config, update the local comparison config files:
 - `toy-runs\tuned_method_configs_v1.json`
 - `toy-runs\tuned_method_configs_hq_v1.json`
 - `toy-runs\tuned_method_configs_xt_v1.json`
@@ -146,7 +146,7 @@ python -m toy_2d.compare_methods `
   --outdir toy-runs\method_table_path_v1 `
   --method-configs toy-runs\tuned_method_configs_v1.json `
   --datasets eight_gaussians spiral two_moons `
-  --methods baseline wdro causal_wdro `
+  --methods baseline wdro cdro `
   --fractions 0.2 0.5 1.0 `
   --full-samples 2000 `
   --seeds 0 1 2 `
@@ -166,7 +166,7 @@ python -m toy_2d.compare_methods `
   --outdir toy-runs\high_quality_100pct_path_v1 `
   --method-configs toy-runs\tuned_method_configs_hq_v1.json `
   --datasets eight_gaussians spiral two_moons `
-  --methods baseline wdro causal_wdro `
+  --methods baseline wdro cdro `
   --fractions 1.0 `
   --full-samples 4000 `
   --seeds 0 `
