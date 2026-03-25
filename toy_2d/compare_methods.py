@@ -10,8 +10,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from toy_2d import normalize_method_config_keys, normalize_method_names
-from toy_2d.robust_defaults import CDRO_DEFAULTS, WDRO_CORE_DEFAULTS
+from toy_2d import normalize_comparison_method_config_keys, normalize_comparison_method_names
+from toy_2d.robust_defaults import CDRO_DEFAULTS, CDRO_MARKOV_DEFAULTS, WDRO_CORE_DEFAULTS
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "method_table")
     parser.add_argument("--method-configs", type=Path, default=None)
     parser.add_argument("--datasets", nargs="+", default=["eight_gaussians", "spiral", "two_moons"])
-    parser.add_argument("--methods", nargs="+", default=["baseline", "wdro", "cdro"])
+    parser.add_argument("--methods", nargs="+", default=["baseline", "wdro", "cdro", "cdro_markov"])
     parser.add_argument("--fractions", nargs="+", type=float, default=[0.2, 0.5, 1.0])
     parser.add_argument("--full-samples", type=int, default=2000)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.methods = normalize_method_names(args.methods)
+    args.methods = normalize_comparison_method_names(args.methods)
     root = Path(__file__).resolve().parents[1]
     args.outdir.mkdir(parents=True, exist_ok=True)
     method_configs = load_method_configs(args.method_configs)
@@ -120,92 +120,17 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
                         "fixed" if requested_cdro_budget_mode == "match_wdro_run" else requested_cdro_budget_mode
                     )
                     outdir = args.outdir / dataset / fraction_tag / method / f"seed{seed}"
-                    command = [
-                        sys.executable,
-                        "-m",
-                        "toy_2d.train_wild",
-                        "--dataset",
-                        dataset,
-                        "--method",
-                        method,
-                        "--epochs",
-                        str(args.epochs),
-                        "--num-samples",
-                        str(num_samples),
-                        "--batch-size",
-                        str(args.batch_size),
-                        "--eval-every",
-                        str(args.eval_every),
-                        "--num-eval-samples",
-                        str(args.num_eval_samples),
-                        "--metric-samples",
-                        str(args.metric_samples),
-                        "--seed",
-                        str(seed),
-                        "--outdir",
-                        str(outdir),
-                        "--lr",
-                        str(get_config_value(method_config, "lr", args.lr)),
-                        "--ema-decay",
-                        str(get_config_value(method_config, "ema_decay", args.ema_decay)),
-                        "--hidden-dim",
-                        str(get_config_value(method_config, "hidden_dim", args.hidden_dim)),
-                        "--depth",
-                        str(get_config_value(method_config, "depth", args.depth)),
-                        "--embedding-dim",
-                        str(get_config_value(method_config, "embedding_dim", args.embedding_dim)),
-                        "--wdro-k",
-                        str(get_config_value(method_config, "wdro_k", args.wdro_k)),
-                        "--wdro-step-size",
-                        str(get_config_value(method_config, "wdro_step_size", args.wdro_step_size)),
-                        "--wdro-gamma",
-                        str(get_config_value(method_config, "wdro_gamma", args.wdro_gamma)),
-                        "--wdro-p-adv",
-                        str(get_config_value(method_config, "wdro_p_adv", args.wdro_p_adv)),
-                        "--wdro-warmup-epochs",
-                        str(get_config_value(method_config, "wdro_warmup_epochs", args.wdro_warmup_epochs)),
-                        "--wdro-refresh-every",
-                        str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
-                        "--cdro-path-steps",
-                        str(get_config_value(method_config, "cdro_path_steps", args.cdro_path_steps)),
-                        "--cdro-warmup-epochs",
-                        str(get_config_value(method_config, "cdro_warmup_epochs", args.cdro_warmup_epochs)),
-                        "--cdro-inner-steps",
-                        str(get_config_value(method_config, "cdro_inner_steps", args.cdro_inner_steps)),
-                        "--cdro-step-size",
-                        str(get_config_value(method_config, "cdro_step_size", args.cdro_step_size)),
-                        "--cdro-gamma",
-                        str(get_config_value(method_config, "cdro_gamma", args.cdro_gamma)),
-                        "--cdro-total-budget",
-                        str(get_config_value(method_config, "cdro_total_budget", args.cdro_total_budget)),
-                        "--cdro-budget-mode",
-                        resolved_cdro_budget_mode,
-                        "--cdro-exact-budget-split"
-                        if bool(get_config_value(method_config, "cdro_exact_budget_split", args.cdro_exact_budget_split))
-                        else "--no-cdro-exact-budget-split",
-                        "--cdro-sigma-schedule",
-                        str(get_config_value(method_config, "cdro_sigma_schedule", args.cdro_sigma_schedule)),
-                        "--cdro-reference-wdro-k",
-                        str(get_config_value(method_config, "cdro_reference_wdro_k", get_config_value(wdro_reference_config, "wdro_k", args.wdro_k))),
-                        "--cdro-reference-wdro-step-size",
-                        str(
-                            get_config_value(
-                                method_config,
-                                "cdro_reference_wdro_step_size",
-                                get_config_value(wdro_reference_config, "wdro_step_size", args.wdro_step_size),
-                            )
-                        ),
-                        "--cdro-reference-wdro-gamma",
-                        str(
-                            get_config_value(
-                                method_config,
-                                "cdro_reference_wdro_gamma",
-                                get_config_value(wdro_reference_config, "wdro_gamma", args.wdro_gamma),
-                            )
-                        ),
-                        "--sampler-steps",
-                        str(get_config_value(method_config, "sampler_steps", args.sampler_steps)),
-                    ]
+                    command = build_method_command(
+                        args=args,
+                        dataset=dataset,
+                        method=method,
+                        method_config=method_config,
+                        wdro_reference_config=wdro_reference_config,
+                        num_samples=num_samples,
+                        outdir=outdir,
+                        seed=seed,
+                        resolved_cdro_budget_mode=resolved_cdro_budget_mode,
+                    )
                     if args.save_eval_checkpoints:
                         command.append("--save-eval-checkpoints")
                     jobs.append(
@@ -269,6 +194,7 @@ def run_job(job: dict) -> dict:
             stderr=subprocess.DEVNULL,
         )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    last_eval = summary["last_eval"]
     return {
         "dataset": job["dataset"],
         "fraction": job["fraction"],
@@ -278,19 +204,19 @@ def run_job(job: dict) -> dict:
         "seed": job["seed"],
         "best_swd": summary["best_sliced_wasserstein"],
         "best_epoch": summary.get("best_epoch"),
-        "last_epoch": summary["last_eval"]["epoch"],
-        "last_swd": summary["last_eval"]["sliced_wasserstein"],
-        "mmd": summary["last_eval"]["mmd_rbf"],
-        "mean_transport_cost": summary["last_eval"].get("mean_transport_cost", 0.0),
-        "max_transport_cost": summary["last_eval"].get("max_transport_cost", 0.0),
-        "total_transport_cost": summary["last_eval"].get(
-            "total_transport_cost", summary["last_eval"].get("mean_transport_cost", 0.0)
+        "last_epoch": last_eval["epoch"],
+        "last_swd": last_eval["sliced_wasserstein"],
+        "mmd": last_eval["mmd_rbf"],
+        "mean_transport_cost": last_eval.get("mean_transport_cost", last_eval.get("control_cost", 0.0)),
+        "max_transport_cost": last_eval.get("max_transport_cost", last_eval.get("control_cost", 0.0)),
+        "total_transport_cost": last_eval.get(
+            "total_transport_cost", last_eval.get("control_cost", last_eval.get("mean_transport_cost", 0.0))
         ),
-        "target_total_budget": summary["last_eval"].get("cdro_target_total_budget"),
-        "max_total_transport_cost": summary["last_eval"].get(
-            "max_total_transport_cost", summary["last_eval"].get("max_transport_cost", 0.0)
+        "target_total_budget": last_eval.get("cdro_target_total_budget", last_eval.get("target_total_budget")),
+        "max_total_transport_cost": last_eval.get(
+            "max_total_transport_cost", last_eval.get("control_cost", last_eval.get("max_transport_cost", 0.0))
         ),
-        "final_loss": summary["final_loss"],
+        "final_loss": summary.get("final_loss", last_eval.get("train_loss", last_eval.get("score_loss"))),
         "runtime_minutes": summary["runtime_minutes"],
         "run_dir": str(job["outdir"]),
     }
@@ -609,7 +535,7 @@ def percent_overhead(baseline: float, candidate: float) -> float:
 def load_method_configs(path: Path | None) -> dict[str, dict]:
     if path is None:
         return {}
-    return normalize_method_config_keys(json.loads(path.read_text(encoding="utf-8")))
+    return normalize_comparison_method_config_keys(json.loads(path.read_text(encoding="utf-8")))
 
 
 def get_config_value(method_config: dict, key: str, fallback):
@@ -633,6 +559,8 @@ def format_method_name(method: str) -> str:
         return "WDRO"
     if method == "cdro":
         return "CDRO"
+    if method == "cdro_markov":
+        return "CDRO Markov"
     return method.replace("_", " ").title()
 
 
@@ -663,6 +591,175 @@ def markdown_header(columns: list[str]) -> str:
 
 def markdown_row(columns) -> str:
     return "| " + " | ".join(str(value) for value in columns) + " |"
+
+
+def build_method_command(
+    *,
+    args: argparse.Namespace,
+    dataset: str,
+    method: str,
+    method_config: dict,
+    wdro_reference_config: dict,
+    num_samples: int,
+    outdir: Path,
+    seed: int,
+    resolved_cdro_budget_mode: str,
+) -> list[str]:
+    if method == "cdro_markov":
+        return [
+            sys.executable,
+            "-m",
+            "toy_2d.train_cdro_markov",
+            "--dataset",
+            dataset,
+            "--epochs",
+            str(args.epochs),
+            "--num-samples",
+            str(num_samples),
+            "--batch-size",
+            str(args.batch_size),
+            "--eval-every",
+            str(args.eval_every),
+            "--num-eval-samples",
+            str(args.num_eval_samples),
+            "--metric-samples",
+            str(args.metric_samples),
+            "--seed",
+            str(seed),
+            "--outdir",
+            str(outdir),
+            "--ema-decay",
+            str(get_config_value(method_config, "ema_decay", args.ema_decay)),
+            "--embedding-dim",
+            str(get_config_value(method_config, "embedding_dim", args.embedding_dim)),
+            "--score-lr",
+            str(get_config_value(method_config, "score_lr", get_config_value(method_config, "lr", CDRO_MARKOV_DEFAULTS["score_lr"]))),
+            "--control-lr",
+            str(get_config_value(method_config, "control_lr", CDRO_MARKOV_DEFAULTS["control_lr"])),
+            "--lambda-lr",
+            str(get_config_value(method_config, "lambda_lr", CDRO_MARKOV_DEFAULTS["lambda_lr"])),
+            "--lambda-init",
+            str(get_config_value(method_config, "lambda_init", CDRO_MARKOV_DEFAULTS["lambda_init"])),
+            "--lambda-min",
+            str(get_config_value(method_config, "lambda_min", CDRO_MARKOV_DEFAULTS["lambda_min"])),
+            "--control-radius",
+            str(get_config_value(method_config, "control_radius", CDRO_MARKOV_DEFAULTS["control_radius"])),
+            "--warmup-epochs",
+            str(get_config_value(method_config, "warmup_epochs", CDRO_MARKOV_DEFAULTS["warmup_epochs"])),
+            "--adversary-steps",
+            str(get_config_value(method_config, "adversary_steps", CDRO_MARKOV_DEFAULTS["adversary_steps"])),
+            "--score-steps",
+            str(get_config_value(method_config, "score_steps", CDRO_MARKOV_DEFAULTS["score_steps"])),
+            "--terminal-momentum",
+            str(get_config_value(method_config, "terminal_momentum", CDRO_MARKOV_DEFAULTS["terminal_momentum"])),
+            "--num-steps",
+            str(get_config_value(method_config, "num_steps", CDRO_MARKOV_DEFAULTS["num_steps"])),
+            "--total-time",
+            str(get_config_value(method_config, "total_time", CDRO_MARKOV_DEFAULTS["total_time"])),
+            "--beta-min",
+            str(get_config_value(method_config, "beta_min", CDRO_MARKOV_DEFAULTS["beta_min"])),
+            "--beta-max",
+            str(get_config_value(method_config, "beta_max", CDRO_MARKOV_DEFAULTS["beta_max"])),
+            "--score-weight-schedule",
+            str(get_config_value(method_config, "score_weight_schedule", CDRO_MARKOV_DEFAULTS["score_weight_schedule"])),
+            "--score-hidden-dim",
+            str(get_config_value(method_config, "score_hidden_dim", get_config_value(method_config, "hidden_dim", CDRO_MARKOV_DEFAULTS["score_hidden_dim"]))),
+            "--score-depth",
+            str(get_config_value(method_config, "score_depth", get_config_value(method_config, "depth", CDRO_MARKOV_DEFAULTS["score_depth"]))),
+            "--control-hidden-dim",
+            str(get_config_value(method_config, "control_hidden_dim", CDRO_MARKOV_DEFAULTS["control_hidden_dim"])),
+            "--control-depth",
+            str(get_config_value(method_config, "control_depth", CDRO_MARKOV_DEFAULTS["control_depth"])),
+            "--control-scale",
+            str(get_config_value(method_config, "control_scale", CDRO_MARKOV_DEFAULTS["control_scale"])),
+        ]
+
+    return [
+        sys.executable,
+        "-m",
+        "toy_2d.train_wild",
+        "--dataset",
+        dataset,
+        "--method",
+        method,
+        "--epochs",
+        str(args.epochs),
+        "--num-samples",
+        str(num_samples),
+        "--batch-size",
+        str(args.batch_size),
+        "--eval-every",
+        str(args.eval_every),
+        "--num-eval-samples",
+        str(args.num_eval_samples),
+        "--metric-samples",
+        str(args.metric_samples),
+        "--seed",
+        str(seed),
+        "--outdir",
+        str(outdir),
+        "--lr",
+        str(get_config_value(method_config, "lr", args.lr)),
+        "--ema-decay",
+        str(get_config_value(method_config, "ema_decay", args.ema_decay)),
+        "--hidden-dim",
+        str(get_config_value(method_config, "hidden_dim", args.hidden_dim)),
+        "--depth",
+        str(get_config_value(method_config, "depth", args.depth)),
+        "--embedding-dim",
+        str(get_config_value(method_config, "embedding_dim", args.embedding_dim)),
+        "--wdro-k",
+        str(get_config_value(method_config, "wdro_k", args.wdro_k)),
+        "--wdro-step-size",
+        str(get_config_value(method_config, "wdro_step_size", args.wdro_step_size)),
+        "--wdro-gamma",
+        str(get_config_value(method_config, "wdro_gamma", args.wdro_gamma)),
+        "--wdro-p-adv",
+        str(get_config_value(method_config, "wdro_p_adv", args.wdro_p_adv)),
+        "--wdro-warmup-epochs",
+        str(get_config_value(method_config, "wdro_warmup_epochs", args.wdro_warmup_epochs)),
+        "--wdro-refresh-every",
+        str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
+        "--cdro-path-steps",
+        str(get_config_value(method_config, "cdro_path_steps", args.cdro_path_steps)),
+        "--cdro-warmup-epochs",
+        str(get_config_value(method_config, "cdro_warmup_epochs", args.cdro_warmup_epochs)),
+        "--cdro-inner-steps",
+        str(get_config_value(method_config, "cdro_inner_steps", args.cdro_inner_steps)),
+        "--cdro-step-size",
+        str(get_config_value(method_config, "cdro_step_size", args.cdro_step_size)),
+        "--cdro-gamma",
+        str(get_config_value(method_config, "cdro_gamma", args.cdro_gamma)),
+        "--cdro-total-budget",
+        str(get_config_value(method_config, "cdro_total_budget", args.cdro_total_budget)),
+        "--cdro-budget-mode",
+        resolved_cdro_budget_mode,
+        "--cdro-exact-budget-split"
+        if bool(get_config_value(method_config, "cdro_exact_budget_split", args.cdro_exact_budget_split))
+        else "--no-cdro-exact-budget-split",
+        "--cdro-sigma-schedule",
+        str(get_config_value(method_config, "cdro_sigma_schedule", args.cdro_sigma_schedule)),
+        "--cdro-reference-wdro-k",
+        str(get_config_value(method_config, "cdro_reference_wdro_k", get_config_value(wdro_reference_config, "wdro_k", args.wdro_k))),
+        "--cdro-reference-wdro-step-size",
+        str(
+            get_config_value(
+                method_config,
+                "cdro_reference_wdro_step_size",
+                get_config_value(wdro_reference_config, "wdro_step_size", args.wdro_step_size),
+            )
+        ),
+        "--cdro-reference-wdro-gamma",
+        str(
+            get_config_value(
+                method_config,
+                "cdro_reference_wdro_gamma",
+                get_config_value(wdro_reference_config, "wdro_gamma", args.wdro_gamma),
+            )
+        ),
+        "--sampler-steps",
+        str(get_config_value(method_config, "sampler_steps", args.sampler_steps)),
+    ]
 
 
 if __name__ == "__main__":

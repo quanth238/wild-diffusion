@@ -179,6 +179,25 @@ python -m toy_2d.compare_methods `
   --metric-samples 2048
 ```
 
+## 6b. Comparison Including Markov CDRO
+
+```powershell
+python -m toy_2d.compare_methods `
+  --outdir toy-runs\method_table_with_markov `
+  --method-configs toy-runs\tuned_method_configs_v1.json `
+  --datasets eight_gaussians spiral two_moons `
+  --methods baseline wdro cdro cdro_markov `
+  --fractions 1.0 `
+  --full-samples 2000 `
+  --seeds 0 `
+  --workers 4 `
+  --epochs 50 `
+  --batch-size 128 `
+  --eval-every 5 `
+  --num-eval-samples 2048 `
+  --metric-samples 1024
+```
+
 ## 7. Optional Cleanup
 
 Delete temporary probe outputs after inspection:

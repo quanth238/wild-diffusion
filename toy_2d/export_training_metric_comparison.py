@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from toy_2d import normalize_method_names
+from toy_2d import normalize_comparison_method_names
 from toy_2d.plotting import save_method_training_metric_comparison
 
 
@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         nargs="+",
-        default=["baseline", "wdro", "cdro"],
+        default=["baseline", "wdro", "cdro", "cdro_markov"],
         help="Methods to overlay.",
     )
     parser.add_argument(
@@ -71,7 +71,7 @@ def resolve_datasets(
 
 def main() -> None:
     args = parse_args()
-    args.methods = normalize_method_names(args.methods)
+    args.methods = normalize_comparison_method_names(args.methods)
     comparison_dir = args.comparison_dir
     datasets = resolve_datasets(
         comparison_dir,

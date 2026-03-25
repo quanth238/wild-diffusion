@@ -36,3 +36,26 @@ CDRO_TUNING_SPACE = {
     "cdro_exact_budget_split": [CDRO_DEFAULTS["exact_budget_split"]],
     "cdro_sigma_schedule": ["edm_quantiles", "karras_grid"],
 }
+
+CDRO_MARKOV_DEFAULTS = {
+    "score_lr": 1e-3,
+    "control_lr": 2e-4,
+    "lambda_lr": 2e-2,
+    "lambda_init": 0.1,
+    "lambda_min": 0.02,
+    "control_radius": 0.05,
+    "warmup_epochs": 8,
+    "adversary_steps": 1,
+    "score_steps": 8,
+    "terminal_momentum": 0.95,
+    "num_steps": 8,
+    "total_time": 1.0,
+    "beta_min": 0.2,
+    "beta_max": 4.0,
+    "score_weight_schedule": "uniform",
+    "score_hidden_dim": 128,
+    "score_depth": 4,
+    "control_hidden_dim": 64,
+    "control_depth": 3,
+    "control_scale": 0.5,
+}

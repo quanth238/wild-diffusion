@@ -8,6 +8,7 @@ Quick setup:
 bash scripts/setup_toy_2d_env.sh
 bash scripts/smoke_test_toy_2d.sh
 bash scripts/smoke_test_toy_2d_cdro_sde.sh
+bash scripts/smoke_test_toy_2d_cdro_markov.sh
 ```
 
 Notes:
@@ -42,6 +43,12 @@ Three-method comparison:
 python -m toy_2d.compare_methods --method-configs toy-runs/tuned_method_configs_v1.json --outdir toy-runs/method_table_path_v1
 ```
 
+Including the new Markov score-based CDRO method:
+
+```bash
+python -m toy_2d.compare_methods --method-configs toy-runs/tuned_method_configs_v1.json --methods baseline wdro cdro cdro_markov --outdir toy-runs/method_table_with_markov
+```
+
 Full experiment command sequences are in `toy_2d/EXPERIMENT_COMMANDS.md`.
 
 Outputs:
@@ -56,6 +63,17 @@ Experimental SDE-based CDRO pipeline:
 - `python -m toy_2d.train_cdro_sde`: trains the forward VP-SDE causal-DRO predictor/adversary/dual loop and exports a robust trajectory replay buffer
 - `python -m toy_2d.train_cdro_reverse`: trains the reverse teacher-forced sampler on saved robust trajectories
 - `python -m toy_2d.sample_cdro_reverse`: samples from the learned reverse model and writes plots/metrics
+
+Experimental Markov score-based CDRO pipeline:
+- `python -m toy_2d.train_cdro_markov`: trains a state-Markov robust forward chain with exact one-step Gaussian score targets, alternating score descent, control ascent, and dual updates
+- keeps the frozen forward control inside reverse-time sampling, rather than fitting a separate reverse model
+- writes checkpoints, sample plots, reverse-process plots, and metric logs
+
+Minimal Markov example:
+
+```bash
+python -m toy_2d.train_cdro_markov --outdir toy-runs/cdro_markov
+```
 
 Minimal end-to-end example:
 

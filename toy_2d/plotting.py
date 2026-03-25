@@ -121,6 +121,44 @@ def save_cdro_sde_forward_curves(
     plt.close(fig)
 
 
+def save_markov_score_training_curves(
+    *,
+    path: Path,
+    history: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+
+    if history:
+        epochs = [item["epoch"] for item in history]
+        score_loss = [item["score_loss"] for item in history]
+        control_cost = [item["control_cost"] for item in history]
+        lambda_values = [item["lambda_value"] for item in history]
+        adversary_value = [item["adversary_value"] for item in history]
+
+        axes[0].plot(epochs, score_loss, color="#1f77b4", linewidth=1.8)
+        axes[1].plot(epochs, control_cost, color="#d62728", linewidth=1.8)
+        axes[2].plot(epochs, lambda_values, color="#2ca02c", linewidth=1.8)
+        axes[3].plot(epochs, adversary_value, color="#9467bd", linewidth=1.8)
+
+    axes[0].set_title("Score loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Value")
+    axes[1].set_title("Control cost")
+    axes[1].set_xlabel("Epoch")
+    axes[2].set_title("Dual lambda")
+    axes[2].set_xlabel("Epoch")
+    axes[3].set_title("Adversary objective")
+    axes[3].set_xlabel("Epoch")
+
+    for ax in axes:
+        ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def save_cdro_sde_reverse_curves(
     *,
     path: Path,
@@ -173,6 +211,7 @@ def save_method_training_metric_comparison(
         "baseline": "#1f77b4",
         "wdro": "#ff7f0e",
         "cdro": "#d62728",
+        "cdro_markov": "#2ca02c",
     }
     metric_specs = [
         ("train_loss", "Training loss"),
@@ -185,7 +224,10 @@ def save_method_training_metric_comparison(
             if not history:
                 continue
             epochs = [item["epoch"] for item in history]
-            values = [item[metric_key] for item in history]
+            if metric_key == "train_loss":
+                values = [item.get("train_loss", item.get("score_loss")) for item in history]
+            else:
+                values = [item[metric_key] for item in history]
             ax.plot(
                 epochs,
                 values,
@@ -201,7 +243,8 @@ def save_method_training_metric_comparison(
 
     axes[0].set_ylabel("Value")
     axes[1].legend(frameon=False, loc="best")
-    fig.suptitle(f"{dataset} | {fraction_tag} | seed {seed} | Baseline vs WDRO vs CDRO")
+    pretty_methods = ", ".join(method.replace("_", " ").title() for method in method_histories)
+    fig.suptitle(f"{dataset} | {fraction_tag} | seed {seed} | {pretty_methods}")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
