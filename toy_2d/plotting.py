@@ -87,6 +87,77 @@ def save_training_curves(
     plt.close(fig)
 
 
+def save_cdro_sde_forward_curves(
+    *,
+    path: Path,
+    history: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    if history:
+        epochs = [item["epoch"] for item in history]
+        predictor = [item["predictor_loss"] for item in history]
+        control_cost = [item["control_cost"] for item in history]
+        lambda_values = [item["lambda_value"] for item in history]
+
+        axes[0].plot(epochs, predictor, color="#1f77b4", linewidth=1.8)
+        axes[1].plot(epochs, control_cost, color="#d62728", linewidth=1.8)
+        axes[2].plot(epochs, lambda_values, color="#2ca02c", linewidth=1.8)
+
+    axes[0].set_title("Predictor loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Value")
+    axes[1].set_title("Control cost")
+    axes[1].set_xlabel("Epoch")
+    axes[2].set_title("Dual lambda")
+    axes[2].set_xlabel("Epoch")
+
+    for ax in axes:
+        ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def save_cdro_sde_reverse_curves(
+    *,
+    path: Path,
+    history: list[dict],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    if history:
+        epochs = [item["epoch"] for item in history]
+        train_loss = [item["train_loss"] for item in history]
+        val_loss = [item["val_loss"] for item in history]
+        swd = [item["sliced_wasserstein"] for item in history]
+        mmd = [item["mmd_rbf"] for item in history]
+
+        axes[0].plot(epochs, train_loss, color="#1f77b4", linewidth=1.8, label="train")
+        axes[0].plot(epochs, val_loss, color="#ff7f0e", linewidth=1.8, label="val")
+        axes[0].legend(frameon=False, loc="best")
+        axes[1].plot(epochs, swd, color="#d62728", linewidth=1.8)
+        axes[2].plot(epochs, mmd, color="#2ca02c", linewidth=1.8)
+
+    axes[0].set_title("Reverse NLL")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Value")
+    axes[1].set_title("Sample SWD")
+    axes[1].set_xlabel("Epoch")
+    axes[2].set_title("Sample MMD")
+    axes[2].set_xlabel("Epoch")
+
+    for ax in axes:
+        ax.grid(alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def save_method_training_metric_comparison(
     *,
     path: Path,

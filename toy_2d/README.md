@@ -7,6 +7,7 @@ Quick setup:
 ```bash
 bash scripts/setup_toy_2d_env.sh
 bash scripts/smoke_test_toy_2d.sh
+bash scripts/smoke_test_toy_2d_cdro_sde.sh
 ```
 
 Notes:
@@ -50,3 +51,16 @@ Outputs:
 - `checkpoint_best.pt` / `checkpoint_last.pt`: saved EMA models
 - `plots/`: generated-vs-real scatters, adversarial refresh plots, and training curves
 - `samples_latest.npz`: latest real/generated sample arrays
+
+Experimental SDE-based CDRO pipeline:
+- `python -m toy_2d.train_cdro_sde`: trains the forward VP-SDE causal-DRO predictor/adversary/dual loop and exports a robust trajectory replay buffer
+- `python -m toy_2d.train_cdro_reverse`: trains the reverse teacher-forced sampler on saved robust trajectories
+- `python -m toy_2d.sample_cdro_reverse`: samples from the learned reverse model and writes plots/metrics
+
+Minimal end-to-end example:
+
+```bash
+python -m toy_2d.train_cdro_sde --outdir toy-runs/cdro_sde_forward
+python -m toy_2d.train_cdro_reverse --forward-run-dir toy-runs/cdro_sde_forward --outdir toy-runs/cdro_sde_reverse
+python -m toy_2d.sample_cdro_reverse --reverse-run-dir toy-runs/cdro_sde_reverse --outdir toy-runs/cdro_sde_samples
+```
