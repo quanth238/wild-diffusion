@@ -199,6 +199,7 @@ def rollout_markov_forward(
     control_net,
     schedule: MarkovVPSchedule,
     zero_control: bool = False,
+    noise_override: torch.Tensor | None = None,
 ) -> ForwardRollout:
     current = clean_points
     states = [current]
@@ -211,6 +212,11 @@ def rollout_markov_forward(
         device=clean_points.device,
         dtype=clean_points.dtype,
     )
+    if noise_override is not None:
+        expected_shape = (clean_points.shape[0], schedule.dt.shape[0], clean_points.shape[1])
+        if tuple(noise_override.shape) != expected_shape:
+            raise ValueError(f"noise_override must have shape {expected_shape}, got {tuple(noise_override.shape)}")
+        noise_override = noise_override.to(device=clean_points.device, dtype=clean_points.dtype)
 
     for step_idx in range(schedule.dt.shape[0]):
         sigma_step = schedule.step_sigma[step_idx].expand(clean_points.shape[0])
@@ -225,7 +231,7 @@ def rollout_markov_forward(
             )
         drift = forward_drift(current, beta=schedule.beta[step_idx], control=control)
         mean = current + drift * schedule.dt[step_idx]
-        noise = torch.randn_like(current)
+        noise = noise_override[:, step_idx, :] if noise_override is not None else torch.randn_like(current)
         current = mean + schedule.step_sigma[step_idx] * noise
         states.append(current)
         noises.append(noise)
@@ -262,6 +268,78 @@ def compute_score_matching_loss(
 
 def compute_control_cost(*, rollout: ForwardRollout, schedule: MarkovVPSchedule) -> torch.Tensor:
     return (rollout.controls.square().sum(dim=2) * schedule.dt.view(1, -1)).mean()
+
+
+def estimate_markov_wdro_proxy_budget(
+    points: torch.Tensor,
+    score_net,
+    *,
+    schedule: MarkovVPSchedule,
+    gamma: float,
+    step_size: float,
+    iters: int,
+    clamp_min: torch.Tensor,
+    clamp_max: torch.Tensor,
+) -> float:
+    adv_points = markov_wdro_proxy_attack(
+        points=points,
+        score_net=score_net,
+        schedule=schedule,
+        gamma=gamma,
+        step_size=step_size,
+        iters=iters,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
+    )
+    delta = adv_points - points
+    return float((0.5 * delta.square().sum(dim=1)).mean().item())
+
+
+def markov_wdro_proxy_attack(
+    *,
+    points: torch.Tensor,
+    score_net,
+    schedule: MarkovVPSchedule,
+    gamma: float,
+    step_size: float,
+    iters: int,
+    clamp_min: torch.Tensor,
+    clamp_max: torch.Tensor,
+) -> torch.Tensor:
+    clamp_min = clamp_min.to(device=points.device, dtype=points.dtype).view(1, -1)
+    clamp_max = clamp_max.to(device=points.device, dtype=points.dtype).view(1, -1)
+    fixed_noises = torch.randn(
+        points.shape[0],
+        schedule.dt.shape[0],
+        points.shape[1],
+        device=points.device,
+        dtype=points.dtype,
+    )
+    x_adv = points.detach().clone().requires_grad_(True)
+    was_training = score_net.training
+    score_net.eval()
+
+    for _ in range(iters):
+        with torch.enable_grad():
+            rollout = rollout_markov_forward(
+                clean_points=x_adv,
+                control_net=None,
+                schedule=schedule,
+                zero_control=True,
+                noise_override=fixed_noises,
+            )
+            score_loss = compute_score_matching_loss(score_net=score_net, rollout=rollout, schedule=schedule)
+            delta = (x_adv - points).view(points.shape[0], -1)
+            transport_cost = 0.5 * delta.square().sum(dim=1).mean()
+            objective = score_loss - gamma * transport_cost
+        grad = torch.autograd.grad(objective, x_adv)[0]
+        x_adv = (x_adv + step_size * grad).detach()
+        x_adv = torch.maximum(torch.minimum(x_adv, clamp_max), clamp_min)
+        x_adv.requires_grad_(True)
+
+    if was_training:
+        score_net.train()
+    return x_adv.detach()
 
 
 def update_terminal_stats(

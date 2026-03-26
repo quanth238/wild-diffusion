@@ -18,6 +18,7 @@ from toy_2d.cdro_markov import (
     build_markov_vp_schedule,
     compute_control_cost,
     compute_score_matching_loss,
+    estimate_markov_wdro_proxy_budget,
     rollout_markov_forward,
     sample_reverse_chain,
     set_module_grad,
@@ -31,6 +32,7 @@ from toy_2d.plotting import (
     save_process_snapshots,
     save_scatter_comparison,
 )
+from toy_2d.robust_defaults import WDRO_CORE_DEFAULTS
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise", type=float, default=0.08)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--torch-num-threads", type=int, default=0)
     parser.add_argument("--standardize", action="store_true", default=True)
     parser.add_argument("--no-standardize", dest="standardize", action="store_false")
 
@@ -52,10 +55,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-init", type=float, default=0.1)
     parser.add_argument("--lambda-min", type=float, default=0.02)
     parser.add_argument("--control-radius", type=float, default=0.05)
+    parser.add_argument("--budget-mode", type=str, default="fixed", choices=("fixed", "match_wdro_proxy"))
+    parser.add_argument("--reference-wdro-k", type=int, default=WDRO_CORE_DEFAULTS["k"])
+    parser.add_argument("--reference-wdro-step-size", type=float, default=WDRO_CORE_DEFAULTS["step_size"])
+    parser.add_argument("--reference-wdro-gamma", type=float, default=WDRO_CORE_DEFAULTS["gamma"])
+    parser.add_argument("--budget-estimate-batch-size", type=int, default=256)
+    parser.add_argument("--budget-scale", type=float, default=1.0)
+    parser.add_argument("--budget-ema-decay", type=float, default=0.9)
+    parser.add_argument("--budget-max-ratio", type=float, default=4.0)
+    parser.add_argument("--budget-schedule", type=str, default="constant", choices=("constant", "frontload"))
+    parser.add_argument("--budget-frontload-power", type=float, default=2.0)
+    parser.add_argument("--budget-frontload-floor", type=float, default=0.25)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--warmup-epochs", type=int, default=8)
     parser.add_argument("--adversary-steps", type=int, default=1)
+    parser.add_argument("--adversary-stop-epoch", type=int, default=0)
     parser.add_argument("--score-steps", type=int, default=8)
     parser.add_argument("--terminal-momentum", type=float, default=0.95)
 
@@ -89,6 +104,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.torch_num_threads > 0:
+        torch.set_num_threads(int(args.torch_num_threads))
+        try:
+            torch.set_num_interop_threads(max(1, min(4, int(args.torch_num_threads))))
+        except RuntimeError:
+            pass
     device = resolve_device(args.device)
     set_seed(args.seed)
 
@@ -135,11 +156,33 @@ def main() -> None:
     best_swd = float("inf")
     best_epoch: int | None = None
     best_eval: dict | None = None
+    budget_state: dict[str, float | None] = {"raw": None, "smoothed": None}
 
     start_time = time.time()
+    active_epochs = max(args.epochs - args.warmup_epochs, 1)
     for epoch_idx in range(args.epochs):
-        loader = build_loader(points=dataset.train_points, batch_size=args.batch_size, seed=args.seed + epoch_idx)
-        control_active = epoch_idx >= args.warmup_epochs and args.adversary_steps > 0
+        epoch = epoch_idx + 1
+        loader = build_loader(
+            points=dataset.train_points,
+            batch_size=args.batch_size,
+            seed=args.seed + epoch_idx,
+            pin_memory=device.type == "cuda",
+        )
+        control_present = epoch_idx >= args.warmup_epochs and args.adversary_steps > 0
+        adversary_update_active = control_present and (
+            args.adversary_stop_epoch <= 0 or (epoch_idx + 1) <= args.adversary_stop_epoch
+        )
+        raw_budget_estimate, base_total_budget, target_total_budget = resolve_target_total_budget(
+            args=args,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            active_epochs=active_epochs,
+            score_model=score_ema,
+            schedule=schedule,
+            dataset=dataset,
+            device=device,
+            budget_state=budget_state,
+        )
 
         epoch_score_losses: list[float] = []
         epoch_control_costs: list[float] = []
@@ -148,9 +191,9 @@ def main() -> None:
         epoch_control_max_norms: list[float] = []
 
         for (batch,) in loader:
-            batch = batch.to(device)
+            batch = batch.to(device, non_blocking=device.type == "cuda")
 
-            if control_active:
+            if adversary_update_active:
                 set_module_grad(score_model, False)
                 set_module_grad(control_model, True)
                 score_model.eval()
@@ -171,7 +214,7 @@ def main() -> None:
                     control_optimizer.step()
                     lambda_value = max(
                         float(args.lambda_min),
-                        lambda_value - args.lambda_lr * (float(args.control_radius) - float(control_cost.detach().item())),
+                        lambda_value - args.lambda_lr * (float(target_total_budget) - float(control_cost.detach().item())),
                     )
                     epoch_control_costs.append(float(control_cost.detach().item()))
                     epoch_adv_values.append(float(objective.detach().item()))
@@ -188,9 +231,9 @@ def main() -> None:
                 score_optimizer.zero_grad(set_to_none=True)
                 rollout = rollout_markov_forward(
                     clean_points=batch,
-                    control_net=control_model if control_active else None,
+                    control_net=control_model if control_present else None,
                     schedule=schedule,
-                    zero_control=not control_active,
+                    zero_control=not control_present,
                 )
                 score_loss = compute_score_matching_loss(score_net=score_model, rollout=rollout, schedule=schedule)
                 score_loss.backward()
@@ -202,9 +245,9 @@ def main() -> None:
             with torch.no_grad():
                 terminal_rollout = rollout_markov_forward(
                     clean_points=batch,
-                    control_net=control_ema if control_active else None,
+                    control_net=control_ema if control_present else None,
                     schedule=schedule,
-                    zero_control=not control_active,
+                    zero_control=not control_present,
                 )
                 terminal_stats = update_terminal_stats(
                     terminal_states=terminal_rollout.states[:, -1, :],
@@ -221,10 +264,16 @@ def main() -> None:
             "adversary_value": float(np.mean(epoch_adv_values)) if epoch_adv_values else 0.0,
             "mean_control_norm": float(np.mean(epoch_control_mean_norms)) if epoch_control_mean_norms else 0.0,
             "max_control_norm": float(np.max(epoch_control_max_norms)) if epoch_control_max_norms else 0.0,
-            "target_total_budget": float(args.control_radius),
+            "target_total_budget": float(target_total_budget),
+            "base_total_budget": float(base_total_budget),
+            "raw_budget_estimate": (None if raw_budget_estimate is None else float(raw_budget_estimate)),
             "lambda_value": float(lambda_value),
-            "control_active": bool(control_active),
+            "control_active": bool(control_present),
+            "adversary_update_active": bool(adversary_update_active),
         }
+        epoch_metrics["budget_utilization"] = (
+            float(epoch_metrics["control_cost"] / target_total_budget) if target_total_budget > 0 else 0.0
+        )
         if terminal_stats is not None:
             epoch_metrics["terminal_var_mean"] = float(terminal_stats.var.mean().item())
             epoch_metrics["terminal_var_min"] = float(terminal_stats.var.min().item())
@@ -236,7 +285,7 @@ def main() -> None:
             eval_metrics = evaluate_model(
                 dataset=dataset,
                 score_model=score_ema,
-                control_model=control_ema if control_active else None,
+                control_model=control_ema if control_present else None,
                 terminal_stats=terminal_stats,
                 schedule=schedule,
                 outdir=args.outdir,
@@ -245,7 +294,7 @@ def main() -> None:
                 num_eval_samples=args.num_eval_samples,
                 metric_samples=args.metric_samples,
                 seed=args.seed,
-                zero_control=not control_active,
+                zero_control=not control_present,
                 num_snapshot_steps=args.num_snapshot_steps,
                 fast_tuning=args.fast_tuning,
             )
@@ -423,6 +472,107 @@ def build_control_model(*, args: argparse.Namespace, device: torch.device):
     return MarkovControlMLP(**kwargs).to(device)
 
 
+def resolve_target_total_budget(
+    *,
+    args: argparse.Namespace,
+    epoch: int,
+    total_epochs: int,
+    active_epochs: int,
+    score_model,
+    schedule,
+    dataset,
+    device: torch.device,
+    budget_state: dict[str, float | None],
+) -> tuple[float | None, float, float]:
+    raw_budget: float | None = None
+    if epoch <= args.warmup_epochs:
+        base_budget = float(args.control_radius)
+        budget_state["raw"] = None
+        budget_state["smoothed"] = None
+        target_budget = apply_budget_schedule(
+            base_budget=base_budget,
+            epoch=epoch,
+            total_epochs=total_epochs,
+            warmup_epochs=args.warmup_epochs,
+            active_epochs=active_epochs,
+            schedule_name="constant",
+            frontload_power=float(args.budget_frontload_power),
+            frontload_floor=float(args.budget_frontload_floor),
+        )
+        return raw_budget, base_budget, target_budget
+
+    if args.budget_mode == "match_wdro_proxy":
+        estimate_batch = min(
+            max(int(args.budget_estimate_batch_size), 1),
+            int(dataset.train_points.shape[0]),
+        )
+        estimate_points = dataset.train_points[:estimate_batch].to(device)
+        raw_budget = estimate_markov_wdro_proxy_budget(
+            estimate_points,
+            score_model,
+            schedule=schedule,
+            gamma=float(args.reference_wdro_gamma),
+            step_size=float(args.reference_wdro_step_size),
+            iters=int(args.reference_wdro_k),
+            clamp_min=dataset.bounds_min.to(device),
+            clamp_max=dataset.bounds_max.to(device),
+        )
+        raw_budget *= float(args.budget_scale)
+        previous = budget_state.get("smoothed")
+        if previous is None:
+            smoothed = raw_budget
+        else:
+            max_ratio = max(float(args.budget_max_ratio), 1.0)
+            clipped = min(max(raw_budget, previous / max_ratio), previous * max_ratio)
+            smoothed = float(args.budget_ema_decay) * previous + (1.0 - float(args.budget_ema_decay)) * clipped
+        budget_state["raw"] = raw_budget
+        budget_state["smoothed"] = smoothed
+        base_budget = float(smoothed)
+    else:
+        base_budget = float(args.control_radius)
+        budget_state["raw"] = base_budget
+        budget_state["smoothed"] = base_budget
+    target_budget = apply_budget_schedule(
+        base_budget=base_budget,
+        epoch=epoch,
+        total_epochs=total_epochs,
+        warmup_epochs=args.warmup_epochs,
+        active_epochs=active_epochs,
+        schedule_name=args.budget_schedule,
+        frontload_power=float(args.budget_frontload_power),
+        frontload_floor=float(args.budget_frontload_floor),
+    )
+    return raw_budget, base_budget, target_budget
+
+
+def apply_budget_schedule(
+    *,
+    base_budget: float,
+    epoch: int,
+    total_epochs: int,
+    warmup_epochs: int,
+    active_epochs: int,
+    schedule_name: str,
+    frontload_power: float,
+    frontload_floor: float,
+) -> float:
+    if schedule_name == "constant":
+        return float(base_budget)
+    if schedule_name != "frontload":
+        raise ValueError(f"Unsupported budget schedule: {schedule_name}")
+    if epoch <= warmup_epochs or active_epochs <= 1:
+        return float(base_budget)
+
+    frontload_floor = min(max(frontload_floor, 0.0), 1.0)
+    active_idx = min(max(epoch - warmup_epochs, 1), active_epochs)
+    progress = (active_idx - 1) / max(active_epochs - 1, 1)
+    current_weight = frontload_floor + (1.0 - frontload_floor) * ((1.0 - progress) ** max(frontload_power, 0.0))
+    grid = np.linspace(0.0, 1.0, num=active_epochs, dtype=np.float64)
+    weights = frontload_floor + (1.0 - frontload_floor) * np.power(1.0 - grid, max(frontload_power, 0.0))
+    normalized_weight = current_weight / float(weights.mean())
+    return float(base_budget * normalized_weight)
+
+
 def clip_gradients(parameters, *, grad_clip: float) -> None:
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(list(parameters), grad_clip)
@@ -441,11 +591,19 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def build_loader(*, points: torch.Tensor, batch_size: int, seed: int) -> DataLoader:
+def build_loader(*, points: torch.Tensor, batch_size: int, seed: int, pin_memory: bool) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
     dataset = TensorDataset(points)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator, drop_last=False)
+    effective_batch_size = points.shape[0] if batch_size <= 0 else min(batch_size, points.shape[0])
+    return DataLoader(
+        dataset,
+        batch_size=effective_batch_size,
+        shuffle=True,
+        generator=generator,
+        drop_last=False,
+        pin_memory=pin_memory,
+    )
 
 
 def select_snapshot_indices(*, total_count: int, num_snapshots: int) -> list[int]:

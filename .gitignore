@@ -127,3 +127,6 @@ venv.bak/
 
 # Local toy experiment outputs
 toy-runs/
+
+# Local datasets and download caches
+datasets/

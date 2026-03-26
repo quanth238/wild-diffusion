@@ -13,7 +13,7 @@ from toy_2d.robust_defaults import CDRO_MARKOV_DEFAULTS
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Random search for Markov CDRO settings.")
+    parser = argparse.ArgumentParser(description="Staged search for Markov CDRO settings.")
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "tuning_cdro_markov")
     parser.add_argument("--datasets", nargs="+", default=["eight_gaussians"])
     parser.add_argument("--fractions", nargs="+", type=float, default=[0.5, 1.0])
@@ -25,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy-epochs", type=int, default=60)
     parser.add_argument("--topk", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--proxy-batch-size", type=int, default=None)
+    parser.add_argument("--final-batch-size", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--proxy-eval-every", type=int, default=10)
     parser.add_argument("--num-eval-samples", type=int, default=2048)
@@ -35,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-aggregate", type=Path, default=None)
     parser.add_argument("--reference-method", type=str, default="wdro")
     parser.add_argument("--device", type=str, default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--search-strategy", type=str, default="coordinate", choices=("coordinate", "random"))
     return parser.parse_args()
 
 
@@ -56,6 +59,7 @@ def main() -> None:
             StageConfig(
                 name="proxy",
                 epochs=args.proxy_epochs,
+                batch_size=args.proxy_batch_size if args.proxy_batch_size is not None else args.batch_size,
                 eval_every=args.proxy_eval_every,
                 num_eval_samples=args.proxy_num_eval_samples,
                 metric_samples=args.proxy_metric_samples,
@@ -82,6 +86,7 @@ def main() -> None:
             StageConfig(
                 name="final",
                 epochs=args.epochs,
+                batch_size=args.final_batch_size if args.final_batch_size is not None else args.batch_size,
                 eval_every=args.eval_every,
                 num_eval_samples=args.num_eval_samples,
                 metric_samples=args.metric_samples,
@@ -105,6 +110,12 @@ def main() -> None:
 
 
 def build_trial_configs(*, args: argparse.Namespace) -> list[dict]:
+    if args.search_strategy == "coordinate":
+        return build_coordinate_trial_configs(args=args)
+    return build_random_trial_configs(args=args)
+
+
+def build_random_trial_configs(*, args: argparse.Namespace) -> list[dict]:
     rng = random.Random(args.seed)
     baseline = dict(CDRO_MARKOV_DEFAULTS)
     search_space = {
@@ -151,6 +162,49 @@ def build_trial_configs(*, args: argparse.Namespace) -> list[dict]:
     return configs
 
 
+def build_coordinate_trial_configs(*, args: argparse.Namespace) -> list[dict]:
+    baseline = dict(CDRO_MARKOV_DEFAULTS)
+    ordered_space = [
+        ("score_weight_schedule", [baseline["score_weight_schedule"], "inv_sigma_sq", "sigma_sq"]),
+        ("num_steps", [baseline["num_steps"], 16, 20]),
+        ("beta_max", [baseline["beta_max"], 8.0, 10.0]),
+        ("score_hidden_dim", [baseline["score_hidden_dim"], 192, 256]),
+        ("score_steps", [baseline["score_steps"], 12, 16]),
+        ("warmup_epochs", [baseline["warmup_epochs"], 12, 16]),
+        ("lambda_min", [baseline["lambda_min"], 0.05, 0.08, 0.01]),
+        ("control_radius", [baseline["control_radius"], 0.03, 0.02, 0.08]),
+        ("lambda_lr", [baseline["lambda_lr"], 0.01, 0.05]),
+        ("control_arch", [baseline["control_arch"], "gru"]),
+        ("control_hidden_dim", [baseline["control_hidden_dim"], 96, 128]),
+        ("control_scale", [baseline["control_scale"], 0.3]),
+        ("control_lr", [baseline["control_lr"], 1e-4, 5e-4]),
+        ("lambda_init", [baseline["lambda_init"], 0.2, 0.05]),
+        ("score_lr", [baseline["score_lr"], 5e-4]),
+        ("terminal_momentum", [baseline["terminal_momentum"], 0.98]),
+    ]
+
+    configs = [baseline]
+    seen = {config_key(baseline)}
+    target = max(1, args.trials)
+    max_levels = max(len(values) - 1 for _, values in ordered_space)
+
+    for level in range(max_levels):
+        for key, values in ordered_space:
+            alt_index = level + 1
+            if alt_index >= len(values):
+                continue
+            candidate = dict(baseline)
+            candidate[key] = values[alt_index]
+            candidate_key = config_key(candidate)
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            configs.append(candidate)
+            if len(configs) >= target:
+                return configs
+    return configs
+
+
 def config_key(config: dict) -> tuple:
     return tuple(sorted(config.items()))
 
@@ -176,6 +230,7 @@ class StageConfig:
         *,
         name: str,
         epochs: int,
+        batch_size: int,
         eval_every: int,
         num_eval_samples: int,
         metric_samples: int,
@@ -183,6 +238,7 @@ class StageConfig:
     ):
         self.name = name
         self.epochs = epochs
+        self.batch_size = batch_size
         self.eval_every = eval_every
         self.num_eval_samples = num_eval_samples
         self.metric_samples = metric_samples
@@ -191,6 +247,14 @@ class StageConfig:
 
 def run_stage(*, payloads: list[tuple], workers: int, output_path: Path) -> list[dict]:
     results: list[dict] = []
+    if output_path.exists():
+        output_path.unlink()
+    if workers <= 1:
+        for payload in payloads:
+            result = run_trial(payload)
+            results.append(result)
+            append_jsonl(output_path, result)
+        return results
     with futures.ProcessPoolExecutor(max_workers=workers) as executor:
         future_map = {executor.submit(run_trial, payload): payload[0] for payload in payloads}
         for future in futures.as_completed(future_map):
@@ -239,7 +303,7 @@ def run_trial(payload: tuple[int, dict, argparse.Namespace, dict | None, StageCo
                     "--num-samples",
                     str(num_samples),
                     "--batch-size",
-                    str(args.batch_size),
+                    str(stage.batch_size),
                     "--eval-every",
                     str(stage.eval_every),
                     "--num-eval-samples",
