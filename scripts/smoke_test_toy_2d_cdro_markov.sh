@@ -39,6 +39,48 @@ print(f"[INFO] scipy={scipy.__version__}")
 PY
 
 run python -m toy_2d.train_cdro_markov \
+  --method baseline_score \
+  --outdir "${OUT_ROOT}/baseline_score" \
+  --dataset two_moons \
+  --device cpu \
+  --epochs 2 \
+  --eval-every 1 \
+  --num-samples 256 \
+  --num-eval-samples 256 \
+  --metric-samples 256 \
+  --batch-size 64 \
+  --num-steps 6 \
+  --score-steps 2 \
+  --score-hidden-dim 64 \
+  --embedding-dim 16 \
+  --beta-min 0.2 \
+  --beta-max 4.0 \
+  --num-snapshot-steps 4
+
+run python -m toy_2d.train_cdro_markov \
+  --method wdro_score \
+  --outdir "${OUT_ROOT}/wdro_score" \
+  --dataset two_moons \
+  --device cpu \
+  --epochs 3 \
+  --eval-every 1 \
+  --num-samples 256 \
+  --num-eval-samples 256 \
+  --metric-samples 256 \
+  --batch-size 64 \
+  --num-steps 6 \
+  --score-steps 2 \
+  --score-hidden-dim 64 \
+  --embedding-dim 16 \
+  --beta-min 0.2 \
+  --beta-max 4.0 \
+  --wdro-warmup-epochs 1 \
+  --wdro-refresh-every 1 \
+  --wdro-k 2 \
+  --num-snapshot-steps 4
+
+run python -m toy_2d.train_cdro_markov \
+  --method cdro_markov \
   --outdir "${OUT_ROOT}/train" \
   --dataset two_moons \
   --device cpu \

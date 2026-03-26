@@ -13,8 +13,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from toy_2d.cdro_markov import (
     MarkovControlGRU,
     MarkovControlMLP,
+    MarkovPrecondScoreMLP,
     MarkovScoreMLP,
     TerminalStats,
+    build_score_wdro_dataset,
     build_markov_vp_schedule,
     compute_control_cost,
     compute_score_matching_loss,
@@ -28,6 +30,7 @@ from toy_2d.cdro_markov import (
 from toy_2d.datasets import build_dataset
 from toy_2d.metrics import mmd_rbf, sliced_wasserstein
 from toy_2d.plotting import (
+    save_adversarial_debug,
     save_markov_score_training_curves,
     save_process_snapshots,
     save_scatter_comparison,
@@ -38,6 +41,7 @@ from toy_2d.robust_defaults import WDRO_CORE_DEFAULTS
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Markov score-based CDRO toy model.")
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "cdro_markov")
+    parser.add_argument("--method", type=str, default="cdro_markov", choices=("baseline_score", "wdro_score", "cdro_markov"))
     parser.add_argument("--dataset", type=str, default="two_moons")
     parser.add_argument("--num-samples", type=int, default=4096)
     parser.add_argument("--noise", type=float, default=0.08)
@@ -73,6 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adversary-stop-epoch", type=int, default=0)
     parser.add_argument("--score-steps", type=int, default=8)
     parser.add_argument("--terminal-momentum", type=float, default=0.95)
+    parser.add_argument("--terminal-sampler", type=str, default="gaussian", choices=("gaussian", "replay"))
+    parser.add_argument("--terminal-buffer-size", type=int, default=4096)
+    parser.add_argument("--terminal-jitter-scale", type=float, default=0.0)
+    parser.add_argument("--reverse-noise-scale", type=float, default=1.0)
+    parser.add_argument("--reverse-tail-noise-scale", type=float, default=1.0)
+    parser.add_argument("--reverse-deterministic-tail-steps", type=int, default=0)
 
     parser.add_argument("--num-steps", type=int, default=12)
     parser.add_argument("--total-time", type=float, default=1.0)
@@ -87,11 +97,21 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--score-hidden-dim", type=int, default=128)
     parser.add_argument("--score-depth", type=int, default=4)
+    parser.add_argument("--score-arch", type=str, default="precond", choices=("raw", "precond"))
     parser.add_argument("--control-hidden-dim", type=int, default=64)
     parser.add_argument("--control-depth", type=int, default=3)
     parser.add_argument("--control-arch", type=str, default="mlp", choices=("mlp", "gru"))
     parser.add_argument("--embedding-dim", type=int, default=32)
     parser.add_argument("--control-scale", type=float, default=0.5)
+    parser.add_argument("--sigma-data", type=float, default=0.5)
+    parser.add_argument("--reverse-solver", type=str, default="heun", choices=("euler", "heun"))
+    parser.add_argument("--wdro-k", type=int, default=WDRO_CORE_DEFAULTS["k"])
+    parser.add_argument("--wdro-step-size", type=float, default=WDRO_CORE_DEFAULTS["step_size"])
+    parser.add_argument("--wdro-gamma", type=float, default=WDRO_CORE_DEFAULTS["gamma"])
+    parser.add_argument("--wdro-p-adv", type=float, default=WDRO_CORE_DEFAULTS["p_adv"])
+    parser.add_argument("--wdro-warmup-epochs", type=int, default=25)
+    parser.add_argument("--wdro-refresh-every", type=int, default=10)
+    parser.add_argument("--wdro-debug-points", type=int, default=256)
 
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--num-eval-samples", type=int, default=2048)
@@ -123,6 +143,9 @@ def main() -> None:
         noise=args.noise,
         standardize=args.standardize,
     )
+    base_points = dataset.train_points.clone()
+    current_points = base_points.clone()
+    rng = np.random.default_rng(args.seed + 1)
 
     schedule = build_markov_vp_schedule(
         num_steps=args.num_steps,
@@ -134,21 +157,19 @@ def main() -> None:
         weight_schedule=args.score_weight_schedule,
     )
 
-    score_model = MarkovScoreMLP(
-        data_dim=2,
-        hidden_dim=args.score_hidden_dim,
-        depth=args.score_depth,
-        embedding_dim=args.embedding_dim,
-    ).to(device)
+    score_model = build_score_model(args=args, device=device)
     score_ema = copy.deepcopy(score_model).eval()
 
-    control_model = build_control_model(args=args, device=device)
-    initialize_control_head(control_model)
-    control_ema = copy.deepcopy(control_model).eval()
+    control_model = build_control_model(args=args, device=device) if args.method == "cdro_markov" else None
+    if control_model is not None:
+        initialize_control_head(control_model)
+    control_ema = copy.deepcopy(control_model).eval() if control_model is not None else None
 
     score_optimizer = torch.optim.Adam(score_model.parameters(), lr=args.score_lr)
-    control_optimizer = torch.optim.Adam(control_model.parameters(), lr=args.control_lr)
-    lambda_value = float(args.lambda_init)
+    control_optimizer = (
+        torch.optim.Adam(control_model.parameters(), lr=args.control_lr) if control_model is not None else None
+    )
+    lambda_value = float(args.lambda_init) if args.method == "cdro_markov" else 0.0
     terminal_stats: TerminalStats | None = None
 
     history: list[dict] = []
@@ -157,18 +178,58 @@ def main() -> None:
     best_epoch: int | None = None
     best_eval: dict | None = None
     budget_state: dict[str, float | None] = {"raw": None, "smoothed": None}
+    latest_adv_stats: dict | None = None
+    latest_adv_snapshot: tuple[np.ndarray, np.ndarray] | None = None
+    latest_adv_plot_stats: tuple[float, float] | None = None
 
     start_time = time.time()
     active_epochs = max(args.epochs - args.warmup_epochs, 1)
     for epoch_idx in range(args.epochs):
         epoch = epoch_idx + 1
+        if args.method == "wdro_score" and should_refresh(
+            epoch_idx=epoch_idx,
+            warmup=args.wdro_warmup_epochs,
+            refresh_every=args.wdro_refresh_every,
+        ):
+            refresh = build_score_wdro_dataset(
+                base_points=base_points,
+                score_net=score_ema,
+                schedule=schedule,
+                batch_size=args.batch_size,
+                gamma=args.wdro_gamma,
+                step_size=args.wdro_step_size,
+                iters=args.wdro_k,
+                p_adv=args.wdro_p_adv,
+                clamp_min=dataset.bounds_min.to(device),
+                clamp_max=dataset.bounds_max.to(device),
+                device=device,
+                rng=rng,
+                debug_adv_points=args.wdro_debug_points,
+            )
+            current_points = refresh.combined_points
+            latest_adv_stats = {
+                "mean_l2_shift": refresh.mean_l2_shift,
+                "max_l2_shift": refresh.max_l2_shift,
+                "mean_transport_cost": refresh.mean_transport_cost,
+                "max_transport_cost": refresh.max_transport_cost,
+                "mean_total_transport_cost": refresh.mean_transport_cost,
+                "max_total_transport_cost": refresh.max_transport_cost,
+            }
+            if refresh.adv_original is not None and refresh.adv_generated is not None:
+                orig_np = dataset.destandardize(refresh.adv_original).cpu().numpy()
+                adv_np = dataset.destandardize(refresh.adv_generated).cpu().numpy()
+                latest_adv_snapshot = (orig_np, adv_np)
+                shifts = np.linalg.norm(adv_np - orig_np, axis=1)
+                latest_adv_plot_stats = (float(shifts.mean()), float(shifts.max()))
+        elif args.method != "wdro_score":
+            current_points = base_points
         loader = build_loader(
-            points=dataset.train_points,
+            points=current_points,
             batch_size=args.batch_size,
             seed=args.seed + epoch_idx,
             pin_memory=device.type == "cuda",
         )
-        control_present = epoch_idx >= args.warmup_epochs and args.adversary_steps > 0
+        control_present = args.method == "cdro_markov" and epoch_idx >= args.warmup_epochs and args.adversary_steps > 0
         adversary_update_active = control_present and (
             args.adversary_stop_epoch <= 0 or (epoch_idx + 1) <= args.adversary_stop_epoch
         )
@@ -194,6 +255,8 @@ def main() -> None:
             batch = batch.to(device, non_blocking=device.type == "cuda")
 
             if adversary_update_active:
+                if control_model is None or control_optimizer is None:
+                    raise RuntimeError("CDRO Markov adversary updates require a control model and optimizer.")
                 set_module_grad(score_model, False)
                 set_module_grad(control_model, True)
                 score_model.eval()
@@ -221,10 +284,12 @@ def main() -> None:
                     control_norms = rollout.controls.detach().norm(dim=2)
                     epoch_control_mean_norms.append(float(control_norms.mean().item()))
                     epoch_control_max_norms.append(float(control_norms.max().item()))
-                update_ema(ema=control_ema, model=control_model, decay=args.ema_decay)
+                if control_ema is not None:
+                    update_ema(ema=control_ema, model=control_model, decay=args.ema_decay)
                 set_module_grad(score_model, True)
 
-            set_module_grad(control_model, False)
+            if control_model is not None:
+                set_module_grad(control_model, False)
             set_module_grad(score_model, True)
             score_model.train()
             for _ in range(args.score_steps):
@@ -253,9 +318,11 @@ def main() -> None:
                     terminal_states=terminal_rollout.states[:, -1, :],
                     current=terminal_stats,
                     momentum=args.terminal_momentum,
+                    replay_max_size=args.terminal_buffer_size,
                 )
 
-            set_module_grad(control_model, True)
+            if control_model is not None:
+                set_module_grad(control_model, True)
 
         epoch_metrics = {
             "epoch": epoch_idx + 1,
@@ -270,13 +337,23 @@ def main() -> None:
             "lambda_value": float(lambda_value),
             "control_active": bool(control_present),
             "adversary_update_active": bool(adversary_update_active),
+            "dataset_size": int(current_points.shape[0]),
+            "method": args.method,
         }
+        if latest_adv_stats is not None:
+            epoch_metrics["mean_l2_shift"] = latest_adv_stats["mean_l2_shift"]
+            epoch_metrics["max_l2_shift"] = latest_adv_stats["max_l2_shift"]
+            epoch_metrics["mean_transport_cost"] = latest_adv_stats["mean_transport_cost"]
+            epoch_metrics["max_transport_cost"] = latest_adv_stats["max_transport_cost"]
+            epoch_metrics["total_transport_cost"] = latest_adv_stats["mean_total_transport_cost"]
+            epoch_metrics["max_total_transport_cost"] = latest_adv_stats["max_total_transport_cost"]
         epoch_metrics["budget_utilization"] = (
             float(epoch_metrics["control_cost"] / target_total_budget) if target_total_budget > 0 else 0.0
         )
         if terminal_stats is not None:
             epoch_metrics["terminal_var_mean"] = float(terminal_stats.var.mean().item())
             epoch_metrics["terminal_var_min"] = float(terminal_stats.var.min().item())
+            epoch_metrics["terminal_replay_size"] = int(terminal_stats.replay.shape[0]) if terminal_stats.replay is not None else 0
         history.append(epoch_metrics)
 
         if epoch_metrics["epoch"] == 1 or epoch_metrics["epoch"] % args.eval_every == 0 or epoch_metrics["epoch"] == args.epochs:
@@ -296,6 +373,13 @@ def main() -> None:
                 seed=args.seed,
                 zero_control=not control_present,
                 num_snapshot_steps=args.num_snapshot_steps,
+                method_name=args.method,
+                reverse_solver=args.reverse_solver,
+                terminal_sampler=args.terminal_sampler,
+                terminal_jitter_scale=args.terminal_jitter_scale,
+                reverse_noise_scale=args.reverse_noise_scale,
+                reverse_tail_noise_scale=args.reverse_tail_noise_scale,
+                reverse_deterministic_tail_steps=args.reverse_deterministic_tail_steps,
                 fast_tuning=args.fast_tuning,
             )
             eval_metrics.update(epoch_metrics)
@@ -318,6 +402,15 @@ def main() -> None:
                     dataset=dataset,
                     epoch=epoch_metrics["epoch"],
                     metrics=eval_metrics,
+                )
+            if latest_adv_snapshot is not None and latest_adv_plot_stats is not None and not args.fast_tuning:
+                save_adversarial_debug(
+                    path=args.outdir / "plots" / f"adv_epoch_{epoch_metrics['epoch']:04d}.png",
+                    original_points=latest_adv_snapshot[0],
+                    adversarial_points=latest_adv_snapshot[1],
+                    title=f"{args.method} refresh at epoch {epoch_metrics['epoch']}",
+                    mean_l2_shift=latest_adv_plot_stats[0],
+                    max_l2_shift=latest_adv_plot_stats[1],
                 )
 
             if eval_metrics["sliced_wasserstein"] < best_swd:
@@ -382,6 +475,13 @@ def evaluate_model(
     seed: int,
     zero_control: bool,
     num_snapshot_steps: int,
+    method_name: str,
+    reverse_solver: str,
+    terminal_sampler: str,
+    terminal_jitter_scale: float,
+    reverse_noise_scale: float,
+    reverse_tail_noise_scale: float,
+    reverse_deterministic_tail_steps: int,
     fast_tuning: bool = False,
 ) -> dict:
     score_model.eval()
@@ -398,6 +498,12 @@ def evaluate_model(
         device=device,
         zero_control=zero_control,
         collect_states=not fast_tuning,
+        solver=reverse_solver,
+        terminal_sampler=terminal_sampler,
+        terminal_jitter_scale=terminal_jitter_scale,
+        reverse_noise_scale=reverse_noise_scale,
+        reverse_tail_noise_scale=reverse_tail_noise_scale,
+        reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
     )
     generated = dataset.destandardize(generated_std.cpu()).cpu()
     real_all = torch.from_numpy(dataset.raw_points)
@@ -414,6 +520,11 @@ def evaluate_model(
         "epoch": epoch,
         "mmd_rbf": mmd_rbf(real_metric, fake_metric),
         "sliced_wasserstein": sliced_wasserstein(real_metric, fake_metric, seed=seed + epoch),
+        "terminal_sampler": terminal_sampler,
+        "terminal_jitter_scale": float(terminal_jitter_scale),
+        "reverse_noise_scale": float(reverse_noise_scale),
+        "reverse_tail_noise_scale": float(reverse_tail_noise_scale),
+        "reverse_deterministic_tail_steps": int(reverse_deterministic_tail_steps),
     }
 
     if not fast_tuning:
@@ -421,7 +532,7 @@ def evaluate_model(
             path=outdir / "plots" / f"samples_epoch_{epoch:04d}.png",
             real_points=real_metric.numpy(),
             generated_points=fake_metric.numpy(),
-            title=f"{dataset.name} | Markov CDRO | epoch {epoch}",
+            title=f"{dataset.name} | {format_markov_method_name(method_name)} | epoch {epoch}",
         )
         np.savez(
             outdir / "samples_latest.npz",
@@ -443,7 +554,7 @@ def evaluate_model(
                     "color": "#2ca02c",
                 }
             ],
-            title=f"Markov CDRO reverse process | epoch {epoch}",
+            title=f"{format_markov_method_name(method_name)} reverse process | epoch {epoch}",
         )
     return metrics
 
@@ -472,6 +583,28 @@ def build_control_model(*, args: argparse.Namespace, device: torch.device):
     return MarkovControlMLP(**kwargs).to(device)
 
 
+def build_score_model(*, args: argparse.Namespace, device: torch.device):
+    kwargs = {
+        "data_dim": 2,
+        "hidden_dim": args.score_hidden_dim,
+        "depth": args.score_depth,
+        "embedding_dim": args.embedding_dim,
+    }
+    if args.score_arch == "precond":
+        return MarkovPrecondScoreMLP(**kwargs, sigma_data=args.sigma_data).to(device)
+    return MarkovScoreMLP(**kwargs).to(device)
+
+
+def format_markov_method_name(method: str) -> str:
+    if method == "baseline_score":
+        return "Baseline Score"
+    if method == "wdro_score":
+        return "WDRO Score"
+    if method == "cdro_markov":
+        return "CDRO Markov"
+    return method.replace("_", " ").title()
+
+
 def resolve_target_total_budget(
     *,
     args: argparse.Namespace,
@@ -484,6 +617,8 @@ def resolve_target_total_budget(
     device: torch.device,
     budget_state: dict[str, float | None],
 ) -> tuple[float | None, float, float]:
+    if args.method != "cdro_markov":
+        return None, 0.0, 0.0
     raw_budget: float | None = None
     if epoch <= args.warmup_epochs:
         base_budget = float(args.control_radius)
@@ -591,6 +726,14 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def should_refresh(*, epoch_idx: int, warmup: int, refresh_every: int) -> bool:
+    if refresh_every <= 0:
+        return False
+    if epoch_idx < warmup:
+        return False
+    return (epoch_idx - warmup) % refresh_every == 0
+
+
 def build_loader(*, points: torch.Tensor, batch_size: int, seed: int, pin_memory: bool) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(seed)
@@ -636,11 +779,12 @@ def save_checkpoint(
     torch.save(
         {
             "score_model_state": score_model.state_dict(),
-            "control_model_state": control_model.state_dict(),
+            "control_model_state": (control_model.state_dict() if control_model is not None else None),
             "schedule": schedule.to_dict(),
             "terminal_stats": {
                 "mean": terminal_stats.mean.detach().cpu(),
                 "var": terminal_stats.var.detach().cpu(),
+                "replay": (terminal_stats.replay.detach().cpu() if terminal_stats.replay is not None else None),
             },
             "config": vars(args),
             "dataset": {

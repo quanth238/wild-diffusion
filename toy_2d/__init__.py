@@ -1,7 +1,7 @@
 """CPU-friendly toy 2D diffusion baselines for continuous-data experiments."""
 
 LEGACY_METHOD_CHOICES = ("baseline", "wdro", "cdro")
-COMPARISON_METHOD_CHOICES = LEGACY_METHOD_CHOICES + ("cdro_markov",)
+COMPARISON_METHOD_CHOICES = LEGACY_METHOD_CHOICES + ("baseline_score", "wdro_score", "cdro_markov")
 METHOD_CHOICES = LEGACY_METHOD_CHOICES
 
 

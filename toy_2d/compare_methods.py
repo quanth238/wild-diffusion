@@ -556,8 +556,12 @@ def replace_command_arg(command: list[str], flag: str, value: str) -> None:
 def format_method_name(method: str) -> str:
     if method == "baseline":
         return "Baseline"
+    if method == "baseline_score":
+        return "Baseline Score"
     if method == "wdro":
         return "WDRO"
+    if method == "wdro_score":
+        return "WDRO Score"
     if method == "cdro":
         return "CDRO"
     if method == "cdro_markov":
@@ -606,11 +610,13 @@ def build_method_command(
     seed: int,
     resolved_cdro_budget_mode: str,
 ) -> list[str]:
-    if method == "cdro_markov":
-        return [
+    if method in {"baseline_score", "wdro_score", "cdro_markov"}:
+        command = [
             sys.executable,
             "-m",
             "toy_2d.train_cdro_markov",
+            "--method",
+            method,
             "--dataset",
             dataset,
             "--epochs",
@@ -649,10 +655,18 @@ def build_method_command(
             str(get_config_value(method_config, "warmup_epochs", CDRO_MARKOV_DEFAULTS["warmup_epochs"])),
             "--adversary-steps",
             str(get_config_value(method_config, "adversary_steps", CDRO_MARKOV_DEFAULTS["adversary_steps"])),
+            "--adversary-stop-epoch",
+            str(get_config_value(method_config, "adversary_stop_epoch", CDRO_MARKOV_DEFAULTS["adversary_stop_epoch"])),
             "--score-steps",
             str(get_config_value(method_config, "score_steps", CDRO_MARKOV_DEFAULTS["score_steps"])),
             "--terminal-momentum",
             str(get_config_value(method_config, "terminal_momentum", CDRO_MARKOV_DEFAULTS["terminal_momentum"])),
+            "--terminal-sampler",
+            str(get_config_value(method_config, "terminal_sampler", CDRO_MARKOV_DEFAULTS["terminal_sampler"])),
+            "--terminal-buffer-size",
+            str(get_config_value(method_config, "terminal_buffer_size", CDRO_MARKOV_DEFAULTS["terminal_buffer_size"])),
+            "--terminal-jitter-scale",
+            str(get_config_value(method_config, "terminal_jitter_scale", CDRO_MARKOV_DEFAULTS["terminal_jitter_scale"])),
             "--num-steps",
             str(get_config_value(method_config, "num_steps", CDRO_MARKOV_DEFAULTS["num_steps"])),
             "--total-time",
@@ -667,6 +681,8 @@ def build_method_command(
             str(get_config_value(method_config, "score_hidden_dim", get_config_value(method_config, "hidden_dim", CDRO_MARKOV_DEFAULTS["score_hidden_dim"]))),
             "--score-depth",
             str(get_config_value(method_config, "score_depth", get_config_value(method_config, "depth", CDRO_MARKOV_DEFAULTS["score_depth"]))),
+            "--score-arch",
+            str(get_config_value(method_config, "score_arch", CDRO_MARKOV_DEFAULTS.get("score_arch", "precond"))),
             "--control-hidden-dim",
             str(get_config_value(method_config, "control_hidden_dim", CDRO_MARKOV_DEFAULTS["control_hidden_dim"])),
             "--control-arch",
@@ -675,7 +691,63 @@ def build_method_command(
             str(get_config_value(method_config, "control_depth", CDRO_MARKOV_DEFAULTS["control_depth"])),
             "--control-scale",
             str(get_config_value(method_config, "control_scale", CDRO_MARKOV_DEFAULTS["control_scale"])),
+            "--sigma-data",
+            str(get_config_value(method_config, "sigma_data", 0.5)),
+            "--reverse-solver",
+            str(get_config_value(method_config, "reverse_solver", "heun")),
+            "--reverse-noise-scale",
+            str(get_config_value(method_config, "reverse_noise_scale", CDRO_MARKOV_DEFAULTS["reverse_noise_scale"])),
+            "--reverse-tail-noise-scale",
+            str(get_config_value(method_config, "reverse_tail_noise_scale", CDRO_MARKOV_DEFAULTS["reverse_tail_noise_scale"])),
+            "--reverse-deterministic-tail-steps",
+            str(
+                get_config_value(
+                    method_config,
+                    "reverse_deterministic_tail_steps",
+                    CDRO_MARKOV_DEFAULTS["reverse_deterministic_tail_steps"],
+                )
+            ),
+            "--wdro-k",
+            str(get_config_value(method_config, "wdro_k", args.wdro_k)),
+            "--wdro-step-size",
+            str(get_config_value(method_config, "wdro_step_size", args.wdro_step_size)),
+            "--wdro-gamma",
+            str(get_config_value(method_config, "wdro_gamma", args.wdro_gamma)),
+            "--wdro-p-adv",
+            str(get_config_value(method_config, "wdro_p_adv", args.wdro_p_adv)),
+            "--wdro-warmup-epochs",
+            str(get_config_value(method_config, "wdro_warmup_epochs", args.wdro_warmup_epochs)),
+            "--wdro-refresh-every",
+            str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
         ]
+        if method == "cdro_markov":
+            command.extend(
+                [
+                    "--budget-mode",
+                    str(get_config_value(method_config, "budget_mode", CDRO_MARKOV_DEFAULTS.get("budget_mode", "fixed"))),
+                    "--reference-wdro-k",
+                    str(get_config_value(method_config, "reference_wdro_k", args.wdro_k)),
+                    "--reference-wdro-step-size",
+                    str(get_config_value(method_config, "reference_wdro_step_size", args.wdro_step_size)),
+                    "--reference-wdro-gamma",
+                    str(get_config_value(method_config, "reference_wdro_gamma", args.wdro_gamma)),
+                    "--budget-estimate-batch-size",
+                    str(get_config_value(method_config, "budget_estimate_batch_size", 256)),
+                    "--budget-scale",
+                    str(get_config_value(method_config, "budget_scale", 1.0)),
+                    "--budget-ema-decay",
+                    str(get_config_value(method_config, "budget_ema_decay", 0.9)),
+                    "--budget-max-ratio",
+                    str(get_config_value(method_config, "budget_max_ratio", 4.0)),
+                    "--budget-schedule",
+                    str(get_config_value(method_config, "budget_schedule", "constant")),
+                    "--budget-frontload-power",
+                    str(get_config_value(method_config, "budget_frontload_power", 2.0)),
+                    "--budget-frontload-floor",
+                    str(get_config_value(method_config, "budget_frontload_floor", 0.25)),
+                ]
+            )
+        return command
 
     return [
         sys.executable,

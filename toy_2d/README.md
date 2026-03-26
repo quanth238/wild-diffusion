@@ -49,6 +49,14 @@ Including the new Markov score-based CDRO method:
 python -m toy_2d.compare_methods --method-configs toy-runs/tuned_method_configs_v1.json --methods baseline wdro cdro cdro_markov --outdir toy-runs/method_table_with_markov
 ```
 
+Score-matching-only baselines on the same VP chain:
+
+```bash
+python -m toy_2d.train_cdro_markov --method baseline_score --outdir toy-runs/baseline_score
+python -m toy_2d.train_cdro_markov --method wdro_score --outdir toy-runs/wdro_score
+python -m toy_2d.train_cdro_markov --method cdro_markov --outdir toy-runs/cdro_markov
+```
+
 Full experiment command sequences are in `toy_2d/EXPERIMENT_COMMANDS.md`.
 
 Outputs:
@@ -66,6 +74,9 @@ Experimental SDE-based CDRO pipeline:
 
 Experimental Markov score-based CDRO pipeline:
 - `python -m toy_2d.train_cdro_markov`: trains a state-Markov robust forward chain with exact one-step Gaussian score targets, alternating score descent, control ascent, and dual updates
+- `--method baseline_score`: pure Markov score matching with no adversary
+- `--method wdro_score`: score matching with WDRO-style adversarial refreshes on clean points
+- `--method cdro_markov`: score matching with Markov drift control and dual-budget updates
 - keeps the frozen forward control inside reverse-time sampling, rather than fitting a separate reverse model
 - writes checkpoints, sample plots, reverse-process plots, and metric logs
 

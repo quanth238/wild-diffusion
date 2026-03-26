@@ -209,7 +209,9 @@ def save_method_training_metric_comparison(
 
     method_colors = {
         "baseline": "#1f77b4",
+        "baseline_score": "#17becf",
         "wdro": "#ff7f0e",
+        "wdro_score": "#bcbd22",
         "cdro": "#d62728",
         "cdro_markov": "#2ca02c",
     }
