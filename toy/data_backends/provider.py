@@ -1,8 +1,14 @@
 from dataclasses import dataclass, field
+import gzip
+import os
+from pathlib import Path
+import struct
 from typing import Callable, Dict, Optional, Tuple, Union
+from urllib.request import urlretrieve
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from ..data import (
     build_circle_gmm_centers,
@@ -51,6 +57,8 @@ def build_dataset_bundle(cfg, device: torch.device) -> DatasetBundle:
 
     if cfg.dataset_kind == "toy_gmm":
         return _build_toy_gmm_bundle(cfg, device)
+    if cfg.dataset_kind == "mnist":
+        return _build_mnist_bundle(cfg, device)
     if cfg.dataset_kind == "image_folder":
         return _build_image_folder_bundle(cfg, device)
     raise NotImplementedError(
@@ -206,6 +214,23 @@ def _sample_pool_to_device(pool: torch.Tensor, batch_size: int, device: torch.de
     return pool[idx].to(device=device)
 
 
+def _evaluate_image_samples(samples_np) -> Dict[str, float]:
+    """Backend-agnostic image quality summary used by image-like datasets."""
+
+    samples_np = samples_np.astype("float32", copy=False)
+    flat = samples_np.reshape(samples_np.shape[0], -1)
+    per_sample_std = flat.std(axis=1)
+    return {
+        "global_mean": float(flat.mean()),
+        "global_std": float(flat.std()),
+        "per_sample_std_mean": float(per_sample_std.mean()),
+        "per_sample_std_p10": float(np.quantile(per_sample_std, 0.10)),
+        "frac_saturated_abs_gt_095": float((np.abs(samples_np) > 0.95).mean()),
+        "value_min": float(samples_np.min()),
+        "value_max": float(samples_np.max()),
+    }
+
+
 def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
     """Build a small image-folder backend for the toy protocol."""
 
@@ -277,20 +302,6 @@ def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
         sigma_value = float(sigma.item()) if torch.is_tensor(sigma) else float(sigma)
         return torch.randn((batch_size, *data_shape), device=device) * sigma_value
 
-    def evaluate_samples(samples_np) -> Dict[str, float]:
-        samples_np = samples_np.astype("float32", copy=False)
-        flat = samples_np.reshape(samples_np.shape[0], -1)
-        per_sample_std = flat.std(axis=1)
-        return {
-            "global_mean": float(flat.mean()),
-            "global_std": float(flat.std()),
-            "per_sample_std_mean": float(per_sample_std.mean()),
-            "per_sample_std_p10": float(np.quantile(per_sample_std, 0.10)),
-            "frac_saturated_abs_gt_095": float((np.abs(samples_np) > 0.95).mean()),
-            "value_min": float(samples_np.min()),
-            "value_max": float(samples_np.max()),
-        }
-
     def estimate_sigma() -> float:
         source = train_pool_limited_cpu if cfg.limited_data_enabled else population_pool_cpu
         return float(source.reshape(source.shape[0], -1).std(unbiased=False).item())
@@ -309,7 +320,7 @@ def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
         sample_val_batch=sample_val,
         sample_population_batch=sample_population,
         sample_terminal_batch=sample_terminal,
-        evaluate_sample_metrics=evaluate_samples,
+        evaluate_sample_metrics=_evaluate_image_samples,
         estimate_sigma_data=estimate_sigma,
         metadata={
             "num_classes": int(num_classes),
@@ -320,5 +331,157 @@ def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
             "train_root": train_root_resolved,
             "val_root": val_root_resolved,
             "train_val_disjoint_guarantee": bool(not cfg.dataset_val_path),
+        },
+    )
+
+
+def _download_if_missing(url: str, path: Path) -> None:
+    """Download URL to `path` if absent (atomic rename on success)."""
+
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    urlretrieve(url, tmp_path)
+    tmp_path.replace(path)
+
+
+def _read_idx_images(path: Path) -> torch.Tensor:
+    """Read IDX image file (gzip) into uint8 tensor [N,1,H,W]."""
+
+    with gzip.open(path, "rb") as f:
+        magic, n, rows, cols = struct.unpack(">IIII", f.read(16))
+        if magic != 2051:
+            raise ValueError(f"Invalid image magic for {path}: {magic}")
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    data = data.reshape(n, 1, rows, cols)
+    return torch.from_numpy(data.copy())
+
+
+def _read_idx_labels(path: Path) -> torch.Tensor:
+    """Read IDX label file (gzip) into uint8 tensor [N]."""
+
+    with gzip.open(path, "rb") as f:
+        magic, n = struct.unpack(">II", f.read(8))
+        if magic != 2049:
+            raise ValueError(f"Invalid label magic for {path}: {magic}")
+        data = np.frombuffer(f.read(), dtype=np.uint8)
+    if data.shape[0] != n:
+        raise ValueError(f"Label size mismatch for {path}: header={n}, actual={data.shape[0]}")
+    return torch.from_numpy(data.copy())
+
+
+def _load_mnist_tensors(cache_root: Path):
+    """Download/load MNIST train/test splits as float32 in [-1,1]."""
+
+    base_urls = [
+        "https://storage.googleapis.com/cvdf-datasets/mnist/",
+        "http://yann.lecun.com/exdb/mnist/",
+    ]
+    files = {
+        "train_images": "train-images-idx3-ubyte.gz",
+        "train_labels": "train-labels-idx1-ubyte.gz",
+        "test_images": "t10k-images-idx3-ubyte.gz",
+        "test_labels": "t10k-labels-idx1-ubyte.gz",
+    }
+
+    for name, filename in files.items():
+        dst = cache_root / filename
+        if dst.exists():
+            continue
+        last_err = None
+        for base in base_urls:
+            try:
+                _download_if_missing(base + filename, dst)
+                last_err = None
+                break
+            except Exception as err:  # pragma: no cover - network fallback path
+                last_err = err
+                if dst.exists():
+                    dst.unlink(missing_ok=True)
+        if last_err is not None:
+            raise RuntimeError(f"Failed to download MNIST file '{filename}': {last_err}")
+
+    train_images_u8 = _read_idx_images(cache_root / files["train_images"])
+    train_labels = _read_idx_labels(cache_root / files["train_labels"]).to(dtype=torch.long)
+    test_images_u8 = _read_idx_images(cache_root / files["test_images"])
+    test_labels = _read_idx_labels(cache_root / files["test_labels"]).to(dtype=torch.long)
+
+    train_images = train_images_u8.to(dtype=torch.float32) / 255.0 * 2.0 - 1.0
+    test_images = test_images_u8.to(dtype=torch.float32) / 255.0 * 2.0 - 1.0
+    return train_images, train_labels, test_images, test_labels
+
+
+def _build_mnist_bundle(cfg, device: torch.device) -> DatasetBundle:
+    """Build MNIST backend (download IDX files if needed, no torchvision dependency)."""
+
+    if cfg.image_channels != 1:
+        raise ValueError(
+            f"dataset_kind='mnist' requires --image-channels=1, got image_channels={cfg.image_channels}"
+        )
+    cache_root = Path(cfg.dataset_path).expanduser() if cfg.dataset_path else Path.home() / ".cache" / "wild_diffusion" / "mnist"
+    train_images, train_labels, test_images, test_labels = _load_mnist_tensors(cache_root)
+
+    if cfg.image_size > 0 and cfg.image_size != train_images.shape[-1]:
+        size = (int(cfg.image_size), int(cfg.image_size))
+        train_images = F.interpolate(train_images, size=size, mode="bilinear", align_corners=False)
+        test_images = F.interpolate(test_images, size=size, mode="bilinear", align_corners=False)
+
+    train_idx = _subsample_indices(train_images.shape[0], cfg.image_train_size, cfg.image_split_seed)
+    val_idx = _subsample_indices(test_images.shape[0], cfg.image_val_size, cfg.image_split_seed + 1001)
+
+    train_pool_limited_cpu = train_images[train_idx].clone()
+    train_labels_limited_cpu = train_labels[train_idx].clone()
+    val_pool_cpu = test_images[val_idx].clone()
+    val_labels_cpu = test_labels[val_idx].clone()
+    population_pool_cpu = train_images
+    population_labels_cpu = train_labels
+    data_shape = tuple(int(v) for v in population_pool_cpu.shape[1:])
+
+    def sample_train(batch_size: int) -> torch.Tensor:
+        if cfg.limited_data_enabled:
+            return _sample_pool_to_device(train_pool_limited_cpu, batch_size, device)
+        return _sample_pool_to_device(population_pool_cpu, batch_size, device)
+
+    def sample_val(batch_size: int) -> torch.Tensor:
+        return _sample_pool_to_device(val_pool_cpu, batch_size, device)
+
+    def sample_population(batch_size: int) -> torch.Tensor:
+        return _sample_pool_to_device(population_pool_cpu, batch_size, device)
+
+    def sample_terminal(batch_size: int, sigma: Union[float, torch.Tensor]) -> torch.Tensor:
+        sigma_value = float(sigma.item()) if torch.is_tensor(sigma) else float(sigma)
+        return torch.randn((batch_size, *data_shape), device=device) * sigma_value
+
+    def estimate_sigma() -> float:
+        source = train_pool_limited_cpu if cfg.limited_data_enabled else population_pool_cpu
+        return float(source.reshape(source.shape[0], -1).std(unbiased=False).item())
+
+    train_pool_field = train_pool_limited_cpu if cfg.limited_data_enabled else None
+    train_labels_field = train_labels_limited_cpu if cfg.limited_data_enabled else None
+
+    return DatasetBundle(
+        name="mnist",
+        data_shape=data_shape,
+        centers=None,
+        train_pool=train_pool_field,
+        train_pool_labels=train_labels_field,
+        val_pool=val_pool_cpu,
+        sample_train_batch=sample_train,
+        sample_val_batch=sample_val,
+        sample_population_batch=sample_population,
+        sample_terminal_batch=sample_terminal,
+        evaluate_sample_metrics=_evaluate_image_samples,
+        estimate_sigma_data=estimate_sigma,
+        metadata={
+            "num_classes": 10,
+            "class_names": [str(i) for i in range(10)],
+            "val_pool_labels": val_labels_cpu,
+            "population_size": int(population_pool_cpu.shape[0]),
+            "enable_nearest_reference_distance": False,
+            "train_root": str(cache_root),
+            "val_root": str(cache_root),
+            "train_val_disjoint_guarantee": True,
+            "population_labels": population_labels_cpu,
         },
     )

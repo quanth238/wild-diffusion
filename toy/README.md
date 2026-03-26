@@ -1,4 +1,4 @@
-# Toy: Trajectory-Perturbed Robust Diffusion (Versioned: v1/v2)
+# Toy: Trajectory-Perturbed Robust Diffusion (Versioned: v1/v2/wild)
 
 This folder is a Torch-first toy implementation for the draft method in `pdfs/method.md`.
 Current runnable targets are:
@@ -7,6 +7,9 @@ Current runnable targets are:
 - `--method-version v1`: soft regularization by **energy penalty only** (closeness disabled),
   with optional dual-lambda update for
   \(\rho\lambda + \sup_u[\mathcal L_{\mathrm{attack}}-\lambda \mathcal C_{\mathrm{energy}}]\).
+- `--method-version wild`: sample-level WDRO surrogate update (WILD style):
+  interval refresh of adversarial samples from
+  `argmax_x' [loss(x') - gamma * 0.5||x'-x||^2]`.
 
 
 ## Structure
@@ -26,6 +29,7 @@ Current runnable targets are:
 - `versions/`: version-specific robust method implementations.
   - `versions/v2/`: hard-constrained rollout + robust trainer (implemented).
   - `versions/v1/`: energy-penalty rollout + robust trainer (implemented, closeness disabled).
+  - `versions/wild/`: WDRO surrogate sample-level trainer (implemented).
 - `data.py`: 2D toy data generation (8-mode Gaussian ring).
 - `models.py`: denoiser/control MLPs.
   - Denoiser now uses EDM preconditioning (`c_skip`, `c_out`, `c_in`, `c_noise`) to match EDM/WILD behavior.
@@ -66,6 +70,39 @@ Outer minimization:
   with `warmup_clean_steps=900` and `warmup_ramp_steps=600`.
 
 No `R_close` term is used.
+
+## WILD Objective (method-version=`wild`)
+
+Inner step (sample update):
+- keep model fixed, update a batch of synthetic training samples by gradient ascent on
+  `loss(x') - wild_gamma * 0.5||x' - x||^2` for `wild_inner_steps`.
+- refresh this adversarial cache every `wild_update_interval` steps.
+
+Outer step (parameter update):
+- train denoiser on weighted clean/adv objective using `outer_clean_weight` and `outer_attack_weight`.
+- works for both `--training-objective edm` and `--training-objective score`.
+
+Main knobs:
+- `--wild-update-interval`
+- `--wild-cache-batches`
+- `--wild-inner-steps`
+- `--wild-step-size`
+- `--wild-gamma`
+- `--wild-clamp-samples --wild-sample-min --wild-sample-max` (optional)
+
+### Training Objective Switch (`--training-objective`)
+
+You can keep the same rollout/control framework and switch denoiser training loss:
+
+- `--training-objective edm` (default):
+  - weighted x0-regression (`EDM` style).
+- `--training-objective score`:
+  - weighted score matching on noisy states.
+  - configure score weighting with `--score-matching-weight-power` (default `2.0`).
+
+For fair convergence comparison, `metrics.json` also stores:
+- `objective_debug.baseline_loss` (selected primary objective).
+- `objective_debug.baseline_proxy_weighted_denoise_loss` (common x0-regression proxy metric).
 
 ## Flow Modes (important)
 
@@ -223,6 +260,102 @@ Notes:
   - endpoint image global std is not too small,
   - endpoint recovery MSE mean is not too large.
 - This is a minimal image sanity-check backend, not a replacement for full FID-based image evaluation.
+
+## MNIST Backend
+
+You can run MNIST directly (no `torchvision` requirement). The backend auto-downloads IDX files
+to `~/.cache/wild_diffusion/mnist` (or `--dataset-path` if provided).
+
+```bash
+cd Wild-Diffusion
+
+# EDM baseline on MNIST.
+python toy/run_toy.py \
+  --dataset-kind mnist \
+  --model-kind image_conv \
+  --diagnostics-kind image_basic \
+  --image-channels 1 \
+  --image-size 28 \
+  --image-train-size 5000 \
+  --image-val-size 2000 \
+  --training-objective edm \
+  --baseline-only
+
+# Score-matching objective on MNIST.
+python toy/run_toy.py \
+  --dataset-kind mnist \
+  --model-kind image_conv \
+  --diagnostics-kind image_basic \
+  --image-channels 1 \
+  --image-size 28 \
+  --image-train-size 5000 \
+  --image-val-size 2000 \
+  --training-objective score \
+  --score-matching-weight-power 2.0 \
+  --baseline-only
+```
+
+### One-Command EDM vs Score (+ attack, v2 path-level) on MNIST
+
+```bash
+cd Wild-Diffusion
+python toy/scripts/compare_mnist_objectives.py \
+  --outdir toy_outputs_mnist_compare \
+  --prefix mnist_objcmp \
+  --seeds 0,1 \
+  --device auto \
+  --steps 300 \
+  --batch-size 128 \
+  --kappa 0.15
+```
+
+Outputs:
+- `toy_outputs_mnist_compare/mnist_objcmp_summary.json`
+- `toy_outputs_mnist_compare/mnist_objcmp_summary.png`
+
+### One-Command Baseline vs WILD on MNIST (EDM + Score)
+
+```bash
+cd Wild-Diffusion
+python toy/scripts/compare_mnist_wild_objectives.py \
+  --outdir toy_outputs_mnist_wild_compare \
+  --prefix mnist_wildcmp \
+  --seeds 0,1 \
+  --device auto \
+  --steps 300 \
+  --batch-size 128 \
+  --wild-update-interval 20 \
+  --wild-cache-batches 4 \
+  --wild-inner-steps 3 \
+  --wild-step-size 0.05 \
+  --wild-gamma 2.0
+```
+
+Outputs:
+- `toy_outputs_mnist_wild_compare/mnist_wildcmp_summary.json`
+- `toy_outputs_mnist_wild_compare/mnist_wildcmp_summary.png`
+
+## One-Command Baseline vs WILD on Toy (EDM + Score)
+
+```bash
+cd Wild-Diffusion
+python toy/scripts/compare_toy_wild_objectives.py \
+  --outdir toy_outputs_wild_compare \
+  --prefix toy_wildcmp \
+  --seeds 0,1 \
+  --device auto \
+  --steps 800 \
+  --batch-size 512 \
+  --wild-update-interval 20 \
+  --wild-cache-batches 4 \
+  --wild-inner-steps 3 \
+  --wild-step-size 0.05 \
+  --wild-gamma 2.0
+```
+
+Outputs:
+- `toy_outputs_wild_compare/toy_wildcmp_summary.json`
+- `toy_outputs_wild_compare/toy_wildcmp_summary.png`
 
 ## Checks (before training)
 

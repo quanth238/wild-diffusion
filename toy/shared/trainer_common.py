@@ -5,7 +5,7 @@ import torch
 
 from ..models import set_requires_grad
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
-from .objective import weighted_denoise_loss
+from .objective import compute_training_loss, weighted_denoise_loss
 from .reverse import sample_reverse_paths
 from .sigma import sample_target_indices, sample_target_indices_log_normal
 from .train_utils import sample_train_batch
@@ -23,7 +23,7 @@ def train_baseline(
     """Train baseline denoiser theta on standard EDM weighted denoising loss."""
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
-    history = {"loss": []}
+    history = {"loss": [], "proxy_weighted_denoise_loss": []}
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
 
     ema_model = None
@@ -53,7 +53,7 @@ def train_baseline(
         x_noisy = x0 + batch_scalar_like(sigma, x0) * torch.randn_like(x0)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = weighted_denoise_loss(denoiser, x_noisy, x0, sigma, cfg.sigma_data)
+        loss = compute_training_loss(cfg, denoiser, x_noisy, x0, sigma)
         if has_nan_or_inf(loss):
             raise RuntimeError("NaN/Inf detected in baseline loss.")
         loss.backward()
@@ -63,9 +63,22 @@ def train_baseline(
                 for p_ema, p in zip(ema_model.parameters(), denoiser.parameters()):
                     p_ema.mul_(cfg.ema_decay).add_(p, alpha=1.0 - cfg.ema_decay)
         history["loss"].append(scalarize(loss))
+        if str(getattr(cfg, "training_objective", "edm")).lower() == "edm":
+            proxy_loss = loss
+        else:
+            with torch.no_grad():
+                proxy_loss = weighted_denoise_loss(denoiser, x_noisy, x0, sigma, cfg.sigma_data)
+        history["proxy_weighted_denoise_loss"].append(scalarize(proxy_loss))
 
         if step % cfg.log_every == 0:
-            print(f"[baseline] step={step:05d} loss={loss.item():.6f}", flush=True)
+            if str(getattr(cfg, "training_objective", "edm")).lower() == "edm":
+                print(f"[baseline] step={step:05d} loss={loss.item():.6f}", flush=True)
+            else:
+                print(
+                    f"[baseline] step={step:05d} loss={loss.item():.6f} "
+                    f"proxy_weighted_denoise={proxy_loss.item():.6f}",
+                    flush=True,
+                )
 
     history["sigma_counts"] = [int(v) for v in sigma_counts.detach().cpu().tolist()]
     eval_model = ema_model if ema_model is not None else denoiser

@@ -105,4 +105,9 @@ def empty_robust_history() -> dict:
         "diag_delta_norm_ratio_max": [],
         "diag_path_delta_mean": [],
         "diag_terminal_delta_mean": [],
+        "wild_inner_attack_loss": [],
+        "wild_inner_transport_cost": [],
+        "wild_inner_sigma_mean": [],
+        "wild_refresh_step": [],
+        "wild_cache_size": [],
     }

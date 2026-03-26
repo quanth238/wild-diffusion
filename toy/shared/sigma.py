@@ -9,7 +9,7 @@ def build_sigma_levels(sigma_min: float, sigma_max: float, n_steps: int, device:
     return torch.cat(
         [
             torch.zeros(1, device=device),
-            torch.logspace(math.log10(sigma_min), math.log10(sigma_max), n_steps, device=device),
+            torch.logspace(math.log10(sigma_min), math.log10(sigma_max), n_steps, device="cpu").to(device),
         ]
     )
 

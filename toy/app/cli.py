@@ -19,6 +19,14 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--batch-size must be > 0, got {cfg.batch_size}")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
+    if cfg.training_objective not in ("edm", "score"):
+        raise ValueError(
+            f"--training-objective must be one of ('edm', 'score'), got {cfg.training_objective}"
+        )
+    if cfg.score_matching_weight_power < 0:
+        raise ValueError(
+            f"--score-matching-weight-power must be >= 0, got {cfg.score_matching_weight_power}"
+        )
     if cfg.n_steps_path <= 0:
         raise ValueError(f"--n-steps-path must be > 0, got {cfg.n_steps_path}")
     if cfg.sigma_min <= 0:
@@ -44,6 +52,22 @@ def _validate_config(cfg: ToyConfig) -> None:
         )
     if cfg.outer_attack_weight == 0 and cfg.outer_clean_weight == 0:
         raise ValueError("Both outer weights are zero; training objective is identically zero.")
+    if cfg.wild_update_interval <= 0:
+        raise ValueError(f"--wild-update-interval must be > 0, got {cfg.wild_update_interval}")
+    if cfg.wild_cache_batches <= 0:
+        raise ValueError(f"--wild-cache-batches must be > 0, got {cfg.wild_cache_batches}")
+    if cfg.wild_inner_steps < 0:
+        raise ValueError(f"--wild-inner-steps must be >= 0, got {cfg.wild_inner_steps}")
+    if cfg.wild_step_size <= 0:
+        raise ValueError(f"--wild-step-size must be > 0, got {cfg.wild_step_size}")
+    if cfg.wild_gamma < 0:
+        raise ValueError(f"--wild-gamma must be >= 0, got {cfg.wild_gamma}")
+    if cfg.wild_delta_ratio_denom <= 0:
+        raise ValueError(f"--wild-delta-ratio-denom must be > 0, got {cfg.wild_delta_ratio_denom}")
+    if cfg.wild_sample_max <= cfg.wild_sample_min:
+        raise ValueError(
+            f"--wild-sample-max must be > --wild-sample-min, got {cfg.wild_sample_max} <= {cfg.wild_sample_min}"
+        )
     if cfg.dataset_kind == "image_folder":
         if not cfg.dataset_path:
             raise ValueError("--dataset-path must be provided when --dataset-kind=image_folder")
@@ -51,6 +75,17 @@ def _validate_config(cfg: ToyConfig) -> None:
             raise ValueError(f"--image-size must be > 0, got {cfg.image_size}")
         if cfg.image_channels not in (1, 3):
             raise ValueError(f"--image-channels must be 1 or 3, got {cfg.image_channels}")
+        if cfg.image_train_size <= 0 or cfg.image_val_size <= 0:
+            raise ValueError(
+                f"--image-train-size and --image-val-size must be > 0, got {cfg.image_train_size}, {cfg.image_val_size}"
+            )
+    if cfg.dataset_kind == "mnist":
+        if cfg.image_channels != 1:
+            raise ValueError(
+                f"--image-channels must be 1 for --dataset-kind=mnist, got {cfg.image_channels}"
+            )
+        if cfg.image_size <= 0:
+            raise ValueError(f"--image-size must be > 0, got {cfg.image_size}")
         if cfg.image_train_size <= 0 or cfg.image_val_size <= 0:
             raise ValueError(
                 f"--image-train-size and --image-val-size must be > 0, got {cfg.image_train_size}, {cfg.image_val_size}"
@@ -69,7 +104,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outdir", type=str, default=ToyConfig.outdir)
     parser.add_argument("--exp-name", type=str, default=ToyConfig.exp_name)
     parser.add_argument("--seed", type=int, default=ToyConfig.seed)
-    parser.add_argument("--device", type=str, default=ToyConfig.device, choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--device", type=str, default=ToyConfig.device, choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument(
         "--method-version",
         type=str,
@@ -103,6 +138,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plot-stochastic-backward", action="store_true", default=ToyConfig.plot_stochastic_backward)
     parser.add_argument("--plot-deterministic-backward", action="store_true")
     parser.add_argument("--baseline-only", action="store_true", default=ToyConfig.baseline_only)
+    parser.add_argument("--compute-fid", action="store_true", default=ToyConfig.compute_fid)
+    parser.add_argument("--fid-samples", type=int, default=ToyConfig.fid_samples)
     parser.add_argument("--use-ema-eval", action="store_true", default=ToyConfig.use_ema_eval)
     parser.add_argument("--disable-ema-eval", action="store_true")
     parser.add_argument("--ema-decay", type=float, default=ToyConfig.ema_decay)
@@ -112,6 +149,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-phi", type=float, default=ToyConfig.lr_phi)
     parser.add_argument("--inner-steps", type=int, default=ToyConfig.inner_steps)
     parser.add_argument("--clip-phi-grad", type=float, default=ToyConfig.clip_phi_grad)
+    parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score"])
+    parser.add_argument("--score-matching-weight-power", type=float, default=ToyConfig.score_matching_weight_power)
 
     parser.add_argument("--n-modes", type=int, default=ToyConfig.n_modes)
     parser.add_argument("--mode-radius", type=float, default=ToyConfig.mode_radius)
@@ -156,6 +195,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-ramp-steps", type=int, default=ToyConfig.warmup_ramp_steps)
     parser.add_argument("--warmup-attack-weight-start", type=float, default=ToyConfig.warmup_attack_weight_start)
     parser.add_argument("--warmup-phi-lr-scale-start", type=float, default=ToyConfig.warmup_phi_lr_scale_start)
+    parser.add_argument("--wild-update-interval", type=int, default=ToyConfig.wild_update_interval)
+    parser.add_argument("--wild-cache-batches", type=int, default=ToyConfig.wild_cache_batches)
+    parser.add_argument("--wild-inner-steps", type=int, default=ToyConfig.wild_inner_steps)
+    parser.add_argument("--wild-step-size", type=float, default=ToyConfig.wild_step_size)
+    parser.add_argument("--wild-gamma", type=float, default=ToyConfig.wild_gamma)
+    parser.add_argument("--wild-fixed-noise-inner", action="store_true", default=ToyConfig.wild_fixed_noise_inner)
+    parser.add_argument("--disable-wild-fixed-noise-inner", action="store_true")
+    parser.add_argument("--wild-clamp-samples", action="store_true", default=ToyConfig.wild_clamp_samples)
+    parser.add_argument("--wild-sample-min", type=float, default=ToyConfig.wild_sample_min)
+    parser.add_argument("--wild-sample-max", type=float, default=ToyConfig.wild_sample_max)
+    parser.add_argument("--wild-delta-ratio-denom", type=float, default=ToyConfig.wild_delta_ratio_denom)
     parser.add_argument("--collapse-diag-every", type=int, default=ToyConfig.collapse_diag_every)
     parser.add_argument("--collapse-gap-ratio-tol", type=float, default=ToyConfig.collapse_gap_ratio_tol)
     parser.add_argument("--collapse-delta-ratio-tol", type=float, default=ToyConfig.collapse_delta_ratio_tol)
@@ -213,6 +263,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
     disable_v1_dual_lambda = bool(args_dict.pop("disable_v1_dual_lambda"))
+    disable_wild_fixed_noise_inner = bool(args_dict.pop("disable_wild_fixed_noise_inner"))
     collapse_v_l2_tol_legacy = args_dict.pop("collapse_v_l2_tol")
 
     cfg = ToyConfig(**args_dict)
@@ -238,6 +289,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.kappa_preserve_l2_budget = False
     if disable_v1_dual_lambda:
         cfg.v1_dual_lambda_enabled = False
+    if disable_wild_fixed_noise_inner:
+        cfg.wild_fixed_noise_inner = False
     if collapse_v_l2_tol_legacy is not None:
         cfg.collapse_delta_ratio_tol = float(collapse_v_l2_tol_legacy)
     if cfg.use_log_normal_sigma_sampling and cfg.auto_log_normal_params:

@@ -1,7 +1,7 @@
 from types import ModuleType
 
 
-SUPPORTED_METHOD_VERSIONS = ("v1", "v2")
+SUPPORTED_METHOD_VERSIONS = ("v1", "v2", "wild")
 
 
 def resolve_method_module(method_version: str) -> ModuleType:
@@ -15,8 +15,11 @@ def resolve_method_module(method_version: str) -> ModuleType:
         from .v1 import method as module
 
         return module
+    if method_version == "wild":
+        from .wild import method as module
+
+        return module
     raise ValueError(
         f"Unsupported method_version='{method_version}'. "
         f"Supported versions: {', '.join(SUPPORTED_METHOD_VERSIONS)}"
     )
-

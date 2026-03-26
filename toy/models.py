@@ -54,6 +54,39 @@ class ToyEDMDenoiser(nn.Module):
         return batch_scalar_like(c_skip, x) * x + batch_scalar_like(c_out, x) * f_x
 
 
+class ToyScoreModel(nn.Module):
+    """2D MLP score model for VE corruption x_sigma = x0 + sigma * eps.
+
+    `forward()` returns an x0 estimate to stay API-compatible with reverse/eval code:
+      x0_hat = x + sigma^2 * s_theta(x, sigma).
+    """
+
+    def __init__(self, hidden_dim: int = 128, sigma_data: float = 0.5):
+        super().__init__()
+        self.sigma_data = float(sigma_data)
+        self.model = nn.Sequential(
+            nn.Linear(2 + 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def predict_score(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        sigma2 = sigma.square()
+        sigma_data2 = self.sigma_data ** 2
+        c_in = 1.0 / torch.sqrt(sigma2 + sigma_data2)
+        c_noise = torch.log(sigma) / 4.0
+        h = torch.cat([batch_scalar_like(c_in, x) * x, noise_features(c_noise)], dim=1)
+        return self.model(h)
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        score = self.predict_score(x, sigma)
+        return x + batch_scalar_like(sigma.square(), x) * score
+
+
 class ControlNet(nn.Module):
     """Control policy phi for constrained forward perturbations delta_k.
 
@@ -147,6 +180,41 @@ class ImageEDMDenoiser(nn.Module):
             h = block(h, cond)
         f_x = self.out_conv(self.act(self.out_norm(h)))
         return batch_scalar_like(c_skip, x) * x + batch_scalar_like(c_out, x) * f_x
+
+
+class ImageScoreModel(nn.Module):
+    """Small convolutional score model with x0-compatible forward output."""
+
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_data: float = 0.5, num_blocks: int = 4):
+        super().__init__()
+        self.sigma_data = float(sigma_data)
+        self.in_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.blocks = nn.ModuleList([_ConvResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.out_norm = nn.GroupNorm(_num_groups(hidden_dim), hidden_dim)
+        self.out_conv = nn.Conv2d(hidden_dim, in_channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+
+    def predict_score(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        sigma2 = sigma.square()
+        sigma_data2 = self.sigma_data ** 2
+        c_in = 1.0 / torch.sqrt(sigma2 + sigma_data2)
+        c_noise = torch.log(sigma) / 4.0
+        cond = self.noise_mlp(noise_features(c_noise))
+        h = self.in_conv(batch_scalar_like(c_in, x) * x)
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out_conv(self.act(self.out_norm(h)))
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        score = self.predict_score(x, sigma)
+        return x + batch_scalar_like(sigma.square(), x) * score
 
 
 class ImageControlNet(nn.Module):

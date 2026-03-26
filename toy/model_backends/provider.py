@@ -2,7 +2,14 @@ from dataclasses import dataclass
 
 import torch
 
-from ..models import ControlNet, ImageControlNet, ImageEDMDenoiser, ToyEDMDenoiser
+from ..models import (
+    ControlNet,
+    ImageControlNet,
+    ImageEDMDenoiser,
+    ImageScoreModel,
+    ToyEDMDenoiser,
+    ToyScoreModel,
+)
 
 
 @dataclass
@@ -18,11 +25,15 @@ class ModelBundle:
 def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) -> ModelBundle:
     """Factory for denoiser/control backends used by the toy protocol."""
 
+    objective = str(getattr(cfg, "training_objective", "edm")).lower()
+    if objective not in ("edm", "score"):
+        raise ValueError(f"Unsupported training_objective='{objective}'. Expected one of: edm, score.")
+
     model_kind = cfg.model_kind
     if model_kind == "auto":
         if dataset.name == "toy_gmm":
             model_kind = "toy_mlp"
-        elif dataset.name == "image_folder":
+        elif dataset.name in ("image_folder", "mnist"):
             model_kind = "image_conv"
         else:
             raise NotImplementedError(
@@ -42,10 +53,11 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
                 f"got data_shape={dataset.data_shape}"
             )
         channels = int(dataset.data_shape[0])
+        denoiser_cls = ImageEDMDenoiser if objective == "edm" else ImageScoreModel
         return ModelBundle(
-            name="image_conv",
-            baseline=ImageEDMDenoiser(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
-            robust=ImageEDMDenoiser(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
+            name=f"image_conv_{objective}",
+            baseline=denoiser_cls(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
+            robust=denoiser_cls(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
             control=ImageControlNet(in_channels=channels, hidden_dim=cfg.hidden_dim).to(device),
         )
 
@@ -55,9 +67,10 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
             f"got data_shape={dataset.data_shape}"
         )
 
+    denoiser_cls = ToyEDMDenoiser if objective == "edm" else ToyScoreModel
     return ModelBundle(
-        name="toy_mlp",
-        baseline=ToyEDMDenoiser(cfg.hidden_dim, sigma_data=sigma_data).to(device),
-        robust=ToyEDMDenoiser(cfg.hidden_dim, sigma_data=sigma_data).to(device),
+        name=f"toy_mlp_{objective}",
+        baseline=denoiser_cls(cfg.hidden_dim, sigma_data=sigma_data).to(device),
+        robust=denoiser_cls(cfg.hidden_dim, sigma_data=sigma_data).to(device),
         control=ControlNet(cfg.hidden_dim).to(device),
     )

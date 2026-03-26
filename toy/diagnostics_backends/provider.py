@@ -26,7 +26,7 @@ def build_diagnostics_bundle(cfg, dataset) -> DiagnosticsBundle:
 
     if diagnostics_kind == "toy_gmm":
         return _build_toy_gmm_diagnostics(dataset)
-    if diagnostics_kind in ("image_folder", "image_basic"):
+    if diagnostics_kind in ("image_folder", "mnist", "image_basic"):
         return _build_image_diagnostics()
     raise NotImplementedError(
         f"Unsupported diagnostics_kind='{cfg.diagnostics_kind}'. "

@@ -3,7 +3,7 @@ from typing import Callable, Optional
 import torch
 
 from ...models import set_requires_grad
-from ...shared.objective import inner_objective_attack_only, weighted_denoise_loss
+from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import (
     pathwise_l2,
@@ -106,7 +106,7 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss = weighted_denoise_loss(denoiser, roll.x_target, x0, roll.sigma_target, cfg.sigma_data)
+                train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
                 inner_obj = inner_objective_attack_only(train_loss)
                 if has_nan_or_inf(inner_obj):
                     raise RuntimeError("NaN/Inf detected in inner objective.")
@@ -140,11 +140,11 @@ def train_trajectory_robust_constrained(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
         )
-        outer_loss_attack = weighted_denoise_loss(denoiser, roll.x_target, x0, roll.sigma_target, cfg.sigma_data)
+        outer_loss_attack = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
         outer_loss_clean = torch.zeros((), device=x0.device, dtype=x0.dtype)
         if clean_weight > 0.0:
             x_ref_target = roll.states_ref[torch.arange(x0.shape[0], device=x0.device), indices]
-            outer_loss_clean = weighted_denoise_loss(denoiser, x_ref_target, x0, roll.sigma_target, cfg.sigma_data)
+            outer_loss_clean = compute_training_loss(cfg, denoiser, x_ref_target, x0, roll.sigma_target)
         outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
         if has_nan_or_inf(outer_loss):
             raise RuntimeError("NaN/Inf detected in outer loss.")
@@ -192,12 +192,12 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss_cur = weighted_denoise_loss(
+                train_loss_cur = compute_training_loss(
+                    cfg,
                     denoiser,
                     roll_cur_diag.x_target,
                     x0,
                     roll_cur_diag.sigma_target,
-                    cfg.sigma_data,
                 )
                 inner_obj_cur = inner_objective_attack_only(train_loss_cur)
 
@@ -210,12 +210,12 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss_zero = weighted_denoise_loss(
+                train_loss_zero = compute_training_loss(
+                    cfg,
                     denoiser,
                     roll_zero_diag.x_target,
                     x0,
                     roll_zero_diag.sigma_target,
-                    cfg.sigma_data,
                 )
                 inner_obj_zero = inner_objective_attack_only(train_loss_zero)
                 gap = inner_obj_cur - inner_obj_zero
@@ -290,4 +290,3 @@ def train_trajectory_robust_energy(
         sample_train_batch_fn=sample_train_batch_fn,
         sample_population_batch_fn=sample_population_batch_fn,
     )
-

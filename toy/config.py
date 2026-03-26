@@ -40,6 +40,8 @@ class ToyConfig:
     lr_phi: float = 5e-4
     inner_steps: int = 1
     clip_phi_grad: float = 1.0
+    training_objective: str = "edm"  # edm|score
+    score_matching_weight_power: float = 2.0  # lambda(sigma)=sigma^p in score objective
 
     # Data.
     n_modes: int = 8
@@ -87,6 +89,18 @@ class ToyConfig:
     collapse_delta_ratio_tol: float = 0.05
     constraint_saturation_threshold: float = 0.98
 
+    # WILD-style sample-level WDRO surrogate options (method-version=wild).
+    wild_update_interval: int = 20
+    wild_cache_batches: int = 4
+    wild_inner_steps: int = 3
+    wild_step_size: float = 0.05
+    wild_gamma: float = 2.0
+    wild_fixed_noise_inner: bool = True
+    wild_clamp_samples: bool = False
+    wild_sample_min: float = -1.0
+    wild_sample_max: float = 1.0
+    wild_delta_ratio_denom: float = 1.0
+
     # Baseline acceptance gate (must pass before attack training).
     baseline_gate_enabled: bool = True
     baseline_gate_error_on_fail: bool = False
@@ -95,6 +109,9 @@ class ToyConfig:
     baseline_gate_max_generated_p90_min_dist: float = 0.45
     baseline_gate_max_endpoint_avg_min_dist: float = 0.35
     baseline_gate_max_endpoint_p90_min_dist: float = 0.60
+
+    compute_fid: bool = False
+    fid_samples: int = 2000
 
     # Reverse terminal consistency check:
     # at k=terminal, reverse state must match the forward terminal state.

@@ -5,7 +5,7 @@ import torch
 
 from .data import sample_gmm
 from .models import set_requires_grad
-from .shared.objective import inner_objective_attack_only, weighted_denoise_loss
+from .shared.objective import compute_training_loss, inner_objective_attack_only
 from .shared.sigma import sample_target_indices
 from .versions.registry import resolve_method_module
 
@@ -138,7 +138,7 @@ def gradient_check_denoiser(
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
         )
-        return weighted_denoise_loss(denoiser, roll.x_target, x0, roll.sigma_target, cfg.sigma_data)
+        return compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
 
     loss = loss_fn()
     loss.backward()
@@ -198,7 +198,7 @@ def gradient_check_control(
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
         )
-        train_loss = weighted_denoise_loss(denoiser, roll.x_target, x0, roll.sigma_target, cfg.sigma_data)
+        train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
         return inner_objective_attack_only(train_loss)
 
     def training_inner_loss():
@@ -206,6 +206,16 @@ def gradient_check_control(
         return -inner_fn()
 
     inner_obj = training_inner_loss()
+    if not inner_obj.requires_grad:
+        param = next(control.parameters())
+        index = tuple(0 for _ in range(param.ndim))
+        return {
+            "index": [int(i) for i in index],
+            "autodiff": 0.0,
+            "numerical": 0.0,
+            "relative_error": 0.0,
+            "no_control_dependency": True,
+        }
     inner_obj.backward()
 
     param = next(control.parameters())
@@ -232,15 +242,15 @@ def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_b
         )
 
     # Run checks on CPU/float64 copies for numerical stability.
-    denoiser_chk = copy.deepcopy(denoiser).to(device="cpu", dtype=torch.float64)
-    control_chk = copy.deepcopy(control).to(device="cpu", dtype=torch.float64)
-    centers_chk = None if centers is None else centers.detach().to(device="cpu", dtype=torch.float64)
-    sigma_levels_chk = sigma_levels.detach().to(device="cpu", dtype=torch.float64)
+    denoiser_chk = copy.deepcopy(denoiser).to("cpu").to(torch.float64)
+    control_chk = copy.deepcopy(control).to("cpu").to(torch.float64)
+    centers_chk = None if centers is None else centers.detach().to("cpu").to(torch.float64)
+    sigma_levels_chk = sigma_levels.detach().to("cpu").to(torch.float64)
 
     def sample_batch_chk(batch_size: int) -> torch.Tensor:
         if sample_batch_fn is None:
             return _sample_check_batch(cfg, batch_size, centers=centers_chk, sample_batch_fn=None)
-        return sample_batch_fn(batch_size).detach().to(device="cpu", dtype=torch.float64)
+        return sample_batch_fn(batch_size).detach().to("cpu").to(torch.float64)
 
     report = {
         "rollout": sanity_check_rollout(

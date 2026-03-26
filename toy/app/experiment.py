@@ -485,6 +485,17 @@ def run_experiment(cfg) -> dict:
             "method_description": getattr(method, "DESCRIPTION", ""),
             "model_backend": model_bundle.name,
             "diagnostics_backend": diagnostics.name,
+            "training_objective": str(getattr(cfg, "training_objective", "edm")),
+            "score_matching_weight_power": float(getattr(cfg, "score_matching_weight_power", 2.0)),
+            "wild_update_interval": int(getattr(cfg, "wild_update_interval", 0)),
+            "wild_cache_batches": int(getattr(cfg, "wild_cache_batches", 0)),
+            "wild_inner_steps": int(getattr(cfg, "wild_inner_steps", 0)),
+            "wild_step_size": float(getattr(cfg, "wild_step_size", 0.0)),
+            "wild_gamma": float(getattr(cfg, "wild_gamma", 0.0)),
+            "wild_fixed_noise_inner": bool(getattr(cfg, "wild_fixed_noise_inner", False)),
+            "wild_clamp_samples": bool(getattr(cfg, "wild_clamp_samples", False)),
+            "wild_sample_min": float(getattr(cfg, "wild_sample_min", 0.0)),
+            "wild_sample_max": float(getattr(cfg, "wild_sample_max", 0.0)),
         },
         "dataset_debug": {
             "dataset_backend": dataset.name,
@@ -517,12 +528,24 @@ def run_experiment(cfg) -> dict:
             **baseline_gate,
         },
         "objective_debug": {
+            "baseline_loss_kind": str(getattr(cfg, "training_objective", "edm")),
             "baseline_loss": summarize_series(history_baseline["loss"]),
+            "baseline_proxy_weighted_denoise_loss": summarize_series(
+                history_baseline.get("proxy_weighted_denoise_loss", [])
+            ),
+            "baseline_loss_curve": [float(v) for v in history_baseline.get("loss", [])],
+            "baseline_proxy_weighted_denoise_curve": [
+                float(v) for v in history_baseline.get("proxy_weighted_denoise_loss", [])
+            ],
             "baseline_sigma_counts": history_baseline.get("sigma_counts", []),
             "robust_outer_loss": summarize_series(history_robust["outer_loss"]),
             "robust_outer_loss_attack": summarize_series(history_robust.get("outer_loss_attack", [])),
             "robust_outer_loss_clean": summarize_series(history_robust.get("outer_loss_clean", [])),
+            "robust_outer_loss_curve": [float(v) for v in history_robust.get("outer_loss", [])],
+            "robust_outer_loss_attack_curve": [float(v) for v in history_robust.get("outer_loss_attack", [])],
+            "robust_outer_loss_clean_curve": [float(v) for v in history_robust.get("outer_loss_clean", [])],
             "robust_inner_obj": summarize_series(history_robust["inner_obj"]),
+            "robust_inner_obj_curve": [float(v) for v in history_robust.get("inner_obj", [])],
             "robust_energy": summarize_series(history_robust.get("energy", [])),
             "robust_lambda_value": summarize_series(history_robust.get("lambda_value", [])),
             "robust_lambda_value_next": summarize_series(history_robust.get("lambda_value_next", [])),
@@ -546,6 +569,11 @@ def run_experiment(cfg) -> dict:
             "diag_delta_norm_ratio_max": summarize_series(history_robust.get("diag_delta_norm_ratio_max", [])),
             "diag_path_delta_mean": summarize_series(history_robust.get("diag_path_delta_mean", [])),
             "diag_terminal_delta_mean": summarize_series(history_robust.get("diag_terminal_delta_mean", [])),
+            "wild_inner_attack_loss": summarize_series(history_robust.get("wild_inner_attack_loss", [])),
+            "wild_inner_transport_cost": summarize_series(history_robust.get("wild_inner_transport_cost", [])),
+            "wild_inner_sigma_mean": summarize_series(history_robust.get("wild_inner_sigma_mean", [])),
+            "wild_refresh_steps": [int(v) for v in history_robust.get("wild_refresh_step", [])],
+            "wild_cache_sizes": [int(v) for v in history_robust.get("wild_cache_size", [])],
             "collapse_gap_ratio_tol": float(cfg.collapse_gap_ratio_tol),
             "collapse_delta_ratio_tol": float(cfg.collapse_delta_ratio_tol),
             "collapse_suspected": collapse_suspected,
@@ -632,6 +660,63 @@ def run_experiment(cfg) -> dict:
     metrics["sample_quality_debug"]["robust_generated_mode_metrics"] = metrics["sample_quality_debug"][
         "robust_generated_metrics"
     ]
+
+    if getattr(cfg, "compute_fid", False) and dataset.name in ("mnist", "image_basic"):
+        print("  [info] Computing FID via subprocess...", flush=True)
+        import re
+        import subprocess
+        from PIL import Image
+        def calc_fid_for_batch(batch_np, prefix):
+            fid_dir = os.path.join(exp_dir, f"fid_{prefix}")
+            os.makedirs(fid_dir, exist_ok=True)
+            n_images = batch_np.shape[0]
+            for i in range(n_images):
+                # Model output is float in [-1, 1]. Remap to uint8 [0, 255].
+                img_np = ((batch_np[i] + 1.0) * 0.5).clip(0.0, 1.0)
+                img_np = (img_np * 255).astype("uint8")
+                if img_np.shape[0] == 1:
+                    img = Image.fromarray(img_np[0], mode="L")
+                else:
+                    img = Image.fromarray(img_np.transpose(1, 2, 0), mode="RGB")
+                img.save(os.path.join(fid_dir, f"{i:05d}.png"))
+            ref_path = "toy_outputs/mnist_ref.npz"
+            if not os.path.exists(ref_path):
+                print(f"[WARN] FID reference {ref_path} not found.", flush=True)
+                return None
+            # Explicitly inherit FID_DETECTOR_PATH so the subprocess can find the model.
+            fid_env = os.environ.copy()
+            res = None
+            try:
+                res = subprocess.run(
+                    [
+                        "torchrun", "--standalone", "--nproc_per_node=1", "fid.py", "calc",
+                        "--images", fid_dir,
+                        "--ref", ref_path,
+                        "--num", str(n_images),   # must match actual image count (default=50000 would fail)
+                    ],
+                    capture_output=True, text=True, check=True,
+                    env=fid_env,
+                )
+                # fid.py prints exactly one bare float: `print(f'{fid:g}')`.
+                # Use regex to extract safely, regardless of other log lines.
+                match = re.search(r"^\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s*$",
+                                   res.stdout, re.MULTILINE)
+                if match:
+                    return float(match.group(1))
+                print(f"[WARN] FID stdout did not contain a bare float for {prefix}.", flush=True)
+                print(f"[WARN] FID stdout was:\n{res.stdout[:500]}", flush=True)
+                return None
+            except Exception as e:
+                print(f"[WARN] FID calculation failed for {prefix}: {e}", flush=True)
+                if res is not None:
+                    if res.stdout:
+                        print(f"[WARN] FID stdout:\n{res.stdout[:1000]}", flush=True)
+                    if res.stderr:
+                        print(f"[WARN] FID stderr:\n{res.stderr[:2000]}", flush=True)
+                return None
+
+        metrics["sample_quality_debug"]["baseline_fid"] = calc_fid_for_batch(baseline_gen_np, "baseline")
+        metrics["sample_quality_debug"]["robust_fid"] = calc_fid_for_batch(robust_gen_np, "robust")
 
     diagnostics.plot_forward_backward_debug(
         fwd_baseline_paths=tensor_to_numpy(ref_paths_plot),
