@@ -35,6 +35,14 @@ def _row_from_metrics(seed: int, baseline_payload: Dict, robust_payload: Dict) -
     b = baseline_payload["metrics"]
     r = robust_payload["metrics"]
 
+    b_backend = b.get("dataset_debug", {}).get("dataset_backend")
+    r_backend = r.get("dataset_debug", {}).get("dataset_backend")
+    if b_backend != "toy_gmm" or r_backend != "toy_gmm":
+        raise ValueError(
+            "evaluate_stageA.py is only valid for the 2D toy GMM protocol; "
+            f"got baseline backend={b_backend!r}, robust backend={r_backend!r}"
+        )
+
     b_gate = b["baseline_gate"]
     r_gate = r["baseline_gate"]
 

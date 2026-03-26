@@ -48,6 +48,31 @@ def scalarize(value: torch.Tensor) -> float:
     return float(value.detach().item())
 
 
+def flatten_batch(tensor: torch.Tensor) -> torch.Tensor:
+    """Flatten all non-batch axes into a single feature axis."""
+
+    return tensor.reshape(tensor.shape[0], -1)
+
+
+def batch_scalar_like(values: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    """Broadcast per-sample scalars across the non-batch axes of `reference`."""
+
+    view_shape = (values.shape[0],) + (1,) * (reference.ndim - 1)
+    return values.reshape(view_shape)
+
+
+def per_sample_squared_l2(delta: torch.Tensor) -> torch.Tensor:
+    """Return squared L2 norm per sample for tensors with arbitrary trailing shape."""
+
+    return flatten_batch(delta).pow(2).sum(dim=1)
+
+
+def per_sample_l2(delta: torch.Tensor) -> torch.Tensor:
+    """Return L2 norm per sample for tensors with arbitrary trailing shape."""
+
+    return torch.sqrt(per_sample_squared_l2(delta))
+
+
 def as_jsonable_metrics(metrics: Dict) -> Dict:
     """Recursively coerce tensors/NumPy scalars into JSON-serializable values."""
 

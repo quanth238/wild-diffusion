@@ -136,6 +136,86 @@ def plot_forward_timestep_clouds(
     plt.close(fig)
 
 
+def _to_display_image(img: np.ndarray) -> np.ndarray:
+    """Map CHW image in [-1, 1] to HWC image in [0, 1] for plotting."""
+
+    if img.ndim != 3:
+        raise ValueError(f"Expected CHW image, got shape {img.shape}")
+    if img.shape[0] == 1:
+        hwc = np.repeat(img, 3, axis=0).transpose(1, 2, 0)
+    else:
+        hwc = img.transpose(1, 2, 0)
+    return np.clip((hwc + 1.0) * 0.5, 0.0, 1.0)
+
+
+def _make_image_grid(images: np.ndarray, n_show: int = 16) -> np.ndarray:
+    """Tile the first few CHW images into a single HWC grid."""
+
+    if images.ndim != 4:
+        raise ValueError(f"Expected image batch [B,C,H,W], got shape {images.shape}")
+    n = min(int(n_show), images.shape[0])
+    tiles = [_to_display_image(images[i]) for i in range(n)]
+    if len(tiles) == 0:
+        raise ValueError("Cannot build image grid from an empty batch.")
+
+    height, width, channels = tiles[0].shape
+    ncols = int(np.ceil(np.sqrt(n)))
+    nrows = int(np.ceil(n / ncols))
+    canvas = np.zeros((nrows * height, ncols * width, channels), dtype=np.float32)
+
+    for idx, tile in enumerate(tiles):
+        row = idx // ncols
+        col = idx % ncols
+        canvas[row * height : (row + 1) * height, col * width : (col + 1) * width] = tile
+    return canvas
+
+
+def plot_forward_timestep_image_grids(
+    fwd_baseline_paths: np.ndarray,
+    bwd_baseline_paths: np.ndarray,
+    fwd_attack_paths: np.ndarray,
+    bwd_attack_paths: np.ndarray,
+    centers,
+    out_path: str,
+    max_panels: int = 6,
+    n_show_images: int = 16,
+) -> None:
+    """4-row timestep grid view for image-shaped forward/backward paths."""
+
+    del centers
+    if fwd_baseline_paths.ndim != 5:
+        raise ValueError(
+            "plot_forward_timestep_image_grids expects arrays shaped [B,T,C,H,W], "
+            f"got {fwd_baseline_paths.shape}"
+        )
+
+    n_steps = fwd_baseline_paths.shape[1]
+    n_show = min(max_panels, n_steps)
+    idx_fwd = np.linspace(0, n_steps - 1, n_show, dtype=int)
+    idx_rev = np.linspace(n_steps - 1, 0, n_show, dtype=int)
+    fig, axes = plt.subplots(4, n_show, figsize=(3.0 * n_show, 10.5), squeeze=False)
+
+    row_titles = ["Fwd Baseline", "Bwd Baseline", "Fwd Attack", "Bwd Attack"]
+    panels = [
+        (fwd_baseline_paths, idx_fwd),
+        (bwd_baseline_paths, idx_rev),
+        (fwd_attack_paths, idx_fwd),
+        (bwd_attack_paths, idx_rev),
+    ]
+
+    for row, (paths, indices) in enumerate(panels):
+        for col, step_idx in enumerate(indices):
+            ax = axes[row, col]
+            ax.imshow(_make_image_grid(paths[:, step_idx], n_show=n_show_images))
+            ax.set_title(f"{row_titles[row]} k={step_idx}")
+            ax.axis("off")
+
+    fig.suptitle("Forward/Backward Debug View (Baseline vs Attack)", y=0.995)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def plot_generated_reverse_timestep_clouds(
     baseline_rev_paths: np.ndarray,
     robust_rev_paths: np.ndarray,

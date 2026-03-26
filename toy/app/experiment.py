@@ -6,11 +6,12 @@ import torch
 
 from ..checks import run_preflight_checks
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
-from ..diffusion import build_kappa_schedule, build_sigma_levels, rollout_controlled_ve, sample_target_indices
+from ..diagnostics_backends.provider import build_diagnostics_bundle
+from ..shared.sigma import build_sigma_levels, sample_target_indices
+from ..model_backends.provider import build_model_bundle
 from .utils import (
     compute_terminal_match_stats,
     empty_robust_history,
-    estimate_sigma_data,
     summarize_series,
     summarize_train_vs_val_curve_gaps,
 )
@@ -20,41 +21,54 @@ from ..metrics import (
     compute_paired_reverse_delta_by_step,
     compute_path_mse_by_step,
     compute_x0_recovery_vs_terminal_step,
-    estimate_bayes_posterior_mean_mse,
-    evaluate_baseline_gate,
     evaluate_nearest_reference_distance,
-    evaluate_mode_coverage,
     summarize_attack_gap_windows,
 )
-from ..models import ControlNet, ToyEDMDenoiser
-from ..plotting import plot_debug_losses, plot_forward_timestep_clouds
-from ..trainer import reverse_paths_from_terminal, train_baseline, train_trajectory_robust_energy
+from ..trainer import reverse_paths_from_terminal, train_baseline
 from ..utils import as_jsonable_metrics, ensure_dir, pick_device, set_seed, tensor_to_numpy
+from ..versions.registry import resolve_method_module
 
 
 def _print_dataset_info(cfg, dataset: DatasetBundle) -> None:
     """Print dataset regime summary (limited-data vs population sampling)."""
 
+    print(f"[info] dataset_backend={dataset.name} data_shape={dataset.data_shape}", flush=True)
     if cfg.limited_data_enabled:
-        print(
-            "[info] limited_data_enabled=True "
-            f"train_pool_size={dataset.train_pool.shape[0]} "
-            f"({cfg.train_points_per_mode} points/mode x {cfg.n_modes} modes)",
-            flush=True,
-        )
+        if dataset.name == "toy_gmm":
+            print(
+                "[info] limited_data_enabled=True "
+                f"train_pool_size={dataset.train_pool.shape[0]} "
+                f"({cfg.train_points_per_mode} points/mode x {cfg.n_modes} modes)",
+                flush=True,
+            )
+        else:
+            print(
+                "[info] limited_data_enabled=True "
+                f"train_pool_size={dataset.train_pool.shape[0]}",
+                flush=True,
+            )
     else:
         print("[info] limited_data_enabled=False (population sampling mode)", flush=True)
     print(f"[info] val_pool_size={dataset.val_pool.shape[0]}", flush=True)
+    if dataset.name == "image_folder":
+        disjoint = dataset.metadata.get("train_val_disjoint_guarantee")
+        if disjoint is False:
+            print(
+                "[warn] image_folder backend is using dataset_val_path mode; train/val disjointness is not guaranteed "
+                "unless the two roots are independently curated.",
+                flush=True,
+            )
 
 
 def _build_baseline_gate(
     cfg,
+    diagnostics,
     baseline_eval,
     control,
     sigma_levels: torch.Tensor,
     kappa_by_step: torch.Tensor,
-    centers_np,
     dataset: DatasetBundle,
+    method,
 ) -> Dict:
     """Compute baseline acceptance gate metrics before robust phase.
 
@@ -71,7 +85,7 @@ def _build_baseline_gate(
 
     x_gate = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_gate = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    gate_roll = rollout_controlled_ve(
+    gate_roll = method.rollout_controlled_ve(
         x0=x_gate,
         target_indices=idx_gate,
         control_net=control,
@@ -87,27 +101,37 @@ def _build_baseline_gate(
         sigma_levels=sigma_levels_gate,
         stochastic=False,
     )
-    gate_endpoint_mode_metrics = evaluate_mode_coverage(tensor_to_numpy(gate_rev_det[:, 0]), centers_np)
+    gate_endpoint_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_rev_det[:, 0]))
+    gate_endpoint_recovery_mse = float((gate_rev_det[:, 0] - x_gate).reshape(x_gate.shape[0], -1).pow(2).mean().item())
     gate_gen_paths = reverse_paths_from_terminal(
         denoiser=baseline_eval,
-        x_terminal=torch.randn(cfg.eval_samples, 2, device=sigma_levels.device) * sigma_levels[-1],
+        x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
         sigma_levels=sigma_levels,
         stochastic=True,
     )
-    gate_generated_mode_metrics = evaluate_mode_coverage(tensor_to_numpy(gate_gen_paths[:, 0]), centers_np)
-    baseline_gate = evaluate_baseline_gate(
-        generated_mode_metrics=gate_generated_mode_metrics,
-        endpoint_mode_metrics=gate_endpoint_mode_metrics,
-        min_coverage=cfg.baseline_gate_min_coverage,
-        max_generated_avg_min_dist=cfg.baseline_gate_max_generated_avg_min_dist,
-        max_generated_p90_min_dist=cfg.baseline_gate_max_generated_p90_min_dist,
-        max_endpoint_avg_min_dist=cfg.baseline_gate_max_endpoint_avg_min_dist,
-        max_endpoint_p90_min_dist=cfg.baseline_gate_max_endpoint_p90_min_dist,
+    gate_generated_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_gen_paths[:, 0]))
+    baseline_gate = diagnostics.build_baseline_gate(
+        cfg,
+        {
+            "generated_metrics": gate_generated_mode_metrics,
+            "endpoint_metrics": gate_endpoint_mode_metrics,
+            "endpoint_recovery_mse_mean": gate_endpoint_recovery_mse,
+            "sigma_terminal": float(sigma_levels_gate[-1].item()),
+        },
     )
     return baseline_gate
 
 
-def _run_robust_phase(cfg, robust, control, centers, sigma_levels, dataset: DatasetBundle, baseline_gate: Dict):
+def _run_robust_phase(
+    cfg,
+    robust,
+    control,
+    centers,
+    sigma_levels,
+    dataset: DatasetBundle,
+    baseline_gate: Dict,
+    method,
+):
     """Execute or skip robust training depending on baseline-only mode and gate status."""
 
     attack_training_executed = False
@@ -132,7 +156,7 @@ def _run_robust_phase(cfg, robust, control, centers, sigma_levels, dataset: Data
         return False, empty_robust_history(), robust
 
     attack_training_executed = True
-    history_robust = train_trajectory_robust_energy(
+    history_robust = method.train_trajectory_robust(
         robust,
         control,
         centers,
@@ -140,6 +164,7 @@ def _run_robust_phase(cfg, robust, control, centers, sigma_levels, dataset: Data
         cfg,
         train_pool=dataset.train_pool,
         sample_train_batch_fn=dataset.sample_train_batch,
+        sample_population_batch_fn=dataset.sample_population_batch,
     )
     return attack_training_executed, history_robust, robust
 
@@ -165,25 +190,32 @@ def run_experiment(cfg) -> dict:
         if cfg.baseline_only
         else ("robust_forced_no_gate" if not cfg.baseline_gate_enabled else "robust_with_gate")
     )
+    method = resolve_method_module(cfg.method_version)
+    if not getattr(method, "IMPLEMENTED", True):
+        raise NotImplementedError(
+            f"method_version='{cfg.method_version}' is marked IMPLEMENTED=False. "
+            "Please implement its rollout/train API under toy/versions/<version>/."
+        )
     print(f"[info] device={device}", flush=True)
     print(f"[info] exp_dir={exp_dir}", flush=True)
     print(
         "[info] flow_mode="
         f"{flow_mode} baseline_gate_enabled={cfg.baseline_gate_enabled} "
-        f"outer_attack_weight={cfg.outer_attack_weight} outer_clean_weight={cfg.outer_clean_weight}",
+        f"outer_attack_weight={cfg.outer_attack_weight} outer_clean_weight={cfg.outer_clean_weight} "
+        f"method_version={cfg.method_version}",
         flush=True,
     )
 
     dataset = build_dataset_bundle(cfg, device)
+    diagnostics = build_diagnostics_bundle(cfg, dataset)
     centers = dataset.centers
-    centers_np = tensor_to_numpy(centers)
     if cfg.sigma_data <= 0:
-        cfg.sigma_data = estimate_sigma_data(centers, cfg.data_std)
+        cfg.sigma_data = dataset.estimate_sigma_data()
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
     sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
-    kappa_by_step = build_kappa_schedule(
+    kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
         use_time_dependent=cfg.use_time_dependent_kappa,
@@ -193,13 +225,22 @@ def run_experiment(cfg) -> dict:
         preserve_l2_budget=cfg.kappa_preserve_l2_budget,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
 
-    baseline = ToyEDMDenoiser(cfg.hidden_dim, sigma_data=cfg.sigma_data).to(device)
-    robust = ToyEDMDenoiser(cfg.hidden_dim, sigma_data=cfg.sigma_data).to(device)
-    control = ControlNet(cfg.hidden_dim).to(device)
+    model_bundle = build_model_bundle(cfg, dataset, sigma_data=cfg.sigma_data, device=device)
+    baseline = model_bundle.baseline
+    robust = model_bundle.robust
+    control = model_bundle.control
 
     check_report = {}
     if cfg.run_checks:
-        check_report = run_preflight_checks(robust, control, centers, sigma_levels, cfg)
+        check_report = run_preflight_checks(
+            robust,
+            control,
+            centers,
+            sigma_levels,
+            cfg,
+            sample_batch_fn=dataset.sample_population_batch,
+            method=method,
+        )
         print("[check] preflight passed", flush=True)
         print(
             f"[check] grad_rel_err denoiser={check_report['gradcheck_denoiser']['relative_error']:.3e} "
@@ -214,15 +255,18 @@ def run_experiment(cfg) -> dict:
         cfg,
         train_pool=dataset.train_pool,
         sample_train_batch_fn=dataset.sample_train_batch,
+        sample_population_batch_fn=dataset.sample_population_batch,
     )
+    robust.load_state_dict(baseline_eval.state_dict())
     baseline_gate = _build_baseline_gate(
         cfg=cfg,
+        diagnostics=diagnostics,
         baseline_eval=baseline_eval,
         control=control,
         sigma_levels=sigma_levels,
         kappa_by_step=kappa_by_step,
-        centers_np=centers_np,
         dataset=dataset,
+        method=method,
     )
 
     attack_training_executed, history_robust, robust = _run_robust_phase(
@@ -233,6 +277,7 @@ def run_experiment(cfg) -> dict:
         sigma_levels=sigma_levels,
         dataset=dataset,
         baseline_gate=baseline_gate,
+        method=method,
     )
     if not attack_training_executed:
         robust = baseline_eval
@@ -240,7 +285,7 @@ def run_experiment(cfg) -> dict:
     # Evaluate denoise curves on train-pool and held-out pools to expose overfitting under limited data.
     x_train_eval = dataset.sample_train_batch(cfg.debug_eval_batch)
     idx_train_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    train_roll = rollout_controlled_ve(
+    train_roll = method.rollout_controlled_ve(
         x0=x_train_eval,
         target_indices=idx_train_eval,
         control_net=control,
@@ -260,7 +305,7 @@ def run_experiment(cfg) -> dict:
 
     x_val_eval = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_val_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    val_roll = rollout_controlled_ve(
+    val_roll = method.rollout_controlled_ve(
         x0=x_val_eval,
         target_indices=idx_val_eval,
         control_net=control,
@@ -291,9 +336,7 @@ def run_experiment(cfg) -> dict:
     if cfg.plot_stochastic_backward:
         # Fair comparison: baseline/attack reverse use the same stochastic increments.
         shared_reverse_noise = torch.randn(
-            terminal_step + 1,
-            ref_paths_plot.shape[0],
-            ref_paths_plot.shape[2],
+            (terminal_step + 1, ref_paths_plot.shape[0], *ref_paths_plot.shape[2:]),
             device=device,
             dtype=ref_paths_plot.dtype,
         )
@@ -371,29 +414,28 @@ def run_experiment(cfg) -> dict:
         sigma_levels=sigma_levels,
         reverse_fn=reverse_paths_from_terminal,
     )
-    bayes_terminal_mse = estimate_bayes_posterior_mean_mse(
-        centers=centers_np,
-        data_std=cfg.data_std,
+    bayes_terminal_mse = diagnostics.estimate_bayes_terminal_mse(
+        dataset,
+        cfg,
         sigma=float(sigma_levels[terminal_step].item()),
-        n_samples=50000,
-        seed=cfg.seed,
     )
     baseline_gen_paths = reverse_paths_from_terminal(
         denoiser=baseline_eval,
-        x_terminal=torch.randn(cfg.eval_samples, 2, device=device) * sigma_levels[-1],
+        x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
         sigma_levels=sigma_levels,
         stochastic=True,
     )
     baseline_gen_np = tensor_to_numpy(baseline_gen_paths[:, 0])
     robust_gen_paths = reverse_paths_from_terminal(
         denoiser=robust,
-        x_terminal=torch.randn(cfg.eval_samples, 2, device=device) * sigma_levels[-1],
+        x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
         sigma_levels=sigma_levels,
         stochastic=True,
     )
     robust_gen_np = tensor_to_numpy(robust_gen_paths[:, 0])
     val_pool_np = tensor_to_numpy(dataset.val_pool)
     train_pool_np = tensor_to_numpy(dataset.train_pool) if dataset.train_pool is not None else None
+    enable_ref_dist = bool(dataset.metadata.get("enable_nearest_reference_distance", True))
     denoise_gap = summarize_train_vs_val_curve_gaps(denoise_error_curves_train, denoise_error_curves_val)
     attack_gap_windows_train = summarize_attack_gap_windows(denoise_error_curves_train)
     attack_gap_windows_val = summarize_attack_gap_windows(denoise_error_curves_val)
@@ -433,14 +475,37 @@ def run_experiment(cfg) -> dict:
             "outer_attack_weight": float(cfg.outer_attack_weight),
             "outer_clean_weight": float(cfg.outer_clean_weight),
             "inner_steps": int(cfg.inner_steps),
+            "v1_dual_lambda_enabled": bool(cfg.v1_dual_lambda_enabled),
+            "v1_energy_budget_rho": float(cfg.v1_energy_budget_rho),
+            "v1_lambda_init": float(cfg.v1_lambda_init),
+            "v1_lambda_lr": float(cfg.v1_lambda_lr),
+            "v1_lambda_max": float(cfg.v1_lambda_max),
+            "lambda_energy_fixed": float(cfg.lambda_energy),
+            "method_version": cfg.method_version,
+            "method_description": getattr(method, "DESCRIPTION", ""),
+            "model_backend": model_bundle.name,
+            "diagnostics_backend": diagnostics.name,
         },
         "dataset_debug": {
+            "dataset_backend": dataset.name,
+            "data_shape": list(dataset.data_shape),
             "limited_data_enabled": bool(cfg.limited_data_enabled),
-            "train_points_per_mode": int(cfg.train_points_per_mode),
+            "train_points_per_mode": (
+                int(cfg.train_points_per_mode) if dataset.name == "toy_gmm" else None
+            ),
             "train_pool_size": int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None,
             "val_pool_size": int(dataset.val_pool.shape[0]),
             "train_mode_counts": (
-                [int(v) for v in torch.bincount(dataset.train_pool_labels, minlength=cfg.n_modes).detach().cpu().tolist()]
+                [
+                    int(v)
+                    for v in torch.bincount(
+                        dataset.train_pool_labels,
+                        minlength=int(dataset.metadata.get("num_classes", int(dataset.train_pool_labels.max().item()) + 1)),
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
                 if dataset.train_pool_labels is not None
                 else None
             ),
@@ -458,6 +523,11 @@ def run_experiment(cfg) -> dict:
             "robust_outer_loss_attack": summarize_series(history_robust.get("outer_loss_attack", [])),
             "robust_outer_loss_clean": summarize_series(history_robust.get("outer_loss_clean", [])),
             "robust_inner_obj": summarize_series(history_robust["inner_obj"]),
+            "robust_energy": summarize_series(history_robust.get("energy", [])),
+            "robust_lambda_value": summarize_series(history_robust.get("lambda_value", [])),
+            "robust_lambda_value_next": summarize_series(history_robust.get("lambda_value_next", [])),
+            "robust_lambda_subgrad": summarize_series(history_robust.get("lambda_subgrad", [])),
+            "robust_dual_surrogate": summarize_series(history_robust.get("dual_surrogate", [])),
             "robust_delta_norm_mean": summarize_series(history_robust.get("delta_norm_mean", [])),
             "robust_delta_norm_max": summarize_series(history_robust.get("delta_norm_max", [])),
             "robust_delta_norm_ratio_mean": summarize_series(history_robust.get("delta_norm_ratio_mean", [])),
@@ -501,19 +571,28 @@ def run_experiment(cfg) -> dict:
             "terminal_step_for_plot": int(terminal_step),
             "terminal_sigma_for_plot": float(sigma_levels[terminal_step].item()),
             "plot_stochastic_backward": bool(cfg.plot_stochastic_backward),
-            "baseline_x0_mse_from_ref_terminal": float((rev_baseline_from_ref[:, 0] - x_demo).pow(2).sum(dim=1).mean().item()),
+            "baseline_x0_mse_from_ref_terminal": float(
+                (rev_baseline_from_ref[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item()
+            ),
             "baseline_x0_mse_from_attack_terminal": float(
-                (rev_baseline_from_attack[:, 0] - x_demo).pow(2).sum(dim=1).mean().item()
+                (rev_baseline_from_attack[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item()
             ),
-            "bayes_posterior_mean_mse_at_terminal_sigma": float(bayes_terminal_mse),
-            "baseline_to_bayes_mse_ratio_ref_terminal": float(
-                ((rev_baseline_from_ref[:, 0] - x_demo).pow(2).sum(dim=1).mean().item()) / max(bayes_terminal_mse, 1e-12)
+            "bayes_posterior_mean_mse_at_terminal_sigma": (
+                None if bayes_terminal_mse is None else float(bayes_terminal_mse)
             ),
-            "baseline_plot_endpoint_mode_metrics_ref_terminal": evaluate_mode_coverage(
-                tensor_to_numpy(rev_baseline_from_ref_plot[:, 0]), centers_np
+            "baseline_to_bayes_mse_ratio_ref_terminal": (
+                None
+                if bayes_terminal_mse is None
+                else float(
+                    ((rev_baseline_from_ref[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item())
+                    / max(bayes_terminal_mse, 1e-12)
+                )
             ),
-            "baseline_plot_endpoint_mode_metrics_attack_terminal": evaluate_mode_coverage(
-                tensor_to_numpy(rev_baseline_from_attack_plot[:, 0]), centers_np
+            "baseline_plot_endpoint_mode_metrics_ref_terminal": dataset.evaluate_sample_metrics(
+                tensor_to_numpy(rev_baseline_from_ref_plot[:, 0])
+            ),
+            "baseline_plot_endpoint_mode_metrics_attack_terminal": dataset.evaluate_sample_metrics(
+                tensor_to_numpy(rev_baseline_from_attack_plot[:, 0])
             ),
             "baseline_path_mse_by_step_from_ref_terminal": compute_path_mse_by_step(rev_baseline_from_ref, ref_paths_plot),
             "baseline_path_mse_by_step_from_attack_terminal": compute_path_mse_by_step(
@@ -526,31 +605,43 @@ def run_experiment(cfg) -> dict:
             "reverse_terminal_consistency": terminal_consistency,
         },
         "sample_quality_debug": {
-            "baseline_generated_mode_metrics": evaluate_mode_coverage(baseline_gen_np, centers_np),
-            "robust_generated_mode_metrics": evaluate_mode_coverage(robust_gen_np, centers_np),
+            "baseline_generated_metrics": dataset.evaluate_sample_metrics(baseline_gen_np),
+            "robust_generated_metrics": dataset.evaluate_sample_metrics(robust_gen_np),
             "baseline_generated_to_train_min_dist": (
-                evaluate_nearest_reference_distance(baseline_gen_np, train_pool_np) if train_pool_np is not None else None
+                evaluate_nearest_reference_distance(baseline_gen_np, train_pool_np)
+                if train_pool_np is not None and enable_ref_dist
+                else None
             ),
             "robust_generated_to_train_min_dist": (
-                evaluate_nearest_reference_distance(robust_gen_np, train_pool_np) if train_pool_np is not None else None
+                evaluate_nearest_reference_distance(robust_gen_np, train_pool_np)
+                if train_pool_np is not None and enable_ref_dist
+                else None
             ),
             "heldout_to_train_min_dist": (
-                evaluate_nearest_reference_distance(val_pool_np, train_pool_np) if train_pool_np is not None else None
+                evaluate_nearest_reference_distance(val_pool_np, train_pool_np)
+                if train_pool_np is not None and enable_ref_dist
+                else None
             ),
         },
     }
     if check_report:
         metrics["checks"] = check_report
+    metrics["sample_quality_debug"]["baseline_generated_mode_metrics"] = metrics["sample_quality_debug"][
+        "baseline_generated_metrics"
+    ]
+    metrics["sample_quality_debug"]["robust_generated_mode_metrics"] = metrics["sample_quality_debug"][
+        "robust_generated_metrics"
+    ]
 
-    plot_forward_timestep_clouds(
+    diagnostics.plot_forward_backward_debug(
         fwd_baseline_paths=tensor_to_numpy(ref_paths_plot),
         bwd_baseline_paths=rev_baseline_from_ref_np,
         fwd_attack_paths=tensor_to_numpy(ctrl_paths_plot),
         bwd_attack_paths=rev_baseline_from_attack_np,
-        centers=centers_np,
+        centers=dataset.metadata.get("centers_np"),
         out_path=os.path.join(exp_dir, "forward_backward_baseline_attack.png"),
     )
-    plot_debug_losses(
+    diagnostics.plot_loss_debug(
         history_baseline=history_baseline,
         history_robust=history_robust,
         denoise_curves=denoise_error_curves,
@@ -613,18 +704,8 @@ def run_experiment(cfg) -> dict:
                 f"{failed['name']}: value={failed['value']:.4f} {failed['op']} {failed['threshold']:.4f} (FAIL)",
                 flush=True,
             )
-    baseline_gen_mode = metrics["sample_quality_debug"]["baseline_generated_mode_metrics"]
-    if baseline_gen_mode["avg_min_dist_to_mode"] > cfg.baseline_gate_max_generated_avg_min_dist:
-        print(
-            "  [warn] baseline generated samples are still ring-like "
-            f"(avg_min_dist_to_mode={baseline_gen_mode['avg_min_dist_to_mode']:.3f} > "
-            f"{cfg.baseline_gate_max_generated_avg_min_dist:.3f}).",
-            flush=True,
-        )
-        print(
-            "         Increase baseline training steps or use larger batch for sharper mode separation.",
-            flush=True,
-        )
+    for warning in diagnostics.summarize_warnings(cfg, metrics):
+        print(f"  [warn] {warning}", flush=True)
     if check_report:
         print(f"  checks: {check_report}", flush=True)
     print(f"[result] artifacts saved to: {exp_dir}", flush=True)

@@ -2,6 +2,8 @@ from typing import Dict, List
 
 import torch
 
+from ..utils import per_sample_l2
+
 
 def estimate_sigma_data(centers: torch.Tensor, data_std: float) -> float:
     """Estimate EDM `sigma_data` as per-dimension std of clean toy distribution.
@@ -64,9 +66,8 @@ def summarize_train_vs_val_curve_gaps(train_curves: Dict[str, List[float]], val_
 def compute_terminal_match_stats(reverse_paths: torch.Tensor, forward_paths: torch.Tensor) -> dict:
     """Terminal consistency check: compare reverse[-1] and forward[-1] in L2."""
 
-    # reverse_paths / forward_paths: [B, N+1, 2], terminal step is index -1.
     delta = reverse_paths[:, -1] - forward_paths[:, -1]
-    l2 = torch.sqrt(delta.pow(2).sum(dim=1))
+    l2 = per_sample_l2(delta)
     return {
         "mean_l2": float(l2.mean().item()),
         "max_l2": float(l2.max().item()),
@@ -81,6 +82,11 @@ def empty_robust_history() -> dict:
         "outer_loss_attack": [],
         "outer_loss_clean": [],
         "inner_obj": [],
+        "energy": [],
+        "lambda_value": [],
+        "lambda_value_next": [],
+        "lambda_subgrad": [],
+        "dual_surrogate": [],
         "delta_norm_mean": [],
         "delta_norm_max": [],
         "delta_norm_ratio_mean": [],

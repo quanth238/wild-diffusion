@@ -3,11 +3,16 @@ import math
 from typing import Optional, Sequence
 
 from ..config import ToyConfig
+from ..versions.registry import SUPPORTED_METHOD_VERSIONS
 
 
 def _validate_config(cfg: ToyConfig) -> None:
     """Fail-fast validation for impossible or degenerate training settings."""
 
+    if cfg.method_version not in SUPPORTED_METHOD_VERSIONS:
+        raise ValueError(
+            f"--method-version must be one of {SUPPORTED_METHOD_VERSIONS}, got {cfg.method_version}"
+        )
     if cfg.steps <= 0:
         raise ValueError(f"--steps must be > 0, got {cfg.steps}")
     if cfg.batch_size <= 0:
@@ -24,6 +29,14 @@ def _validate_config(cfg: ToyConfig) -> None:
         )
     if cfg.control_radius_kappa < 0:
         raise ValueError(f"--control-radius-kappa must be >= 0, got {cfg.control_radius_kappa}")
+    if cfg.v1_energy_budget_rho < 0:
+        raise ValueError(f"--v1-energy-budget-rho must be >= 0, got {cfg.v1_energy_budget_rho}")
+    if cfg.v1_lambda_init < 0:
+        raise ValueError(f"--v1-lambda-init must be >= 0, got {cfg.v1_lambda_init}")
+    if cfg.v1_lambda_lr < 0:
+        raise ValueError(f"--v1-lambda-lr must be >= 0, got {cfg.v1_lambda_lr}")
+    if cfg.v1_lambda_max <= 0:
+        raise ValueError(f"--v1-lambda-max must be > 0, got {cfg.v1_lambda_max}")
     if cfg.outer_attack_weight < 0 or cfg.outer_clean_weight < 0:
         raise ValueError(
             "outer loss weights must be non-negative, got "
@@ -31,6 +44,17 @@ def _validate_config(cfg: ToyConfig) -> None:
         )
     if cfg.outer_attack_weight == 0 and cfg.outer_clean_weight == 0:
         raise ValueError("Both outer weights are zero; training objective is identically zero.")
+    if cfg.dataset_kind == "image_folder":
+        if not cfg.dataset_path:
+            raise ValueError("--dataset-path must be provided when --dataset-kind=image_folder")
+        if cfg.image_size <= 0:
+            raise ValueError(f"--image-size must be > 0, got {cfg.image_size}")
+        if cfg.image_channels not in (1, 3):
+            raise ValueError(f"--image-channels must be 1 or 3, got {cfg.image_channels}")
+        if cfg.image_train_size <= 0 or cfg.image_val_size <= 0:
+            raise ValueError(
+                f"--image-train-size and --image-val-size must be > 0, got {cfg.image_train_size}, {cfg.image_val_size}"
+            )
 
     # Keep validation strict on impossible settings only; do not emit runtime warnings
     # that might be misinterpreted as implementation errors.
@@ -46,7 +70,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exp-name", type=str, default=ToyConfig.exp_name)
     parser.add_argument("--seed", type=int, default=ToyConfig.seed)
     parser.add_argument("--device", type=str, default=ToyConfig.device, choices=["auto", "cpu", "cuda"])
+    parser.add_argument(
+        "--method-version",
+        type=str,
+        default=ToyConfig.method_version,
+        choices=list(SUPPORTED_METHOD_VERSIONS),
+    )
     parser.add_argument("--dataset-kind", type=str, default=ToyConfig.dataset_kind)
+    parser.add_argument("--model-kind", type=str, default=ToyConfig.model_kind)
+    parser.add_argument("--diagnostics-kind", type=str, default=ToyConfig.diagnostics_kind)
+    parser.add_argument("--dataset-path", type=str, default=ToyConfig.dataset_path)
+    parser.add_argument("--dataset-val-path", type=str, default=ToyConfig.dataset_val_path)
+    parser.add_argument("--image-size", type=int, default=ToyConfig.image_size)
+    parser.add_argument("--image-channels", type=int, default=ToyConfig.image_channels)
+    parser.add_argument("--image-train-size", type=int, default=ToyConfig.image_train_size)
+    parser.add_argument("--image-val-size", type=int, default=ToyConfig.image_val_size)
+    parser.add_argument("--image-split-seed", type=int, default=ToyConfig.image_split_seed)
+    parser.add_argument("--image-gate-min-generated-std", type=float, default=ToyConfig.image_gate_min_generated_std)
+    parser.add_argument("--image-gate-min-endpoint-std", type=float, default=ToyConfig.image_gate_min_endpoint_std)
+    parser.add_argument(
+        "--image-gate-max-endpoint-recovery-mse",
+        type=float,
+        default=ToyConfig.image_gate_max_endpoint_recovery_mse,
+    )
 
     parser.add_argument("--steps", type=int, default=ToyConfig.steps)
     parser.add_argument("--batch-size", type=int, default=ToyConfig.batch_size)
@@ -91,6 +137,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p-std", type=float, default=ToyConfig.p_std)
 
     parser.add_argument("--lambda-energy", type=float, default=ToyConfig.lambda_energy)
+    parser.add_argument("--v1-dual-lambda-enabled", action="store_true", default=ToyConfig.v1_dual_lambda_enabled)
+    parser.add_argument("--disable-v1-dual-lambda", action="store_true")
+    parser.add_argument("--v1-energy-budget-rho", type=float, default=ToyConfig.v1_energy_budget_rho)
+    parser.add_argument("--v1-lambda-init", type=float, default=ToyConfig.v1_lambda_init)
+    parser.add_argument("--v1-lambda-lr", type=float, default=ToyConfig.v1_lambda_lr)
+    parser.add_argument("--v1-lambda-max", type=float, default=ToyConfig.v1_lambda_max)
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--use-time-dependent-kappa", action="store_true", default=ToyConfig.use_time_dependent_kappa)
     parser.add_argument("--disable-time-dependent-kappa", action="store_true")
@@ -160,6 +212,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
+    disable_v1_dual_lambda = bool(args_dict.pop("disable_v1_dual_lambda"))
     collapse_v_l2_tol_legacy = args_dict.pop("collapse_v_l2_tol")
 
     cfg = ToyConfig(**args_dict)
@@ -183,6 +236,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_time_dependent_kappa = False
     if disable_kappa_preserve_l2_budget:
         cfg.kappa_preserve_l2_budget = False
+    if disable_v1_dual_lambda:
+        cfg.v1_dual_lambda_enabled = False
     if collapse_v_l2_tol_legacy is not None:
         cfg.collapse_delta_ratio_tol = float(collapse_v_l2_tol_legacy)
     if cfg.use_log_normal_sigma_sampling and cfg.auto_log_normal_params:

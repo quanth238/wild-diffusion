@@ -1,35 +1,55 @@
-# Toy: Trajectory-Perturbed Robust Diffusion (Hard-Constrained v2)
+# Toy: Trajectory-Perturbed Robust Diffusion (Versioned: v1/v2)
 
-This folder is a Torch-first toy implementation for the draft method in `pdfs/method.md`,
-focused on one target only:
+This folder is a Torch-first toy implementation for the draft method in `pdfs/method.md`.
+Current runnable targets are:
 
-- robust min-max training with trajectory control under a **hard per-step constraint**,
-- no closeness term in this version.
+- `--method-version v2`: robust min-max training with trajectory control under a **hard per-step constraint**.
+- `--method-version v1`: soft regularization by **energy penalty only** (closeness disabled),
+  with optional dual-lambda update for
+  \(\rho\lambda + \sup_u[\mathcal L_{\mathrm{attack}}-\lambda \mathcal C_{\mathrm{energy}}]\).
+
 
 ## Structure
 
 - `run_toy.py`: thin entrypoint.
 - `app/cli.py`: CLI parser -> `ToyConfig`.
-- `app/experiment.py`: orchestration pipeline (train, gate, eval, save).
+- `app/experiment.py`: orchestration pipeline (train, gate, eval, save), resolves method version.
 - `data_backends/provider.py`: dataset template layer (`dataset_kind` backend).
+- `model_backends/provider.py`: denoiser/control factory layer (`model_kind` backend).
+- `diagnostics_backends/provider.py`: diagnostics/plotting family layer (`diagnostics_kind` backend).
 - `config.py`: dataclass config.
+- `shared/`: version-agnostic components.
+  - `shared/sigma.py`: sigma ladder + sigma-step sampling.
+  - `shared/objective.py`: EDM weighted denoise loss.
+  - `shared/reverse.py`: reverse posterior + reverse trajectory samplers.
+  - `shared/train_utils.py`, `shared/trainer_common.py`: shared trainer utilities + baseline trainer.
+- `versions/`: version-specific robust method implementations.
+  - `versions/v2/`: hard-constrained rollout + robust trainer (implemented).
+  - `versions/v1/`: energy-penalty rollout + robust trainer (implemented, closeness disabled).
 - `data.py`: 2D toy data generation (8-mode Gaussian ring).
 - `models.py`: denoiser/control MLPs.
   - Denoiser now uses EDM preconditioning (`c_skip`, `c_out`, `c_in`, `c_noise`) to match EDM/WILD behavior.
-- `diffusion.py`: discrete VE-like rollout with shared noise + per-step projected control.
-- `objective.py`: weighted denoising loss + attack-only inner objective.
-- `trainer.py`: baseline and robust training loops.
+- `diffusion.py`, `objective.py`, `trainer.py`: backward-compatible re-export shims.
 - `checks.py`: rollout sanity checks + finite-difference gradient checks.
 - `metrics.py`: denoise/recovery debug metrics aligned with the draft objective.
 - `plotting.py`: focused debug plots for forward/backward + objective losses.
 
 ## Template Extension
 
-- Current backend: `dataset_kind=toy_gmm`.
-- To add image tests later:
-  - add a new builder in `data_backends/provider.py` that returns `sample_train_batch` / `sample_val_batch`;
-  - keep trainer unchanged (it now supports dataset-agnostic batch samplers);
-  - plug image-specific metrics in `app/experiment.py` (or split evaluator module).
+- Current defaults:
+  - `dataset_kind=toy_gmm`
+  - `model_kind=auto` -> resolves to `toy_mlp`
+  - `diagnostics_kind=auto` -> resolves to `toy_gmm`
+- Added image-capable backend set:
+  - `dataset_kind=image_folder`
+  - `model_kind=image_conv`
+  - `diagnostics_kind=image_basic`
+- To add a new experiment family without breaking the current protocol:
+  - add a new builder in `data_backends/provider.py` returning the `DatasetBundle` contract;
+  - add a new branch in `model_backends/provider.py` for denoiser/control construction;
+  - add a new branch in `diagnostics_backends/provider.py` for plots and optional backend-specific diagnostics.
+- `trainer.py`, `objective.py`, `checks.py`, and `reverse_paths_from_terminal()` are now shape-agnostic over trailing dimensions.
+- `sample_reverse_paths()` remains generic when a backend provides `sample_terminal_batch_fn`; without that callback it falls back to the legacy 2D Gaussian terminal sampler.
 
 ## Objective Implemented (v2)
 
@@ -42,7 +62,8 @@ Outer minimization:
 
 - minimize weighted clean + attacked denoising loss
   (`outer_loss = attack_weight * L_attack + clean_weight * L_clean`).
-- default config currently uses `outer_clean_weight=0.0`, i.e. attack-only outer objective.
+- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.5`,
+  with `warmup_clean_steps=900` and `warmup_ramp_steps=600`.
 
 No `R_close` term is used.
 
@@ -64,11 +85,12 @@ From repo root:
 ```bash
 cd Wild-Diffusion
 python toy/run_toy.py \
+  --method-version v2 \
   --exp-name constrained_v2 \
-  --steps 1200 \
+  --steps 3000 \
   --batch-size 512 \
   --inner-steps 1 \
-  --control-radius-kappa 0.3
+  --control-radius-kappa 0.15
 
 # Gate behavior:
 # attack chỉ chạy khi baseline pass gate.
@@ -108,8 +130,8 @@ cd Wild-Diffusion
 ./toy/scripts/run_stageA_once_and_eval.sh
 
 # Example override:
-SEEDS=0,1,2 DEVICE=cpu STEPS=3000 BATCH_SIZE=1024 \
-KAPPA=0.3 OUTDIR=toy_outputs_stageA PREFIX=stageA_once \
+SEEDS=0,1,2 DEVICE=cpu STEPS=3000 BATCH_SIZE=512 \
+KAPPA=0.15 OUTDIR=toy_outputs_stageA PREFIX=stageA_once \
 ./toy/scripts/run_stageA_once_and_eval.sh
 ```
 
@@ -128,7 +150,79 @@ Notes:
   - `ATTACK_WIN_RATIO_MIN`, `ATTACK_MEAN_GAP_MAX`
   - `CLEAN_MEAN_GAP_MAX`, `CLEAN_TERMINAL_GAP_MAX`
   - `SAMPLE_AVG_DELTA_MAX`, `SAMPLE_P90_DELTA_MAX`
-  - `TAIL_SATURATION_MAX`, `MIN_SEED_PASS_RATIO`
+- `TAIL_SATURATION_MAX`, `MIN_SEED_PASS_RATIO`
+
+## One-Command Single Run
+
+Run one toy experiment (baseline or robust) with env vars:
+
+```bash
+cd Wild-Diffusion
+
+# Robust single run (default mode=robust).
+EXP_NAME=toy_robust_s0 DEVICE=cpu SEED=0 \
+KAPPA=0.15 STEPS=3000 BATCH_SIZE=512 \
+./toy/scripts/run_toy_once.sh
+
+# Baseline-only single run.
+RUN_MODE=baseline EXP_NAME=toy_baseline_s0 DEVICE=cpu SEED=0 \
+STEPS=3000 BATCH_SIZE=512 \
+./toy/scripts/run_toy_once.sh
+
+# Add extra flags when needed:
+# EXTRA_ARGS='--disable-baseline-gate --plot-stochastic-backward'
+```
+
+Output:
+- `OUTDIR/EXP_NAME/metrics.json`
+- `OUTDIR/EXP_NAME/debug_losses_and_recovery.png`
+- `OUTDIR/EXP_NAME/forward_backward_baseline_attack.png`
+
+## Image Backend
+
+The same `toy/run_toy.py` protocol can now run on a small `ImageFolder` dataset.
+
+Required folder layout:
+
+```text
+your_dataset_root/
+  class_a/
+    000.png
+    001.png
+  class_b/
+    000.png
+    001.png
+```
+
+Quick run with the image wrapper:
+
+```bash
+cd Wild-Diffusion
+
+# Baseline-only smoke run on image data.
+RUN_MODE=baseline \
+DATASET_PATH=/abs/path/to/your_dataset_root \
+EXP_NAME=image_baseline_smoke DEVICE=cpu \
+IMAGE_TRAIN_SIZE=256 IMAGE_VAL_SIZE=256 \
+STEPS=200 BATCH_SIZE=32 HIDDEN_DIM=64 \
+./toy/scripts/run_image_once.sh
+
+# Robust run on the same image dataset.
+RUN_MODE=robust \
+DATASET_PATH=/abs/path/to/your_dataset_root \
+EXP_NAME=image_robust_smoke DEVICE=cpu \
+IMAGE_TRAIN_SIZE=256 IMAGE_VAL_SIZE=256 \
+STEPS=200 BATCH_SIZE=32 HIDDEN_DIM=64 \
+KAPPA=0.15 OUTER_CLEAN_WEIGHT=1.0 OUTER_ATTACK_WEIGHT=0.5 \
+./toy/scripts/run_image_once.sh
+```
+
+Notes:
+- Image gate is backend-specific and currently checks:
+  - generated image global std is not too small,
+  - endpoint image global std is not too small,
+  - endpoint recovery MSE mean is not too large.
+- This is a minimal image sanity-check backend, not a replacement for full FID-based image evaluation.
 
 ## Checks (before training)
 

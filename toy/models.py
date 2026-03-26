@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 
+from .utils import batch_scalar_like
+
 
 def noise_features(c_noise: torch.Tensor) -> torch.Tensor:
     """Small sinusoidal embedding used for noise level conditioning."""
@@ -47,9 +49,9 @@ class ToyEDMDenoiser(nn.Module):
         c_in = 1.0 / torch.sqrt(sigma2 + sigma_data2)
         c_noise = torch.log(sigma) / 4.0
 
-        h = torch.cat([c_in.unsqueeze(1) * x, noise_features(c_noise)], dim=1)
+        h = torch.cat([batch_scalar_like(c_in, x) * x, noise_features(c_noise)], dim=1)
         f_x = self.model(h)
-        return c_skip.unsqueeze(1) * x + c_out.unsqueeze(1) * f_x
+        return batch_scalar_like(c_skip, x) * x + batch_scalar_like(c_out, x) * f_x
 
 
 class ControlNet(nn.Module):
@@ -75,6 +77,104 @@ class ControlNet(nn.Module):
         sigma_feat = noise_features(torch.log(sigma) / 4.0)
         h = torch.cat([x_ref, gap, sigma_feat], dim=1)
         return self.net(h)
+
+
+def _num_groups(num_channels: int) -> int:
+    """Pick a valid GroupNorm group count for the given channel size."""
+
+    for groups in [32, 16, 8, 4, 2, 1]:
+        if num_channels % groups == 0:
+            return groups
+    return 1
+
+
+class _ConvResidualBlock(nn.Module):
+    """Simple FiLM-conditioned residual block for image backends."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        groups = _num_groups(channels)
+        self.norm1 = nn.GroupNorm(groups, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(groups, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.film = nn.Linear(channels, channels * 2)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.film(cond).chunk(2, dim=1)
+        scale = scale[:, :, None, None]
+        shift = shift[:, :, None, None]
+        h = self.norm1(x)
+        h = h * (1.0 + scale) + shift
+        h = self.act(h)
+        h = self.conv1(h)
+        h = self.act(self.norm2(h))
+        h = self.conv2(h)
+        return x + h
+
+
+class ImageEDMDenoiser(nn.Module):
+    """Small convolutional EDM denoiser for image-shaped inputs."""
+
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_data: float = 0.5, num_blocks: int = 4):
+        super().__init__()
+        self.sigma_data = float(sigma_data)
+        self.in_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.blocks = nn.ModuleList([_ConvResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.out_norm = nn.GroupNorm(_num_groups(hidden_dim), hidden_dim)
+        self.out_conv = nn.Conv2d(hidden_dim, in_channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        sigma2 = sigma.square()
+        sigma_data2 = self.sigma_data ** 2
+
+        c_skip = sigma_data2 / (sigma2 + sigma_data2)
+        c_out = sigma * self.sigma_data / torch.sqrt(sigma2 + sigma_data2)
+        c_in = 1.0 / torch.sqrt(sigma2 + sigma_data2)
+        c_noise = torch.log(sigma) / 4.0
+
+        cond = self.noise_mlp(noise_features(c_noise))
+        h = self.in_conv(batch_scalar_like(c_in, x) * x)
+        for block in self.blocks:
+            h = block(h, cond)
+        f_x = self.out_conv(self.act(self.out_norm(h)))
+        return batch_scalar_like(c_skip, x) * x + batch_scalar_like(c_out, x) * f_x
+
+
+class ImageControlNet(nn.Module):
+    """Convolutional control network for image trajectory perturbations."""
+
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 64, num_blocks: int = 3):
+        super().__init__()
+        self.in_conv = nn.Conv2d(in_channels * 2, hidden_dim, kernel_size=3, padding=1)
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.blocks = nn.ModuleList([_ConvResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.out_norm = nn.GroupNorm(_num_groups(hidden_dim), hidden_dim)
+        self.out_conv = nn.Conv2d(hidden_dim, in_channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+        # Start from delta ~= 0 so image controls do not immediately saturate the hard constraint.
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x_ref: torch.Tensor, gap: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = sigma.clamp_min(1e-6)
+        cond = self.noise_mlp(noise_features(torch.log(sigma) / 4.0))
+        h = self.in_conv(torch.cat([x_ref, gap], dim=1))
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out_conv(self.act(self.out_norm(h)))
 
 
 def set_requires_grad(module: nn.Module, flag: bool) -> None:

@@ -124,3 +124,6 @@ ENV/
 env/
 env.bak/
 venv.bak/
+
+toy_outputs
+toy_outputs_smoke

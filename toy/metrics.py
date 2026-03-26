@@ -3,6 +3,8 @@ from typing import Callable, Dict
 import numpy as np
 import torch
 
+from .utils import per_sample_l2, per_sample_squared_l2
+
 
 def evaluate_mode_coverage(samples: np.ndarray, centers: np.ndarray) -> Dict[str, float]:
     """Nearest-mode coverage and distance quality metrics for generated 2D samples."""
@@ -28,11 +30,8 @@ def evaluate_mode_coverage(samples: np.ndarray, centers: np.ndarray) -> Dict[str
 def evaluate_nearest_reference_distance(samples: np.ndarray, reference: np.ndarray) -> Dict[str, float]:
     """Distance from each sample to its nearest reference sample (memorization proxy)."""
 
-    if samples.ndim != 2 or reference.ndim != 2:
-        raise ValueError(
-            "samples and reference must be rank-2 arrays [N, D], "
-            f"got {samples.shape} and {reference.shape}"
-        )
+    samples = samples.reshape(samples.shape[0], -1)
+    reference = reference.reshape(reference.shape[0], -1)
     diff = samples[:, None, :] - reference[None, :, :]
     dists = np.linalg.norm(diff, axis=-1)
     min_dist = np.min(dists, axis=1)
@@ -173,10 +172,10 @@ def compute_denoise_error_curves(
         pred_r_ref = robust_model(ref_k, sigma_k)
         pred_r_ctrl = robust_model(ctrl_k, sigma_k)
 
-        err_b_ref = (pred_b_ref - x0).pow(2).sum(dim=1).mean()
-        err_b_ctrl = (pred_b_ctrl - x0).pow(2).sum(dim=1).mean()
-        err_r_ref = (pred_r_ref - x0).pow(2).sum(dim=1).mean()
-        err_r_ctrl = (pred_r_ctrl - x0).pow(2).sum(dim=1).mean()
+        err_b_ref = per_sample_squared_l2(pred_b_ref - x0).mean()
+        err_b_ctrl = per_sample_squared_l2(pred_b_ctrl - x0).mean()
+        err_r_ref = per_sample_squared_l2(pred_r_ref - x0).mean()
+        err_r_ctrl = per_sample_squared_l2(pred_r_ctrl - x0).mean()
 
         curves["step"].append(k)
         curves["sigma"].append(float(sigma_levels[k].item()))
@@ -192,8 +191,8 @@ def compute_denoise_error_curves(
 def compute_path_mse_by_step(reverse_paths: torch.Tensor, forward_paths: torch.Tensor) -> list:
     """Compute per-step E||x_rev_k - x_fwd_k||^2 along aligned trajectories."""
 
-    # Both tensors are [B, N+1, 2], indexed by noise-step k.
-    mse = (reverse_paths - forward_paths).pow(2).sum(dim=2).mean(dim=0)
+    delta = reverse_paths - forward_paths
+    mse = delta.reshape(delta.shape[0], delta.shape[1], -1).pow(2).sum(dim=2).mean(dim=0)
     return [float(v.item()) for v in mse]
 
 
@@ -204,15 +203,15 @@ def compute_paired_reverse_delta_by_step(
 ) -> Dict[str, list]:
     """Compare reverse paths from attacked vs reference terminals using shared settings."""
 
-    # Both tensors are [B, N+1, 2], indexed by reverse noise-step k.
     if reverse_paths_ref.shape != reverse_paths_attack.shape:
         raise ValueError(
             "reverse path tensors must have same shape, got "
             f"{tuple(reverse_paths_ref.shape)} vs {tuple(reverse_paths_attack.shape)}"
         )
     delta = reverse_paths_attack - reverse_paths_ref
-    l2 = torch.sqrt(delta.pow(2).sum(dim=2))  # [B, N+1]
-    mse = delta.pow(2).sum(dim=2)  # [B, N+1]
+    flat = delta.reshape(delta.shape[0], delta.shape[1], -1)
+    mse = flat.pow(2).sum(dim=2)
+    l2 = torch.sqrt(mse)
     n_steps = reverse_paths_ref.shape[1]
     step = list(range(n_steps))
 
@@ -244,7 +243,7 @@ def compute_x0_recovery_vs_terminal_step(
     out = {"step": [], "sigma": [], "x0_mse": []}
     for k in range(1, n_steps + 1):
         rev_k = reverse_fn(denoiser=denoiser, x_terminal=forward_paths[:, k], sigma_levels=sigma_levels[: k + 1])
-        x0_mse = (rev_k[:, 0] - x0).pow(2).sum(dim=1).mean()
+        x0_mse = per_sample_squared_l2(rev_k[:, 0] - x0).mean()
         out["step"].append(k)
         out["sigma"].append(float(sigma_levels[k].item()))
         out["x0_mse"].append(float(x0_mse.item()))
@@ -279,7 +278,7 @@ def compute_control_constraint_stats_by_step(
         kappa_eff = torch.full((n_steps,), float(control_radius_kappa), device=delta_sigma.device, dtype=delta_sigma.dtype)
     radius = kappa_eff * delta_sigma  # [N]
 
-    delta_l2 = torch.sqrt(delta_path.pow(2).sum(dim=2))  # [B, N]
+    delta_l2 = delta_path.reshape(delta_path.shape[0], delta_path.shape[1], -1).pow(2).sum(dim=2).sqrt()
     ratio = delta_l2 / radius.view(1, n_steps).clamp_min(1e-8)
     near_boundary = (ratio >= float(saturation_threshold)).to(delta_l2.dtype)
 
@@ -299,7 +298,7 @@ def compute_control_constraint_stats_by_step(
     if states_ref is not None and states_ctrl is not None:
         # states_*: [B, N+1, D], compare at noise index 1..N
         gap = states_ctrl[:, 1:] - states_ref[:, 1:]
-        gap_l2 = torch.sqrt(gap.pow(2).sum(dim=2))  # [B, N]
+        gap_l2 = per_sample_l2(gap.reshape(-1, *gap.shape[2:])).reshape(gap.shape[0], gap.shape[1])
         out["gap_norm_mean"] = [float(v.item()) for v in gap_l2.mean(dim=0)]
         out["gap_norm_p90"] = [float(v.item()) for v in torch.quantile(gap_l2, 0.90, dim=0)]
 

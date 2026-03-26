@@ -1,13 +1,23 @@
 import copy
-from dataclasses import asdict
 from typing import Dict, Tuple
 
 import torch
 
 from .data import sample_gmm
-from .diffusion import build_kappa_schedule, rollout_controlled_ve, sample_target_indices
 from .models import set_requires_grad
-from .objective import inner_objective_attack_only, weighted_denoise_loss
+from .shared.objective import inner_objective_attack_only, weighted_denoise_loss
+from .shared.sigma import sample_target_indices
+from .versions.registry import resolve_method_module
+
+
+def _sample_check_batch(cfg, batch_size: int, centers=None, sample_batch_fn=None) -> torch.Tensor:
+    """Sample x0 for numerical checks from backend callback or toy GMM fallback."""
+
+    if sample_batch_fn is not None:
+        return sample_batch_fn(batch_size)
+    if centers is None:
+        raise ValueError("centers must be provided when no sample_batch_fn is available for checks.")
+    return sample_gmm(batch_size, centers, cfg.data_std)
 
 
 def _finite_difference_scalar(loss_fn, param: torch.Tensor, idx: Tuple[int, ...], eps: float) -> float:
@@ -43,12 +53,14 @@ def _argmax_abs_index(tensor: torch.Tensor) -> Tuple[int, ...]:
     return tuple(torch.unravel_index(torch.tensor(flat_idx), tensor.shape))
 
 
-def sanity_check_rollout(control, centers, sigma_levels, cfg) -> Dict[str, float]:
+def sanity_check_rollout(control, centers, sigma_levels, cfg, sample_batch_fn=None, method=None) -> Dict[str, float]:
     """Quick rollout sanity: shape consistency + control magnitude diagnostics."""
 
-    x0 = sample_gmm(64, centers, cfg.data_std)
+    if method is None:
+        method = resolve_method_module(cfg.method_version)
+    x0 = _sample_check_batch(cfg, 64, centers=centers, sample_batch_fn=sample_batch_fn)
     idx = sample_target_indices(64, sigma_levels)
-    kappa_by_step = build_kappa_schedule(
+    kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
         use_time_dependent=cfg.use_time_dependent_kappa,
@@ -57,7 +69,7 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg) -> Dict[str, float
         high_multiplier=cfg.kappa_high_multiplier,
         preserve_l2_budget=cfg.kappa_preserve_l2_budget,
     )
-    roll = rollout_controlled_ve(
+    roll = method.rollout_controlled_ve(
         x0,
         idx,
         control,
@@ -69,8 +81,9 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg) -> Dict[str, float
     assert roll.x_target.shape == x0.shape
     assert roll.sigma_target.shape == idx.shape
     assert roll.states_ref is not None and roll.states_ctrl is not None and roll.delta_path is not None
-    mean_dev = (roll.states_ctrl - roll.states_ref).pow(2).sum(dim=2).sqrt().mean().item()
-    delta_l2 = torch.sqrt(roll.delta_path.pow(2).sum(dim=2))
+    flat_dev = (roll.states_ctrl - roll.states_ref).reshape(roll.states_ref.shape[0], roll.states_ref.shape[1], -1)
+    mean_dev = flat_dev.pow(2).sum(dim=2).sqrt().mean().item()
+    delta_l2 = roll.delta_path.reshape(roll.delta_path.shape[0], roll.delta_path.shape[1], -1).pow(2).sum(dim=2).sqrt()
     sigma_k = sigma_levels[:-1]
     sigma_next = sigma_levels[1:]
     delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
@@ -84,17 +97,27 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg) -> Dict[str, float
     }
 
 
-def gradient_check_denoiser(denoiser, control, centers, sigma_levels, cfg) -> Dict[str, float]:
+def gradient_check_denoiser(
+    denoiser,
+    control,
+    centers,
+    sigma_levels,
+    cfg,
+    sample_batch_fn=None,
+    method=None,
+) -> Dict[str, float]:
     """Compare autodiff vs finite-difference gradient for denoiser objective."""
 
+    if method is None:
+        method = resolve_method_module(cfg.method_version)
     denoiser.zero_grad(set_to_none=True)
     set_requires_grad(denoiser, True)
     set_requires_grad(control, False)
 
-    x0 = sample_gmm(32, centers, cfg.data_std)
+    x0 = _sample_check_batch(cfg, 32, centers=centers, sample_batch_fn=sample_batch_fn)
     idx = sample_target_indices(32, sigma_levels)
-    eps_schedule = torch.randn(sigma_levels.numel() - 1, x0.shape[0], x0.shape[1], device=x0.device)
-    kappa_by_step = build_kappa_schedule(
+    eps_schedule = torch.randn((sigma_levels.numel() - 1, x0.shape[0], *x0.shape[1:]), device=x0.device)
+    kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
         use_time_dependent=cfg.use_time_dependent_kappa,
@@ -105,7 +128,7 @@ def gradient_check_denoiser(denoiser, control, centers, sigma_levels, cfg) -> Di
     )
 
     def loss_fn():
-        roll = rollout_controlled_ve(
+        roll = method.rollout_controlled_ve(
             x0,
             idx,
             control,
@@ -134,17 +157,27 @@ def gradient_check_denoiser(denoiser, control, centers, sigma_levels, cfg) -> Di
     }
 
 
-def gradient_check_control(denoiser, control, centers, sigma_levels, cfg) -> Dict[str, float]:
+def gradient_check_control(
+    denoiser,
+    control,
+    centers,
+    sigma_levels,
+    cfg,
+    sample_batch_fn=None,
+    method=None,
+) -> Dict[str, float]:
     """Compare autodiff vs finite-difference gradient for inner control objective."""
 
+    if method is None:
+        method = resolve_method_module(cfg.method_version)
     control.zero_grad(set_to_none=True)
     set_requires_grad(denoiser, False)
     set_requires_grad(control, True)
 
-    x0 = sample_gmm(32, centers, cfg.data_std)
+    x0 = _sample_check_batch(cfg, 32, centers=centers, sample_batch_fn=sample_batch_fn)
     idx = sample_target_indices(32, sigma_levels)
-    eps_schedule = torch.randn(sigma_levels.numel() - 1, x0.shape[0], x0.shape[1], device=x0.device)
-    kappa_by_step = build_kappa_schedule(
+    eps_schedule = torch.randn((sigma_levels.numel() - 1, x0.shape[0], *x0.shape[1:]), device=x0.device)
+    kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
         use_time_dependent=cfg.use_time_dependent_kappa,
@@ -155,7 +188,7 @@ def gradient_check_control(denoiser, control, centers, sigma_levels, cfg) -> Dic
     )
 
     def inner_fn():
-        roll = rollout_controlled_ve(
+        roll = method.rollout_controlled_ve(
             x0,
             idx,
             control,
@@ -188,19 +221,54 @@ def gradient_check_control(denoiser, control, centers, sigma_levels, cfg) -> Dic
     }
 
 
-def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg) -> Dict:
+def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_batch_fn=None, method=None) -> Dict:
     """Numerical preflight checks run on CPU/float64 copies before training."""
+
+    if method is None:
+        method = resolve_method_module(cfg.method_version)
+    if not getattr(method, "IMPLEMENTED", True):
+        raise NotImplementedError(
+            f"method_version='{cfg.method_version}' preflight checks are unavailable: method scaffold is not implemented."
+        )
 
     # Run checks on CPU/float64 copies for numerical stability.
     denoiser_chk = copy.deepcopy(denoiser).to(device="cpu", dtype=torch.float64)
     control_chk = copy.deepcopy(control).to(device="cpu", dtype=torch.float64)
-    centers_chk = centers.detach().to(device="cpu", dtype=torch.float64)
+    centers_chk = None if centers is None else centers.detach().to(device="cpu", dtype=torch.float64)
     sigma_levels_chk = sigma_levels.detach().to(device="cpu", dtype=torch.float64)
 
+    def sample_batch_chk(batch_size: int) -> torch.Tensor:
+        if sample_batch_fn is None:
+            return _sample_check_batch(cfg, batch_size, centers=centers_chk, sample_batch_fn=None)
+        return sample_batch_fn(batch_size).detach().to(device="cpu", dtype=torch.float64)
+
     report = {
-        "rollout": sanity_check_rollout(control_chk, centers_chk, sigma_levels_chk, cfg),
-        "gradcheck_denoiser": gradient_check_denoiser(denoiser_chk, control_chk, centers_chk, sigma_levels_chk, cfg),
-        "gradcheck_control": gradient_check_control(denoiser_chk, control_chk, centers_chk, sigma_levels_chk, cfg),
+        "rollout": sanity_check_rollout(
+            control_chk,
+            centers_chk,
+            sigma_levels_chk,
+            cfg,
+            sample_batch_fn=sample_batch_chk,
+            method=method,
+        ),
+        "gradcheck_denoiser": gradient_check_denoiser(
+            denoiser_chk,
+            control_chk,
+            centers_chk,
+            sigma_levels_chk,
+            cfg,
+            sample_batch_fn=sample_batch_chk,
+            method=method,
+        ),
+        "gradcheck_control": gradient_check_control(
+            denoiser_chk,
+            control_chk,
+            centers_chk,
+            sigma_levels_chk,
+            cfg,
+            sample_batch_fn=sample_batch_chk,
+            method=method,
+        ),
     }
 
     if report["gradcheck_denoiser"]["relative_error"] > cfg.gradcheck_tol:
