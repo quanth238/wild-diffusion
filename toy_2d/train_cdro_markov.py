@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from toy_2d.cdro_markov import (
+    MarkovControlGRU,
     MarkovControlMLP,
     MarkovScoreMLP,
     TerminalStats,
@@ -61,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=12)
     parser.add_argument("--total-time", type=float, default=1.0)
     parser.add_argument("--beta-min", type=float, default=0.2)
-    parser.add_argument("--beta-max", type=float, default=4.0)
+    parser.add_argument("--beta-max", type=float, default=6.0)
     parser.add_argument(
         "--score-weight-schedule",
         type=str,
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-depth", type=int, default=4)
     parser.add_argument("--control-hidden-dim", type=int, default=64)
     parser.add_argument("--control-depth", type=int, default=3)
+    parser.add_argument("--control-arch", type=str, default="mlp", choices=("mlp", "gru"))
     parser.add_argument("--embedding-dim", type=int, default=32)
     parser.add_argument("--control-scale", type=float, default=0.5)
 
@@ -81,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-samples", type=int, default=1024)
     parser.add_argument("--num-snapshot-steps", type=int, default=6)
     parser.add_argument("--save-eval-checkpoints", action="store_true")
+    parser.add_argument("--fast-tuning", action="store_true")
     return parser.parse_args()
 
 
@@ -118,13 +121,7 @@ def main() -> None:
     ).to(device)
     score_ema = copy.deepcopy(score_model).eval()
 
-    control_model = MarkovControlMLP(
-        data_dim=2,
-        hidden_dim=args.control_hidden_dim,
-        depth=args.control_depth,
-        embedding_dim=args.embedding_dim,
-        control_scale=args.control_scale,
-    ).to(device)
+    control_model = build_control_model(args=args, device=device)
     initialize_control_head(control_model)
     control_ema = copy.deepcopy(control_model).eval()
 
@@ -250,16 +247,18 @@ def main() -> None:
                 seed=args.seed,
                 zero_control=not control_active,
                 num_snapshot_steps=args.num_snapshot_steps,
+                fast_tuning=args.fast_tuning,
             )
             eval_metrics.update(epoch_metrics)
             eval_history.append(eval_metrics)
             append_jsonl(args.outdir / "metrics.jsonl", eval_metrics)
-            save_markov_score_training_curves(
-                path=args.outdir / "plots" / "training_curves.png",
-                history=history,
-            )
+            if not args.fast_tuning:
+                save_markov_score_training_curves(
+                    path=args.outdir / "plots" / "training_curves.png",
+                    history=history,
+                )
 
-            if args.save_eval_checkpoints:
+            if args.save_eval_checkpoints and not args.fast_tuning:
                 save_checkpoint(
                     path=args.outdir / "checkpoints" / f"checkpoint_epoch_{epoch_metrics['epoch']:04d}.pt",
                     score_model=score_ema,
@@ -276,17 +275,18 @@ def main() -> None:
                 best_swd = eval_metrics["sliced_wasserstein"]
                 best_epoch = epoch_metrics["epoch"]
                 best_eval = dict(eval_metrics)
-                save_checkpoint(
-                    path=args.outdir / "checkpoint_best.pt",
-                    score_model=score_ema,
-                    control_model=control_ema,
-                    schedule=schedule,
-                    terminal_stats=terminal_stats,
-                    args=args,
-                    dataset=dataset,
-                    epoch=epoch_metrics["epoch"],
-                    metrics=eval_metrics,
-                )
+                if not args.fast_tuning:
+                    save_checkpoint(
+                        path=args.outdir / "checkpoint_best.pt",
+                        score_model=score_ema,
+                        control_model=control_ema,
+                        schedule=schedule,
+                        terminal_stats=terminal_stats,
+                        args=args,
+                        dataset=dataset,
+                        epoch=epoch_metrics["epoch"],
+                        metrics=eval_metrics,
+                    )
 
     total_minutes = (time.time() - start_time) / 60.0
     final_summary = {
@@ -302,17 +302,18 @@ def main() -> None:
     save_json(args.outdir / "summary.json", final_summary)
     if terminal_stats is None:
         raise RuntimeError("terminal_stats must be initialized before saving the final checkpoint.")
-    save_checkpoint(
-        path=args.outdir / "checkpoint_last.pt",
-        score_model=score_ema,
-        control_model=control_ema,
-        schedule=schedule,
-        terminal_stats=terminal_stats,
-        args=args,
-        dataset=dataset,
-        epoch=args.epochs,
-        metrics=eval_history[-1] if eval_history else None,
-    )
+    if not args.fast_tuning:
+        save_checkpoint(
+            path=args.outdir / "checkpoint_last.pt",
+            score_model=score_ema,
+            control_model=control_ema,
+            schedule=schedule,
+            terminal_stats=terminal_stats,
+            args=args,
+            dataset=dataset,
+            epoch=args.epochs,
+            metrics=eval_history[-1] if eval_history else None,
+        )
     print(json.dumps(final_summary, indent=2))
 
 
@@ -332,6 +333,7 @@ def evaluate_model(
     seed: int,
     zero_control: bool,
     num_snapshot_steps: int,
+    fast_tuning: bool = False,
 ) -> dict:
     score_model.eval()
     if control_model is not None:
@@ -346,6 +348,7 @@ def evaluate_model(
         data_dim=2,
         device=device,
         zero_control=zero_control,
+        collect_states=not fast_tuning,
     )
     generated = dataset.destandardize(generated_std.cpu()).cpu()
     real_all = torch.from_numpy(dataset.raw_points)
@@ -364,42 +367,60 @@ def evaluate_model(
         "sliced_wasserstein": sliced_wasserstein(real_metric, fake_metric, seed=seed + epoch),
     }
 
-    save_scatter_comparison(
-        path=outdir / "plots" / f"samples_epoch_{epoch:04d}.png",
-        real_points=real_metric.numpy(),
-        generated_points=fake_metric.numpy(),
-        title=f"{dataset.name} | Markov CDRO | epoch {epoch}",
-    )
-    np.savez(
-        outdir / "samples_latest.npz",
-        real=real_metric.numpy(),
-        generated=fake_metric.numpy(),
-        generated_full=generated.numpy(),
-    )
+    if not fast_tuning:
+        save_scatter_comparison(
+            path=outdir / "plots" / f"samples_epoch_{epoch:04d}.png",
+            real_points=real_metric.numpy(),
+            generated_points=fake_metric.numpy(),
+            title=f"{dataset.name} | Markov CDRO | epoch {epoch}",
+        )
+        np.savez(
+            outdir / "samples_latest.npz",
+            real=real_metric.numpy(),
+            generated=fake_metric.numpy(),
+            generated_full=generated.numpy(),
+        )
 
-    snapshot_indices = select_snapshot_indices(total_count=len(reverse_states), num_snapshots=num_snapshot_steps)
-    reverse_snapshots = [dataset.destandardize(reverse_states[idx]).numpy() for idx in snapshot_indices]
-    reverse_titles = [f"reverse {idx}/{len(reverse_states) - 1}" for idx in snapshot_indices]
-    save_process_snapshots(
-        path=outdir / "plots" / f"reverse_process_epoch_{epoch:04d}.png",
-        rows=[
-            {
-                "row_title": "Reverse",
-                "snapshots": reverse_snapshots,
-                "titles": reverse_titles,
-                "color": "#2ca02c",
-            }
-        ],
-        title=f"Markov CDRO reverse process | epoch {epoch}",
-    )
+        snapshot_indices = select_snapshot_indices(total_count=len(reverse_states), num_snapshots=num_snapshot_steps)
+        reverse_snapshots = [dataset.destandardize(reverse_states[idx]).numpy() for idx in snapshot_indices]
+        reverse_titles = [f"reverse {idx}/{len(reverse_states) - 1}" for idx in snapshot_indices]
+        save_process_snapshots(
+            path=outdir / "plots" / f"reverse_process_epoch_{epoch:04d}.png",
+            rows=[
+                {
+                    "row_title": "Reverse",
+                    "snapshots": reverse_snapshots,
+                    "titles": reverse_titles,
+                    "color": "#2ca02c",
+                }
+            ],
+            title=f"Markov CDRO reverse process | epoch {epoch}",
+        )
     return metrics
 
 
-def initialize_control_head(module: MarkovControlMLP) -> None:
-    final_layer = module.backbone[-1]
+def initialize_control_head(module) -> None:
+    final_layer = None
+    if hasattr(module, "backbone"):
+        final_layer = module.backbone[-1]
+    elif hasattr(module, "head"):
+        final_layer = module.head[-1]
     if isinstance(final_layer, torch.nn.Linear):
         torch.nn.init.zeros_(final_layer.weight)
         torch.nn.init.zeros_(final_layer.bias)
+
+
+def build_control_model(*, args: argparse.Namespace, device: torch.device):
+    kwargs = {
+        "data_dim": 2,
+        "hidden_dim": args.control_hidden_dim,
+        "depth": args.control_depth,
+        "embedding_dim": args.embedding_dim,
+        "control_scale": args.control_scale,
+    }
+    if args.control_arch == "gru":
+        return MarkovControlGRU(**kwargs).to(device)
+    return MarkovControlMLP(**kwargs).to(device)
 
 
 def clip_gradients(parameters, *, grad_clip: float) -> None:

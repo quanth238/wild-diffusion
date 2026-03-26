@@ -335,8 +335,11 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
 
     methods = aggregate["config"]["methods"]
     md_path = outdir / "summary.md"
+    has_baseline = "baseline" in methods
+    delta_methods = [method for method in methods if method != "baseline"] if has_baseline else []
+
     swd_header = ["Dataset", "Data"] + [f"{format_method_name(method)} SWD" for method in methods]
-    swd_header += [f"{format_method_name(method)} Delta" for method in methods if method != "baseline"]
+    swd_header += [f"{format_method_name(method)} Delta" for method in delta_methods]
     lines = [
         "## Last SWD",
         "",
@@ -345,7 +348,7 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_last_swd']:.4f}" for method in methods)
-        cells.extend(f"{row[f'{method}_last_swd_delta_pct']:.2f}%" for method in methods if method != "baseline")
+        cells.extend(f"{row[f'{method}_last_swd_delta_pct']:.2f}%" for method in delta_methods)
         lines.append(markdown_row(cells))
     lines += [
         "",
@@ -356,7 +359,7 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_best_swd']:.4f}" for method in methods)
-        cells.extend(f"{row[f'{method}_best_swd_delta_pct']:.2f}%" for method in methods if method != "baseline")
+        cells.extend(f"{row[f'{method}_best_swd_delta_pct']:.2f}%" for method in delta_methods)
         lines.append(markdown_row(cells))
     lines += [
         "",
@@ -365,13 +368,13 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
         markdown_header(
             ["Dataset", "Data"]
             + [f"{format_method_name(method)} MMD" for method in methods]
-            + [f"{format_method_name(method)} Delta" for method in methods if method != "baseline"]
+            + [f"{format_method_name(method)} Delta" for method in delta_methods]
         ),
     ]
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_mmd']:.4f}" for method in methods)
-        cells.extend(f"{row[f'{method}_mmd_delta_pct']:.2f}%" for method in methods if method != "baseline")
+        cells.extend(f"{row[f'{method}_mmd_delta_pct']:.2f}%" for method in delta_methods)
         lines.append(markdown_row(cells))
     lines += [
         "",
@@ -433,15 +436,13 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
         markdown_header(
             ["Dataset", "Data"]
             + [f"{format_method_name(method)} min" for method in methods]
-            + [f"{format_method_name(method)} Overhead" for method in methods if method != "baseline"]
+            + [f"{format_method_name(method)} Overhead" for method in delta_methods]
         ),
     ]
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
         cells.extend(f"{row[f'{method}_runtime_min']:.2f}" for method in methods)
-        cells.extend(
-            f"{row[f'{method}_runtime_overhead_pct']:.2f}%" for method in methods if method != "baseline"
-        )
+        cells.extend(f"{row[f'{method}_runtime_overhead_pct']:.2f}%" for method in delta_methods)
         lines.append(markdown_row(cells))
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -449,7 +450,7 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     with runtime_csv.open("w", newline="", encoding="utf-8") as handle:
         fieldnames = ["dataset", "fraction", "fraction_tag"]
         fieldnames.extend(f"{method}_runtime_min" for method in methods)
-        fieldnames.extend(f"{method}_runtime_overhead_pct" for method in methods if method != "baseline")
+        fieldnames.extend(f"{method}_runtime_overhead_pct" for method in delta_methods)
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in aggregate["summary"]:
@@ -668,6 +669,8 @@ def build_method_command(
             str(get_config_value(method_config, "score_depth", get_config_value(method_config, "depth", CDRO_MARKOV_DEFAULTS["score_depth"]))),
             "--control-hidden-dim",
             str(get_config_value(method_config, "control_hidden_dim", CDRO_MARKOV_DEFAULTS["control_hidden_dim"])),
+            "--control-arch",
+            str(get_config_value(method_config, "control_arch", CDRO_MARKOV_DEFAULTS["control_arch"])),
             "--control-depth",
             str(get_config_value(method_config, "control_depth", CDRO_MARKOV_DEFAULTS["control_depth"])),
             "--control-scale",

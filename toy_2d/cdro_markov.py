@@ -102,6 +102,57 @@ class MarkovControlMLP(nn.Module):
         raw = self.backbone(torch.cat([y, embedding], dim=1))
         return self.control_scale * torch.tanh(raw)
 
+    def initial_state(self, *, batch_size: int, device: torch.device, dtype: torch.dtype):
+        del batch_size, device, dtype
+        return None
+
+    def step(self, y: torch.Tensor, sigma: torch.Tensor, state):
+        del state
+        return self.forward(y, sigma), None
+
+
+class MarkovControlGRU(nn.Module):
+    def __init__(
+        self,
+        *,
+        data_dim: int = 2,
+        hidden_dim: int = 64,
+        depth: int = 3,
+        embedding_dim: int = 32,
+        control_scale: float = 0.5,
+    ):
+        super().__init__()
+        if depth < 2:
+            raise ValueError("depth must be at least 2.")
+        self.data_dim = data_dim
+        self.hidden_dim = hidden_dim
+        self.control_scale = float(control_scale)
+        self.embedding = GaussianFourierEmbedding(embedding_dim=embedding_dim)
+        self.gru_cell = nn.GRUCell(data_dim + embedding_dim, hidden_dim)
+
+        head_layers: list[nn.Module] = []
+        for _ in range(depth - 2):
+            head_layers.append(nn.Linear(hidden_dim, hidden_dim))
+            head_layers.append(nn.SiLU())
+        head_layers.append(nn.Linear(hidden_dim, data_dim))
+        self.head = nn.Sequential(*head_layers)
+
+    def initial_state(self, *, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return torch.zeros(batch_size, self.hidden_dim, device=device, dtype=dtype)
+
+    def step(self, y: torch.Tensor, sigma: torch.Tensor, state: torch.Tensor | None):
+        sigma = _reshape_sigma_like_input(sigma=sigma, x=y)
+        if state is None:
+            state = self.initial_state(batch_size=y.shape[0], device=y.device, dtype=y.dtype)
+        embedding = self.embedding(torch.log(sigma.clamp(min=1e-8)).squeeze(1) / 4.0)
+        hidden = self.gru_cell(torch.cat([y, embedding], dim=1), state)
+        raw = self.head(hidden)
+        return self.control_scale * torch.tanh(raw), hidden
+
+    def forward(self, y: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        control, _ = self.step(y, sigma, state=None)
+        return control
+
 
 def build_markov_vp_schedule(
     *,
@@ -154,13 +205,24 @@ def rollout_markov_forward(
     noises: list[torch.Tensor] = []
     controls: list[torch.Tensor] = []
     means: list[torch.Tensor] = []
+    control_state = initialize_control_state(
+        control_net=control_net,
+        batch_size=clean_points.shape[0],
+        device=clean_points.device,
+        dtype=clean_points.dtype,
+    )
 
     for step_idx in range(schedule.dt.shape[0]):
         sigma_step = schedule.step_sigma[step_idx].expand(clean_points.shape[0])
         if zero_control or control_net is None:
             control = torch.zeros_like(current)
         else:
-            control = control_net(current, sigma_step)
+            control, control_state = eval_control_step(
+                control_net=control_net,
+                current=current,
+                sigma_step=sigma_step,
+                control_state=control_state,
+            )
         drift = forward_drift(current, beta=schedule.beta[step_idx], control=control)
         mean = current + drift * schedule.dt[step_idx]
         noise = torch.randn_like(current)
@@ -229,26 +291,40 @@ def sample_reverse_chain(
     data_dim: int,
     device: torch.device,
     zero_control: bool = False,
+    collect_states: bool = True,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     mean = terminal_stats.mean.to(device=device)
     var = terminal_stats.var.to(device=device).clamp(min=1e-6)
     current = mean.view(1, data_dim) + torch.randn(num_samples, data_dim, device=device) * var.sqrt().view(1, data_dim)
+    control_state = initialize_control_state(
+        control_net=control_net,
+        batch_size=num_samples,
+        device=device,
+        dtype=current.dtype,
+    )
 
-    reverse_states = [current.detach().cpu()]
+    reverse_states = [current.detach().cpu()] if collect_states else []
     for step_idx in range(schedule.dt.shape[0] - 1, -1, -1):
         sigma_step = schedule.step_sigma[step_idx].expand(num_samples)
         score = score_net(current, sigma_step)
         if zero_control or control_net is None:
             control = torch.zeros_like(current)
         else:
-            control = control_net(current, sigma_step)
+            control, control_state = eval_control_step(
+                control_net=control_net,
+                current=current,
+                sigma_step=sigma_step,
+                control_state=control_state,
+            )
         drift = forward_drift(current, beta=schedule.beta[step_idx], control=control)
         noise = torch.randn_like(current)
         current = current + (-drift + schedule.g[step_idx].square() * score) * schedule.dt[step_idx]
         current = current + schedule.step_sigma[step_idx] * noise
-        reverse_states.append(current.detach().cpu())
+        if collect_states:
+            reverse_states.append(current.detach().cpu())
 
-    reverse_states.reverse()
+    if collect_states:
+        reverse_states.reverse()
     return current, reverse_states
 
 
@@ -274,3 +350,15 @@ def _reshape_sigma_like_input(sigma: torch.Tensor, x: torch.Tensor) -> torch.Ten
     if sigma.ndim != 2 or sigma.shape[0] != x.shape[0] or sigma.shape[1] != 1:
         raise ValueError(f"sigma must broadcast to [batch, 1], got shape {tuple(sigma.shape)}")
     return sigma
+
+
+def initialize_control_state(*, control_net, batch_size: int, device: torch.device, dtype: torch.dtype):
+    if control_net is None or not hasattr(control_net, "initial_state"):
+        return None
+    return control_net.initial_state(batch_size=batch_size, device=device, dtype=dtype)
+
+
+def eval_control_step(*, control_net, current: torch.Tensor, sigma_step: torch.Tensor, control_state):
+    if hasattr(control_net, "step"):
+        return control_net.step(current, sigma_step, control_state)
+    return control_net(current, sigma_step), control_state
