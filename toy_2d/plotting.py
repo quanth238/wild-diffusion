@@ -127,31 +127,72 @@ def save_markov_score_training_curves(
     history: list[dict],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 8))
+    axes = axes.reshape(2, 4)
 
     if history:
         epochs = [item["epoch"] for item in history]
-        score_loss = [item["score_loss"] for item in history]
-        control_cost = [item["control_cost"] for item in history]
-        lambda_values = [item["lambda_value"] for item in history]
-        adversary_value = [item["adversary_value"] for item in history]
+        score_loss = [item.get("score_loss", np.nan) for item in history]
+        diag_nominal = [item.get("eval_diag_nominal_score_loss", np.nan) for item in history]
+        diag_controlled = [item.get("eval_diag_controlled_score_loss", np.nan) for item in history]
+        control_cost = [item.get("control_cost", np.nan) for item in history]
+        target_budget = [item.get("target_total_budget", np.nan) for item in history]
+        lambda_values = [item.get("lambda_value", np.nan) for item in history]
+        budget_util = [item.get("budget_utilization", np.nan) for item in history]
+        adversary_value = [item.get("adversary_value", np.nan) for item in history]
+        eval_swd = [item.get("eval_sliced_wasserstein", np.nan) for item in history]
+        eval_swd_nocontrol = [item.get("eval_reverse_no_control_sliced_wasserstein", np.nan) for item in history]
+        score_grad = [item.get("mean_score_grad_norm", np.nan) for item in history]
+        control_grad = [item.get("mean_control_grad_norm", np.nan) for item in history]
+        control_norm = [item.get("mean_control_norm", np.nan) for item in history]
+        drift_ratio = [item.get("eval_diag_control_to_drift_ratio", np.nan) for item in history]
+        sample_mean_gap = [item.get("eval_sample_mean_gap", np.nan) for item in history]
+        sample_std_gap = [item.get("eval_sample_std_gap", np.nan) for item in history]
 
-        axes[0].plot(epochs, score_loss, color="#1f77b4", linewidth=1.8)
-        axes[1].plot(epochs, control_cost, color="#d62728", linewidth=1.8)
-        axes[2].plot(epochs, lambda_values, color="#2ca02c", linewidth=1.8)
-        axes[3].plot(epochs, adversary_value, color="#9467bd", linewidth=1.8)
+        axes[0, 0].plot(epochs, score_loss, color="#1f77b4", linewidth=1.8)
 
-    axes[0].set_title("Score loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Value")
-    axes[1].set_title("Control cost")
-    axes[1].set_xlabel("Epoch")
-    axes[2].set_title("Dual lambda")
-    axes[2].set_xlabel("Epoch")
-    axes[3].set_title("Adversary objective")
-    axes[3].set_xlabel("Epoch")
+        axes[0, 1].plot(epochs, diag_nominal, color="#2ca02c", linewidth=1.6, label="diag nominal")
+        axes[0, 1].plot(epochs, diag_controlled, color="#d62728", linewidth=1.6, label="diag controlled")
+        if np.isfinite(diag_nominal).any() or np.isfinite(diag_controlled).any():
+            axes[0, 1].legend(frameon=False, fontsize=8)
 
-    for ax in axes:
+        axes[0, 2].plot(epochs, control_cost, color="#d62728", linewidth=1.8, label="control cost")
+        axes[0, 2].plot(epochs, target_budget, color="#7f7f7f", linewidth=1.6, linestyle="--", label="target budget")
+        axes[0, 2].legend(frameon=False, fontsize=8)
+
+        axes[0, 3].plot(epochs, lambda_values, color="#2ca02c", linewidth=1.8, label="lambda")
+        axes[0, 3].plot(epochs, budget_util, color="#ff7f0e", linewidth=1.6, label="budget util")
+        axes[0, 3].plot(epochs, adversary_value, color="#9467bd", linewidth=1.2, alpha=0.8, label="adv obj")
+        axes[0, 3].legend(frameon=False, fontsize=8)
+
+        axes[1, 0].plot(epochs, eval_swd, color="#1f77b4", linewidth=1.8, label="eval SWD")
+        axes[1, 0].plot(epochs, eval_swd_nocontrol, color="#ff7f0e", linewidth=1.6, linestyle="--", label="no-ctrl SWD")
+        if np.isfinite(eval_swd).any() or np.isfinite(eval_swd_nocontrol).any():
+            axes[1, 0].legend(frameon=False, fontsize=8)
+
+        axes[1, 1].plot(epochs, score_grad, color="#1f77b4", linewidth=1.8, label="score grad")
+        axes[1, 1].plot(epochs, control_grad, color="#d62728", linewidth=1.6, label="control grad")
+        axes[1, 1].legend(frameon=False, fontsize=8)
+
+        axes[1, 2].plot(epochs, control_norm, color="#d62728", linewidth=1.8, label="mean control norm")
+        axes[1, 2].plot(epochs, drift_ratio, color="#2ca02c", linewidth=1.6, label="control/drift")
+        axes[1, 2].legend(frameon=False, fontsize=8)
+
+        axes[1, 3].plot(epochs, sample_mean_gap, color="#1f77b4", linewidth=1.8, label="mean gap")
+        axes[1, 3].plot(epochs, sample_std_gap, color="#ff7f0e", linewidth=1.6, label="std gap")
+        axes[1, 3].legend(frameon=False, fontsize=8)
+
+    axes[0, 0].set_title("Score loss")
+    axes[0, 1].set_title("Diag score losses")
+    axes[0, 2].set_title("Control vs budget")
+    axes[0, 3].set_title("Lambda / utilization")
+    axes[1, 0].set_title("Eval SWD")
+    axes[1, 1].set_title("Gradient norms")
+    axes[1, 2].set_title("Control magnitude")
+    axes[1, 3].set_title("Sample geometry gaps")
+
+    for ax in axes.flat:
+        ax.set_xlabel("Epoch")
         ax.grid(alpha=0.2)
 
     fig.tight_layout()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
@@ -10,21 +11,27 @@ from toy_2d.model import GaussianFourierEmbedding
 
 @dataclass(frozen=True)
 class MarkovVPSchedule:
+    family: str
     total_time: float
     dt: torch.Tensor
+    drift_coeff: torch.Tensor
     beta: torch.Tensor
     g: torch.Tensor
     step_sigma: torch.Tensor
     weights: torch.Tensor
+    sigma_levels: torch.Tensor | None = None
 
     def to_dict(self) -> dict[str, float | list[float]]:
         return {
+            "family": self.family,
             "total_time": float(self.total_time),
             "dt": self.dt.detach().cpu().tolist(),
+            "drift_coeff": self.drift_coeff.detach().cpu().tolist(),
             "beta": self.beta.detach().cpu().tolist(),
             "g": self.g.detach().cpu().tolist(),
             "step_sigma": self.step_sigma.detach().cpu().tolist(),
             "weights": self.weights.detach().cpu().tolist(),
+            "sigma_levels": None if self.sigma_levels is None else self.sigma_levels.detach().cpu().tolist(),
         }
 
 
@@ -207,33 +214,74 @@ class MarkovControlGRU(nn.Module):
         return control
 
 
-def build_markov_vp_schedule(
+def build_markov_schedule(
     *,
     num_steps: int,
     total_time: float,
     beta_min: float,
     beta_max: float,
+    sde_family: str,
     device: torch.device,
     dtype: torch.dtype,
     weight_schedule: str = "uniform",
+    ve_sigma_min: float = 0.01,
+    ve_sigma_max: float = 3.0,
+    cosine_s: float = 0.008,
 ) -> MarkovVPSchedule:
     if num_steps < 1:
         raise ValueError("num_steps must be at least 1.")
     if total_time <= 0.0:
         raise ValueError("total_time must be positive.")
     dt = torch.full((num_steps,), float(total_time) / float(num_steps), device=device, dtype=dtype)
-    beta = torch.linspace(beta_min, beta_max, steps=num_steps, device=device, dtype=dtype)
-    g = beta.sqrt()
-    step_sigma = (beta * dt).sqrt()
+    sigma_levels: torch.Tensor | None = None
+
+    if sde_family == "vp_linear":
+        beta = torch.linspace(beta_min, beta_max, steps=num_steps, device=device, dtype=dtype)
+        mean_scale = torch.exp(-0.5 * beta * dt)
+        step_sigma = (1.0 - torch.exp(-beta * dt)).clamp(min=1e-8).sqrt()
+        drift_coeff = (mean_scale - 1.0) / dt
+        g = beta.clamp(min=1e-8).sqrt()
+    elif sde_family == "vp_cosine":
+        time_edges = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device, dtype=dtype)
+        alpha_bar = cosine_alpha_bar(time_edges, s=cosine_s).clamp(min=1e-8)
+        alpha_ratio = (alpha_bar[1:] / alpha_bar[:-1]).clamp(min=1e-8, max=0.999999)
+        mean_scale = alpha_ratio.sqrt()
+        step_sigma = (1.0 - alpha_ratio).clamp(min=1e-8).sqrt()
+        drift_coeff = (mean_scale - 1.0) / dt
+        beta = (-alpha_ratio.log()) / dt
+        g = beta.clamp(min=1e-8).sqrt()
+    elif sde_family == "ve_geometric":
+        if ve_sigma_min <= 0.0 or ve_sigma_max <= 0.0:
+            raise ValueError("VE sigma levels must be positive.")
+        log_sigma = torch.linspace(math.log(ve_sigma_min), math.log(ve_sigma_max), steps=num_steps + 1, device=device, dtype=dtype)
+        sigma_levels = log_sigma.exp()
+        step_var = sigma_levels[1:].square() - sigma_levels[:-1].square()
+        step_sigma = step_var.clamp(min=1e-8).sqrt()
+        drift_coeff = torch.zeros_like(step_sigma)
+        beta = torch.zeros_like(step_sigma)
+        g = step_sigma / dt.sqrt()
+    else:
+        raise ValueError(f"Unsupported sde_family: {sde_family}")
+
     weights = build_step_weights(step_sigma=step_sigma, schedule=weight_schedule)
     return MarkovVPSchedule(
+        family=sde_family,
         total_time=float(total_time),
         dt=dt,
+        drift_coeff=drift_coeff,
         beta=beta,
         g=g,
         step_sigma=step_sigma,
         weights=weights,
+        sigma_levels=sigma_levels,
     )
+
+
+def cosine_alpha_bar(t: torch.Tensor, *, s: float) -> torch.Tensor:
+    scale = math.pi / 2.0
+    numerator = torch.cos(((t + s) / (1.0 + s)) * scale).square()
+    denominator = math.cos((s / (1.0 + s)) * scale) ** 2
+    return numerator / denominator
 
 
 def build_step_weights(*, step_sigma: torch.Tensor, schedule: str) -> torch.Tensor:
@@ -282,7 +330,7 @@ def rollout_markov_forward(
                 sigma_step=sigma_step,
                 control_state=control_state,
             )
-        drift = forward_drift(current, beta=schedule.beta[step_idx], control=control)
+        drift = forward_drift(current, drift_coeff=schedule.drift_coeff[step_idx], control=control)
         mean = current + drift * schedule.dt[step_idx]
         noise = noise_override[:, step_idx, :] if noise_override is not None else torch.randn_like(current)
         current = mean + schedule.step_sigma[step_idx] * noise
@@ -299,8 +347,8 @@ def rollout_markov_forward(
     )
 
 
-def forward_drift(points: torch.Tensor, *, beta: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
-    return -0.5 * beta * points + control
+def forward_drift(points: torch.Tensor, *, drift_coeff: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
+    return drift_coeff * points + control
 
 
 def compute_score_matching_loss(
@@ -515,6 +563,7 @@ def sample_reverse_chain(
     terminal_sampler: str = "gaussian",
     terminal_jitter_scale: float = 0.0,
     reverse_noise_scale: float = 1.0,
+    reverse_control_scale: float = 1.0,
     reverse_tail_noise_scale: float = 1.0,
     reverse_deterministic_tail_steps: int = 0,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -548,11 +597,11 @@ def sample_reverse_chain(
                 sigma_step=sigma_step,
                 control_state=control_state,
             )
+            control = control * float(reverse_control_scale)
         noise = torch.randn_like(current)
-        beta_step = schedule.beta[step_idx]
         dt_step = schedule.dt[step_idx]
-        diffusion_sq = schedule.g[step_idx].square()
-        reverse_drift = -forward_drift(current, beta=beta_step, control=control) + diffusion_sq * score
+        score_scale = schedule.step_sigma[step_idx].square() / dt_step
+        reverse_drift = -forward_drift(current, drift_coeff=schedule.drift_coeff[step_idx], control=control) + score_scale * score
         stochastic_scale = float(reverse_noise_scale)
         if reverse_deterministic_tail_steps > 0 and step_idx < reverse_deterministic_tail_steps:
             stochastic_scale = float(reverse_tail_noise_scale)
@@ -563,10 +612,14 @@ def sample_reverse_chain(
             if zero_control or control_net is None:
                 proposal_control = torch.zeros_like(proposal)
             elif control_state is None:
-                proposal_control = control_net(proposal, sigma_step)
+                proposal_control = control_net(proposal, sigma_step) * float(reverse_control_scale)
             else:
                 proposal_control = control
-            proposal_drift = -forward_drift(proposal, beta=beta_step, control=proposal_control) + diffusion_sq * score_next
+            proposal_drift = -forward_drift(
+                proposal,
+                drift_coeff=schedule.drift_coeff[step_idx],
+                control=proposal_control,
+            ) + score_scale * score_next
             current = current + 0.5 * (reverse_drift + proposal_drift) * dt_step + stochastic
         elif solver == "euler":
             current = current + reverse_drift * dt_step + stochastic

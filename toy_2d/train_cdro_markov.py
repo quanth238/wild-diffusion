@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import time
 from pathlib import Path
 
@@ -16,8 +17,8 @@ from toy_2d.cdro_markov import (
     MarkovPrecondScoreMLP,
     MarkovScoreMLP,
     TerminalStats,
+    build_markov_schedule,
     build_score_wdro_dataset,
-    build_markov_vp_schedule,
     compute_control_cost,
     compute_score_matching_loss,
     estimate_markov_wdro_proxy_budget,
@@ -70,11 +71,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget-schedule", type=str, default="constant", choices=("constant", "frontload"))
     parser.add_argument("--budget-frontload-power", type=float, default=2.0)
     parser.add_argument("--budget-frontload-floor", type=float, default=0.25)
+    parser.add_argument("--min-budget-utilization", type=float, default=0.0)
+    parser.add_argument("--budget-utilization-patience", type=int, default=0)
+    parser.add_argument("--budget-utilization-start-epoch", type=int, default=0)
+    parser.add_argument("--max-budget-utilization", type=float, default=0.0)
+    parser.add_argument("--high-budget-utilization-patience", type=int, default=0)
+    parser.add_argument("--high-budget-utilization-start-epoch", type=int, default=0)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--warmup-epochs", type=int, default=8)
     parser.add_argument("--adversary-steps", type=int, default=1)
     parser.add_argument("--adversary-stop-epoch", type=int, default=0)
+    parser.add_argument(
+        "--disable-control-after-stop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--score-steps", type=int, default=8)
     parser.add_argument("--terminal-momentum", type=float, default=0.95)
     parser.add_argument("--terminal-sampler", type=str, default="gaussian", choices=("gaussian", "replay"))
@@ -86,8 +98,17 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--num-steps", type=int, default=12)
     parser.add_argument("--total-time", type=float, default=1.0)
+    parser.add_argument(
+        "--sde-family",
+        type=str,
+        default="vp_linear",
+        choices=("vp_linear", "vp_cosine", "ve_geometric"),
+    )
     parser.add_argument("--beta-min", type=float, default=0.2)
     parser.add_argument("--beta-max", type=float, default=6.0)
+    parser.add_argument("--ve-sigma-min", type=float, default=0.01)
+    parser.add_argument("--ve-sigma-max", type=float, default=3.0)
+    parser.add_argument("--cosine-s", type=float, default=0.008)
     parser.add_argument(
         "--score-weight-schedule",
         type=str,
@@ -105,6 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-scale", type=float, default=0.5)
     parser.add_argument("--sigma-data", type=float, default=0.5)
     parser.add_argument("--reverse-solver", type=str, default="heun", choices=("euler", "heun"))
+    parser.add_argument("--reverse-control-scale", type=float, default=1.0)
     parser.add_argument("--wdro-k", type=int, default=WDRO_CORE_DEFAULTS["k"])
     parser.add_argument("--wdro-step-size", type=float, default=WDRO_CORE_DEFAULTS["step_size"])
     parser.add_argument("--wdro-gamma", type=float, default=WDRO_CORE_DEFAULTS["gamma"])
@@ -117,6 +139,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-eval-samples", type=int, default=2048)
     parser.add_argument("--metric-samples", type=int, default=1024)
     parser.add_argument("--num-snapshot-steps", type=int, default=6)
+    parser.add_argument("--diagnostic-batch-size", type=int, default=256)
+    parser.add_argument(
+        "--log-reverse-ablation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--save-eval-checkpoints", action="store_true")
     parser.add_argument("--fast-tuning", action="store_true")
     return parser.parse_args()
@@ -147,20 +175,34 @@ def main() -> None:
     current_points = base_points.clone()
     rng = np.random.default_rng(args.seed + 1)
 
-    schedule = build_markov_vp_schedule(
+    schedule = build_markov_schedule(
         num_steps=args.num_steps,
         total_time=args.total_time,
         beta_min=args.beta_min,
         beta_max=args.beta_max,
+        sde_family=args.sde_family,
         device=device,
         dtype=dataset.train_points.dtype,
         weight_schedule=args.score_weight_schedule,
+        ve_sigma_min=args.ve_sigma_min,
+        ve_sigma_max=args.ve_sigma_max,
+        cosine_s=args.cosine_s,
     )
+    diagnostic_batch_size = min(max(int(args.diagnostic_batch_size), 1), int(dataset.train_points.shape[0]))
+    diagnostic_points = dataset.train_points[:diagnostic_batch_size].to(device)
+    diagnostic_noise = torch.randn(
+        diagnostic_batch_size,
+        args.num_steps,
+        dataset.train_points.shape[1],
+        generator=torch.Generator().manual_seed(args.seed + 12345),
+        dtype=dataset.train_points.dtype,
+    ).to(device)
 
+    cdro_has_adversary = args.method == "cdro_markov" and args.adversary_steps > 0 and args.control_scale > 0.0
     score_model = build_score_model(args=args, device=device)
     score_ema = copy.deepcopy(score_model).eval()
 
-    control_model = build_control_model(args=args, device=device) if args.method == "cdro_markov" else None
+    control_model = build_control_model(args=args, device=device) if cdro_has_adversary else None
     if control_model is not None:
         initialize_control_head(control_model)
     control_ema = copy.deepcopy(control_model).eval() if control_model is not None else None
@@ -169,7 +211,7 @@ def main() -> None:
     control_optimizer = (
         torch.optim.Adam(control_model.parameters(), lr=args.control_lr) if control_model is not None else None
     )
-    lambda_value = float(args.lambda_init) if args.method == "cdro_markov" else 0.0
+    lambda_value = float(args.lambda_init) if control_model is not None else 0.0
     terminal_stats: TerminalStats | None = None
 
     history: list[dict] = []
@@ -181,6 +223,9 @@ def main() -> None:
     latest_adv_stats: dict | None = None
     latest_adv_snapshot: tuple[np.ndarray, np.ndarray] | None = None
     latest_adv_plot_stats: tuple[float, float] | None = None
+    low_budget_utilization_streak = 0
+    high_budget_utilization_streak = 0
+    adversary_disabled_epoch: int | None = None
 
     start_time = time.time()
     active_epochs = max(args.epochs - args.warmup_epochs, 1)
@@ -229,7 +274,19 @@ def main() -> None:
             seed=args.seed + epoch_idx,
             pin_memory=device.type == "cuda",
         )
-        control_present = args.method == "cdro_markov" and epoch_idx >= args.warmup_epochs and args.adversary_steps > 0
+        control_present = (
+            cdro_has_adversary
+            and epoch_idx >= args.warmup_epochs
+            and args.adversary_steps > 0
+            and adversary_disabled_epoch is None
+        )
+        if (
+            control_present
+            and args.disable_control_after_stop
+            and args.adversary_stop_epoch > 0
+            and epoch > args.adversary_stop_epoch
+        ):
+            control_present = False
         adversary_update_active = control_present and (
             args.adversary_stop_epoch <= 0 or (epoch_idx + 1) <= args.adversary_stop_epoch
         )
@@ -250,6 +307,8 @@ def main() -> None:
         epoch_adv_values: list[float] = []
         epoch_control_mean_norms: list[float] = []
         epoch_control_max_norms: list[float] = []
+        epoch_score_grad_norms: list[float] = []
+        epoch_control_grad_norms: list[float] = []
 
         for (batch,) in loader:
             batch = batch.to(device, non_blocking=device.type == "cuda")
@@ -273,6 +332,7 @@ def main() -> None:
                     control_cost = compute_control_cost(rollout=rollout, schedule=schedule)
                     objective = score_loss - lambda_value * control_cost
                     (-objective).backward()
+                    epoch_control_grad_norms.append(float(compute_grad_l2_norm(control_model.parameters())))
                     clip_gradients(control_model.parameters(), grad_clip=args.grad_clip)
                     control_optimizer.step()
                     lambda_value = max(
@@ -302,6 +362,7 @@ def main() -> None:
                 )
                 score_loss = compute_score_matching_loss(score_net=score_model, rollout=rollout, schedule=schedule)
                 score_loss.backward()
+                epoch_score_grad_norms.append(float(compute_grad_l2_norm(score_model.parameters())))
                 clip_gradients(score_model.parameters(), grad_clip=args.grad_clip)
                 score_optimizer.step()
                 update_ema(ema=score_ema, model=score_model, decay=args.ema_decay)
@@ -327,10 +388,17 @@ def main() -> None:
         epoch_metrics = {
             "epoch": epoch_idx + 1,
             "score_loss": float(np.mean(epoch_score_losses)) if epoch_score_losses else float("nan"),
+            "score_loss_std": float(np.std(epoch_score_losses)) if epoch_score_losses else 0.0,
             "control_cost": float(np.mean(epoch_control_costs)) if epoch_control_costs else 0.0,
+            "control_cost_std": float(np.std(epoch_control_costs)) if epoch_control_costs else 0.0,
             "adversary_value": float(np.mean(epoch_adv_values)) if epoch_adv_values else 0.0,
+            "adversary_value_std": float(np.std(epoch_adv_values)) if epoch_adv_values else 0.0,
             "mean_control_norm": float(np.mean(epoch_control_mean_norms)) if epoch_control_mean_norms else 0.0,
             "max_control_norm": float(np.max(epoch_control_max_norms)) if epoch_control_max_norms else 0.0,
+            "mean_score_grad_norm": float(np.mean(epoch_score_grad_norms)) if epoch_score_grad_norms else 0.0,
+            "max_score_grad_norm": float(np.max(epoch_score_grad_norms)) if epoch_score_grad_norms else 0.0,
+            "mean_control_grad_norm": float(np.mean(epoch_control_grad_norms)) if epoch_control_grad_norms else 0.0,
+            "max_control_grad_norm": float(np.max(epoch_control_grad_norms)) if epoch_control_grad_norms else 0.0,
             "target_total_budget": float(target_total_budget),
             "base_total_budget": float(base_total_budget),
             "raw_budget_estimate": (None if raw_budget_estimate is None else float(raw_budget_estimate)),
@@ -339,6 +407,9 @@ def main() -> None:
             "adversary_update_active": bool(adversary_update_active),
             "dataset_size": int(current_points.shape[0]),
             "method": args.method,
+            "low_budget_utilization_streak": int(low_budget_utilization_streak),
+            "high_budget_utilization_streak": int(high_budget_utilization_streak),
+            "adversary_disabled_epoch": adversary_disabled_epoch,
         }
         if latest_adv_stats is not None:
             epoch_metrics["mean_l2_shift"] = latest_adv_stats["mean_l2_shift"]
@@ -350,10 +421,71 @@ def main() -> None:
         epoch_metrics["budget_utilization"] = (
             float(epoch_metrics["control_cost"] / target_total_budget) if target_total_budget > 0 else 0.0
         )
+        if (
+            args.method == "cdro_markov"
+            and adversary_disabled_epoch is None
+            and adversary_update_active
+        ):
+            utilization = float(epoch_metrics["budget_utilization"])
+            low_trigger_enabled = args.min_budget_utilization > 0.0 and args.budget_utilization_patience > 0
+            high_trigger_enabled = args.max_budget_utilization > 0.0 and args.high_budget_utilization_patience > 0
+
+            if low_trigger_enabled:
+                low_start_epoch = max(args.budget_utilization_start_epoch, args.warmup_epochs + 1)
+                if epoch >= low_start_epoch and utilization < float(args.min_budget_utilization):
+                    low_budget_utilization_streak += 1
+                else:
+                    low_budget_utilization_streak = 0
+            else:
+                low_budget_utilization_streak = 0
+
+            if high_trigger_enabled:
+                high_start_epoch = max(args.high_budget_utilization_start_epoch, args.warmup_epochs + 1)
+                if epoch >= high_start_epoch and utilization > float(args.max_budget_utilization):
+                    high_budget_utilization_streak += 1
+                else:
+                    high_budget_utilization_streak = 0
+            else:
+                high_budget_utilization_streak = 0
+
+            low_triggered = low_trigger_enabled and (
+                low_budget_utilization_streak >= int(args.budget_utilization_patience)
+            )
+            high_triggered = high_trigger_enabled and (
+                high_budget_utilization_streak >= int(args.high_budget_utilization_patience)
+            )
+            if low_triggered or high_triggered:
+                adversary_disabled_epoch = epoch
+        else:
+            low_budget_utilization_streak = 0
+            high_budget_utilization_streak = 0
+        epoch_metrics["low_budget_utilization_streak"] = int(low_budget_utilization_streak)
+        epoch_metrics["high_budget_utilization_streak"] = int(high_budget_utilization_streak)
+        epoch_metrics["adversary_disabled_epoch"] = adversary_disabled_epoch
+        epoch_metrics["adversary_disabled_due_to_low_utilization"] = (
+            adversary_disabled_epoch is not None
+            and epoch >= adversary_disabled_epoch
+            and low_budget_utilization_streak >= int(args.budget_utilization_patience)
+        )
+        epoch_metrics["adversary_disabled_due_to_high_utilization"] = (
+            adversary_disabled_epoch is not None
+            and epoch >= adversary_disabled_epoch
+            and high_budget_utilization_streak >= int(args.high_budget_utilization_patience)
+        )
         if terminal_stats is not None:
             epoch_metrics["terminal_var_mean"] = float(terminal_stats.var.mean().item())
             epoch_metrics["terminal_var_min"] = float(terminal_stats.var.min().item())
             epoch_metrics["terminal_replay_size"] = int(terminal_stats.replay.shape[0]) if terminal_stats.replay is not None else 0
+        epoch_metrics["score_param_norm"] = float(compute_param_l2_norm(score_model.parameters()))
+        epoch_metrics["score_ema_param_norm"] = float(compute_param_l2_norm(score_ema.parameters()))
+        epoch_metrics["control_param_norm"] = (
+            float(compute_param_l2_norm(control_model.parameters())) if control_model is not None else 0.0
+        )
+        epoch_metrics["control_ema_param_norm"] = (
+            float(compute_param_l2_norm(control_ema.parameters()))
+            if control_ema is not None
+            else 0.0
+        )
         history.append(epoch_metrics)
 
         if epoch_metrics["epoch"] == 1 or epoch_metrics["epoch"] % args.eval_every == 0 or epoch_metrics["epoch"] == args.epochs:
@@ -378,11 +510,22 @@ def main() -> None:
                 terminal_sampler=args.terminal_sampler,
                 terminal_jitter_scale=args.terminal_jitter_scale,
                 reverse_noise_scale=args.reverse_noise_scale,
+                reverse_control_scale=args.reverse_control_scale,
                 reverse_tail_noise_scale=args.reverse_tail_noise_scale,
                 reverse_deterministic_tail_steps=args.reverse_deterministic_tail_steps,
+                diagnostic_points=diagnostic_points,
+                diagnostic_noise=diagnostic_noise,
+                log_reverse_ablation=args.log_reverse_ablation,
                 fast_tuning=args.fast_tuning,
             )
             eval_metrics.update(epoch_metrics)
+            history[-1].update(
+                {
+                    f"eval_{key}": value
+                    for key, value in eval_metrics.items()
+                    if key != "epoch" and isinstance(value, (int, float)) and not isinstance(value, bool)
+                }
+            )
             eval_history.append(eval_metrics)
             append_jsonl(args.outdir / "metrics.jsonl", eval_metrics)
             if not args.fast_tuning:
@@ -430,6 +573,15 @@ def main() -> None:
                         metrics=eval_metrics,
                     )
 
+    active_history = [row for row in history if row.get("adversary_update_active", False)]
+    nontrivial_active_history = [
+        row
+        for row in active_history
+        if float(row.get("mean_control_norm", 0.0)) > 1e-6
+        or float(row.get("control_cost", 0.0)) > 1e-10
+    ]
+    active_eval_history = [row for row in eval_history if row.get("adversary_update_active", False)]
+
     total_minutes = (time.time() - start_time) / 60.0
     final_summary = {
         "dataset": args.dataset,
@@ -440,6 +592,44 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_eval": best_eval,
         "last_eval": eval_history[-1] if eval_history else None,
+        "adversary_update_epochs": len(active_history),
+        "nontrivial_adversary_epochs": len(nontrivial_active_history),
+        "adversary_update_epoch_fraction": (
+            float(len(active_history) / len(history)) if history else 0.0
+        ),
+        "nontrivial_adversary_epoch_fraction": (
+            float(len(nontrivial_active_history) / len(active_history)) if active_history else 0.0
+        ),
+        "active_budget_utilization_mean": (
+            float(np.mean([row.get("budget_utilization", 0.0) for row in active_history]))
+            if active_history
+            else 0.0
+        ),
+        "active_budget_utilization_max": (
+            float(np.max([row.get("budget_utilization", 0.0) for row in active_history]))
+            if active_history
+            else 0.0
+        ),
+        "active_control_cost_mean": (
+            float(np.mean([row.get("control_cost", 0.0) for row in active_history]))
+            if active_history
+            else 0.0
+        ),
+        "active_control_norm_mean": (
+            float(np.mean([row.get("mean_control_norm", 0.0) for row in active_history]))
+            if active_history
+            else 0.0
+        ),
+        "active_control_norm_max": (
+            float(np.max([row.get("max_control_norm", 0.0) for row in active_history]))
+            if active_history
+            else 0.0
+        ),
+        "active_diag_score_loss_gap_mean": (
+            float(np.mean([row.get("diag_score_loss_gap", 0.0) for row in active_eval_history]))
+            if active_eval_history
+            else 0.0
+        ),
     }
     save_json(args.outdir / "summary.json", final_summary)
     if terminal_stats is None:
@@ -480,8 +670,12 @@ def evaluate_model(
     terminal_sampler: str,
     terminal_jitter_scale: float,
     reverse_noise_scale: float,
+    reverse_control_scale: float,
     reverse_tail_noise_scale: float,
     reverse_deterministic_tail_steps: int,
+    diagnostic_points: torch.Tensor,
+    diagnostic_noise: torch.Tensor,
+    log_reverse_ablation: bool,
     fast_tuning: bool = False,
 ) -> dict:
     score_model.eval()
@@ -502,6 +696,7 @@ def evaluate_model(
         terminal_sampler=terminal_sampler,
         terminal_jitter_scale=terminal_jitter_scale,
         reverse_noise_scale=reverse_noise_scale,
+        reverse_control_scale=reverse_control_scale,
         reverse_tail_noise_scale=reverse_tail_noise_scale,
         reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
     )
@@ -523,9 +718,117 @@ def evaluate_model(
         "terminal_sampler": terminal_sampler,
         "terminal_jitter_scale": float(terminal_jitter_scale),
         "reverse_noise_scale": float(reverse_noise_scale),
+        "reverse_control_scale": float(reverse_control_scale),
         "reverse_tail_noise_scale": float(reverse_tail_noise_scale),
         "reverse_deterministic_tail_steps": int(reverse_deterministic_tail_steps),
     }
+
+    generated_stats = compute_point_cloud_stats(fake_metric)
+    real_stats = compute_point_cloud_stats(real_metric)
+    metrics.update(
+        {
+            "generated_mean_norm": generated_stats["mean_norm"],
+            "generated_std_mean": generated_stats["std_mean"],
+            "generated_cov_trace": generated_stats["cov_trace"],
+            "generated_cov_logdet": generated_stats["cov_logdet"],
+            "real_mean_norm": real_stats["mean_norm"],
+            "real_std_mean": real_stats["std_mean"],
+            "real_cov_trace": real_stats["cov_trace"],
+            "real_cov_logdet": real_stats["cov_logdet"],
+            "sample_mean_gap": float(torch.linalg.norm(fake_metric.mean(dim=0) - real_metric.mean(dim=0)).item()),
+            "sample_std_gap": float(
+                torch.linalg.norm(
+                    fake_metric.std(dim=0, unbiased=False) - real_metric.std(dim=0, unbiased=False)
+                ).item()
+            ),
+        }
+    )
+
+    nominal_rollout = rollout_markov_forward(
+        clean_points=diagnostic_points,
+        control_net=None,
+        schedule=schedule,
+        zero_control=True,
+        noise_override=diagnostic_noise,
+    )
+    nominal_diag_score_loss = float(
+        compute_score_matching_loss(score_net=score_model, rollout=nominal_rollout, schedule=schedule).item()
+    )
+    nominal_diag_control_cost = float(compute_control_cost(rollout=nominal_rollout, schedule=schedule).item())
+    metrics["diag_nominal_score_loss"] = nominal_diag_score_loss
+    metrics["diag_nominal_control_cost"] = nominal_diag_control_cost
+
+    if control_model is not None and not zero_control:
+        controlled_rollout = rollout_markov_forward(
+            clean_points=diagnostic_points,
+            control_net=control_model,
+            schedule=schedule,
+            zero_control=False,
+            noise_override=diagnostic_noise,
+        )
+        controlled_diag_score_loss = float(
+            compute_score_matching_loss(score_net=score_model, rollout=controlled_rollout, schedule=schedule).item()
+        )
+        controlled_diag_control_cost = float(
+            compute_control_cost(rollout=controlled_rollout, schedule=schedule).item()
+        )
+        controlled_norms = controlled_rollout.controls.norm(dim=2)
+        reference_drift = (
+            schedule.drift_coeff.view(1, -1, 1) * controlled_rollout.states[:, :-1, :]
+        )
+        reference_drift_norms = reference_drift.norm(dim=2)
+        metrics["diag_controlled_score_loss"] = controlled_diag_score_loss
+        metrics["diag_controlled_control_cost"] = controlled_diag_control_cost
+        metrics["diag_score_loss_gap"] = controlled_diag_score_loss - nominal_diag_score_loss
+        metrics["diag_control_cost_gap"] = controlled_diag_control_cost - nominal_diag_control_cost
+        metrics["diag_control_norm_mean"] = float(controlled_norms.mean().item())
+        metrics["diag_control_norm_max"] = float(controlled_norms.max().item())
+        metrics["diag_reference_drift_norm_mean"] = float(reference_drift_norms.mean().item())
+        metrics["diag_control_to_drift_ratio"] = float(
+            controlled_norms.mean().item() / max(reference_drift_norms.mean().item(), 1e-8)
+        )
+    else:
+        metrics["diag_controlled_score_loss"] = nominal_diag_score_loss
+        metrics["diag_controlled_control_cost"] = nominal_diag_control_cost
+        metrics["diag_score_loss_gap"] = 0.0
+        metrics["diag_control_cost_gap"] = 0.0
+        metrics["diag_control_norm_mean"] = 0.0
+        metrics["diag_control_norm_max"] = 0.0
+        metrics["diag_reference_drift_norm_mean"] = 0.0
+        metrics["diag_control_to_drift_ratio"] = 0.0
+
+    if log_reverse_ablation and control_model is not None and not zero_control:
+        generated_no_control_std, _ = sample_reverse_chain(
+            score_net=score_model,
+            control_net=control_model,
+            schedule=schedule,
+            terminal_stats=terminal_stats,
+            num_samples=num_eval_samples,
+            data_dim=2,
+            device=device,
+            zero_control=True,
+            collect_states=False,
+            solver=reverse_solver,
+            terminal_sampler=terminal_sampler,
+            terminal_jitter_scale=terminal_jitter_scale,
+            reverse_noise_scale=reverse_noise_scale,
+            reverse_control_scale=reverse_control_scale,
+            reverse_tail_noise_scale=reverse_tail_noise_scale,
+            reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
+        )
+        generated_no_control = dataset.destandardize(generated_no_control_std.cpu()).cpu()
+        fake_metric_no_control = generated_no_control[fake_idx]
+        reverse_no_control_mmd = mmd_rbf(real_metric, fake_metric_no_control)
+        reverse_no_control_swd = sliced_wasserstein(real_metric, fake_metric_no_control, seed=seed + epoch + 999)
+        metrics["reverse_no_control_mmd_rbf"] = reverse_no_control_mmd
+        metrics["reverse_no_control_sliced_wasserstein"] = reverse_no_control_swd
+        metrics["reverse_control_gain_mmd"] = reverse_no_control_mmd - metrics["mmd_rbf"]
+        metrics["reverse_control_gain_swd"] = reverse_no_control_swd - metrics["sliced_wasserstein"]
+    else:
+        metrics["reverse_no_control_mmd_rbf"] = metrics["mmd_rbf"]
+        metrics["reverse_no_control_sliced_wasserstein"] = metrics["sliced_wasserstein"]
+        metrics["reverse_control_gain_mmd"] = 0.0
+        metrics["reverse_control_gain_swd"] = 0.0
 
     if not fast_tuning:
         save_scatter_comparison(
@@ -617,7 +920,7 @@ def resolve_target_total_budget(
     device: torch.device,
     budget_state: dict[str, float | None],
 ) -> tuple[float | None, float, float]:
-    if args.method != "cdro_markov":
+    if args.method != "cdro_markov" or args.adversary_steps <= 0 or args.control_scale <= 0.0:
         return None, 0.0, 0.0
     raw_budget: float | None = None
     if epoch <= args.warmup_epochs:
@@ -711,6 +1014,42 @@ def apply_budget_schedule(
 def clip_gradients(parameters, *, grad_clip: float) -> None:
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(list(parameters), grad_clip)
+
+
+def compute_grad_l2_norm(parameters) -> float:
+    total = 0.0
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad_norm = float(param.grad.detach().norm().item())
+        total += grad_norm * grad_norm
+    return math.sqrt(total)
+
+
+def compute_param_l2_norm(parameters) -> float:
+    total = 0.0
+    for param in parameters:
+        param_norm = float(param.detach().norm().item())
+        total += param_norm * param_norm
+    return math.sqrt(total)
+
+
+def compute_point_cloud_stats(points: torch.Tensor) -> dict[str, float]:
+    centered = points - points.mean(dim=0, keepdim=True)
+    if points.shape[0] > 1:
+        cov = centered.t().matmul(centered) / float(points.shape[0] - 1)
+    else:
+        cov = torch.zeros(points.shape[1], points.shape[1], dtype=points.dtype, device=points.device)
+    cov_trace = float(torch.trace(cov).item())
+    stabilized = cov + 1e-6 * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+    sign, logabsdet = torch.linalg.slogdet(stabilized)
+    cov_logdet = float(logabsdet.item()) if float(sign.item()) > 0 else float("nan")
+    return {
+        "mean_norm": float(points.norm(dim=1).mean().item()),
+        "std_mean": float(points.std(dim=0, unbiased=False).mean().item()),
+        "cov_trace": cov_trace,
+        "cov_logdet": cov_logdet,
+    }
 
 
 def resolve_device(name: str) -> torch.device:

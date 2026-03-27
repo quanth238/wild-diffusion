@@ -1,7 +1,27 @@
 """CPU-friendly toy 2D diffusion baselines for continuous-data experiments."""
 
-LEGACY_METHOD_CHOICES = ("baseline", "wdro", "cdro")
-COMPARISON_METHOD_CHOICES = LEGACY_METHOD_CHOICES + ("baseline_score", "wdro_score", "cdro_markov")
+LEGACY_CANONICAL_METHODS = ("baseline", "wdro", "cdro")
+LEGACY_METHOD_ALIASES = {
+    "baseline_edm": "baseline",
+    "wdro_edm": "wdro",
+    "cdro_edm": "cdro",
+}
+LEGACY_METHOD_CHOICES = LEGACY_CANONICAL_METHODS + tuple(LEGACY_METHOD_ALIASES.keys())
+
+COMPARISON_METHOD_CHOICES = (
+    "baseline",
+    "wdro",
+    "cdro",
+    "baseline_edm",
+    "wdro_edm",
+    "cdro_edm",
+    "baseline_score",
+    "wdro_score",
+    "cdro_markov",
+    "baseline_score_raw",
+    "wdro_score_raw",
+    "cdro_markov_raw",
+)
 METHOD_CHOICES = LEGACY_METHOD_CHOICES
 
 
@@ -10,7 +30,9 @@ def normalize_method_name(method: str, *, comparison: bool = False) -> str:
     allowed = COMPARISON_METHOD_CHOICES if comparison else LEGACY_METHOD_CHOICES
     if normalized not in allowed:
         raise ValueError(f"Unsupported method: {method}")
-    return normalized
+    if comparison:
+        return normalized
+    return LEGACY_METHOD_ALIASES.get(normalized, normalized)
 
 
 def normalize_method_names(methods: list[str], *, comparison: bool = False) -> list[str]:

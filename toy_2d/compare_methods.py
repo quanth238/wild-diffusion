@@ -11,7 +11,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from toy_2d import normalize_comparison_method_config_keys, normalize_comparison_method_names
-from toy_2d.robust_defaults import CDRO_DEFAULTS, CDRO_MARKOV_DEFAULTS, WDRO_CORE_DEFAULTS
+from toy_2d.robust_defaults import (
+    CDRO_DEFAULTS,
+    CDRO_MARKOV_DEFAULTS,
+    CDRO_MARKOV_RAW_DEFAULTS,
+    WDRO_CORE_DEFAULTS,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,11 +24,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=Path, default=Path("toy-runs") / "method_table")
     parser.add_argument("--method-configs", type=Path, default=None)
     parser.add_argument("--datasets", nargs="+", default=["eight_gaussians", "spiral", "two_moons"])
-    parser.add_argument("--methods", nargs="+", default=["baseline", "wdro", "cdro", "cdro_markov"])
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["baseline_edm", "wdro_edm", "baseline_score_raw", "wdro_score_raw", "cdro_markov_raw"],
+    )
     parser.add_argument("--fractions", nargs="+", type=float, default=[0.2, 0.5, 1.0])
     parser.add_argument("--full-samples", type=int, default=2000)
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument("--torch-num-threads", type=int, default=0)
     parser.add_argument("--figure-seed", type=int, default=0)
     parser.add_argument("--cleanup-runs", action="store_true")
 
@@ -111,7 +121,12 @@ def build_jobs(*, args: argparse.Namespace, root: Path, method_configs: dict[str
             num_samples = max(64, int(round(args.full_samples * fraction)))
             fraction_tag = fraction_to_tag(fraction)
             for method in args.methods:
-                method_config = method_configs.get(method, {})
+                method_config = resolve_method_config(
+                    method_configs=method_configs,
+                    method=method,
+                    dataset=dataset,
+                    fraction_tag=fraction_tag,
+                )
                 for seed in args.seeds:
                     requested_cdro_budget_mode = str(
                         get_config_value(method_config, "cdro_budget_mode", args.cdro_budget_mode)
@@ -539,6 +554,39 @@ def load_method_configs(path: Path | None) -> dict[str, dict]:
     return normalize_comparison_method_config_keys(json.loads(path.read_text(encoding="utf-8")))
 
 
+def resolve_method_config(
+    *,
+    method_configs: dict[str, dict],
+    method: str,
+    dataset: str,
+    fraction_tag: str,
+) -> dict:
+    base_config = dict(method_configs.get(method, {}))
+    fraction_overrides = base_config.pop("__fraction_overrides__", {})
+    dataset_overrides = base_config.pop("__dataset_overrides__", {})
+
+    resolved = dict(base_config)
+
+    if isinstance(fraction_overrides, dict):
+        global_fraction_override = fraction_overrides.get(fraction_tag)
+        if isinstance(global_fraction_override, dict):
+            resolved.update(global_fraction_override)
+
+    dataset_override = dataset_overrides.get(dataset)
+    if isinstance(dataset_override, dict):
+        dataset_all_override = dataset_override.get("__all__")
+        if isinstance(dataset_all_override, dict):
+            resolved.update(dataset_all_override)
+
+        dataset_fraction_override = dataset_override.get(fraction_tag)
+        if isinstance(dataset_fraction_override, dict):
+            resolved.update(dataset_fraction_override)
+        elif not any(isinstance(value, dict) for value in dataset_override.values()):
+            resolved.update(dataset_override)
+
+    return resolved
+
+
 def get_config_value(method_config: dict, key: str, fallback):
     return method_config.get(key, fallback)
 
@@ -556,17 +604,55 @@ def replace_command_arg(command: list[str], flag: str, value: str) -> None:
 def format_method_name(method: str) -> str:
     if method == "baseline":
         return "Baseline"
+    if method == "baseline_edm":
+        return "Baseline EDM"
     if method == "baseline_score":
         return "Baseline Score"
+    if method == "baseline_score_raw":
+        return "Baseline Score Raw"
     if method == "wdro":
         return "WDRO"
+    if method == "wdro_edm":
+        return "WDRO EDM"
     if method == "wdro_score":
         return "WDRO Score"
+    if method == "wdro_score_raw":
+        return "WDRO Score Raw"
     if method == "cdro":
         return "CDRO"
+    if method == "cdro_edm":
+        return "CDRO EDM"
     if method == "cdro_markov":
         return "CDRO Markov"
+    if method == "cdro_markov_raw":
+        return "CDRO Markov Raw"
     return method.replace("_", " ").title()
+
+
+def resolve_score_method(method: str) -> str | None:
+    if method in {"baseline_score", "baseline_score_raw"}:
+        return "baseline_score"
+    if method in {"wdro_score", "wdro_score_raw"}:
+        return "wdro_score"
+    if method in {"cdro_markov", "cdro_markov_raw"}:
+        return "cdro_markov"
+    return None
+
+
+def resolve_legacy_method(method: str) -> str | None:
+    if method in {"baseline", "baseline_edm"}:
+        return "baseline"
+    if method in {"wdro", "wdro_edm"}:
+        return "wdro"
+    if method in {"cdro", "cdro_edm"}:
+        return "cdro"
+    return None
+
+
+def default_score_method_config(method: str) -> dict:
+    if method.endswith("_raw"):
+        return dict(CDRO_MARKOV_RAW_DEFAULTS)
+    return dict(CDRO_MARKOV_DEFAULTS)
 
 
 def resolve_figure_epoch(*, row: dict, epoch_mode: str, fixed_epoch: int | None) -> int | None:
@@ -610,17 +696,19 @@ def build_method_command(
     seed: int,
     resolved_cdro_budget_mode: str,
 ) -> list[str]:
-    if method in {"baseline_score", "wdro_score", "cdro_markov"}:
+    score_method = resolve_score_method(method)
+    if score_method is not None:
+        score_defaults = default_score_method_config(method)
         command = [
             sys.executable,
             "-m",
             "toy_2d.train_cdro_markov",
             "--method",
-            method,
+            score_method,
             "--dataset",
             dataset,
             "--epochs",
-            str(args.epochs),
+            str(get_config_value(method_config, "epochs", args.epochs)),
             "--num-samples",
             str(num_samples),
             "--batch-size",
@@ -635,76 +723,91 @@ def build_method_command(
             str(seed),
             "--outdir",
             str(outdir),
+            "--torch-num-threads",
+            str(args.torch_num_threads),
             "--ema-decay",
             str(get_config_value(method_config, "ema_decay", args.ema_decay)),
             "--embedding-dim",
             str(get_config_value(method_config, "embedding_dim", args.embedding_dim)),
             "--score-lr",
-            str(get_config_value(method_config, "score_lr", get_config_value(method_config, "lr", CDRO_MARKOV_DEFAULTS["score_lr"]))),
+            str(get_config_value(method_config, "score_lr", get_config_value(method_config, "lr", score_defaults["score_lr"]))),
             "--control-lr",
-            str(get_config_value(method_config, "control_lr", CDRO_MARKOV_DEFAULTS["control_lr"])),
+            str(get_config_value(method_config, "control_lr", score_defaults["control_lr"])),
             "--lambda-lr",
-            str(get_config_value(method_config, "lambda_lr", CDRO_MARKOV_DEFAULTS["lambda_lr"])),
+            str(get_config_value(method_config, "lambda_lr", score_defaults["lambda_lr"])),
             "--lambda-init",
-            str(get_config_value(method_config, "lambda_init", CDRO_MARKOV_DEFAULTS["lambda_init"])),
+            str(get_config_value(method_config, "lambda_init", score_defaults["lambda_init"])),
             "--lambda-min",
-            str(get_config_value(method_config, "lambda_min", CDRO_MARKOV_DEFAULTS["lambda_min"])),
+            str(get_config_value(method_config, "lambda_min", score_defaults["lambda_min"])),
             "--control-radius",
-            str(get_config_value(method_config, "control_radius", CDRO_MARKOV_DEFAULTS["control_radius"])),
+            str(get_config_value(method_config, "control_radius", score_defaults["control_radius"])),
             "--warmup-epochs",
-            str(get_config_value(method_config, "warmup_epochs", CDRO_MARKOV_DEFAULTS["warmup_epochs"])),
+            str(get_config_value(method_config, "warmup_epochs", score_defaults["warmup_epochs"])),
             "--adversary-steps",
-            str(get_config_value(method_config, "adversary_steps", CDRO_MARKOV_DEFAULTS["adversary_steps"])),
+            str(get_config_value(method_config, "adversary_steps", score_defaults["adversary_steps"])),
             "--adversary-stop-epoch",
-            str(get_config_value(method_config, "adversary_stop_epoch", CDRO_MARKOV_DEFAULTS["adversary_stop_epoch"])),
+            str(get_config_value(method_config, "adversary_stop_epoch", score_defaults["adversary_stop_epoch"])),
+            "--disable-control-after-stop"
+            if bool(get_config_value(method_config, "disable_control_after_stop", score_defaults["disable_control_after_stop"]))
+            else "--no-disable-control-after-stop",
             "--score-steps",
-            str(get_config_value(method_config, "score_steps", CDRO_MARKOV_DEFAULTS["score_steps"])),
+            str(get_config_value(method_config, "score_steps", score_defaults["score_steps"])),
             "--terminal-momentum",
-            str(get_config_value(method_config, "terminal_momentum", CDRO_MARKOV_DEFAULTS["terminal_momentum"])),
+            str(get_config_value(method_config, "terminal_momentum", score_defaults["terminal_momentum"])),
             "--terminal-sampler",
-            str(get_config_value(method_config, "terminal_sampler", CDRO_MARKOV_DEFAULTS["terminal_sampler"])),
+            str(get_config_value(method_config, "terminal_sampler", score_defaults["terminal_sampler"])),
             "--terminal-buffer-size",
-            str(get_config_value(method_config, "terminal_buffer_size", CDRO_MARKOV_DEFAULTS["terminal_buffer_size"])),
+            str(get_config_value(method_config, "terminal_buffer_size", score_defaults["terminal_buffer_size"])),
             "--terminal-jitter-scale",
-            str(get_config_value(method_config, "terminal_jitter_scale", CDRO_MARKOV_DEFAULTS["terminal_jitter_scale"])),
+            str(get_config_value(method_config, "terminal_jitter_scale", score_defaults["terminal_jitter_scale"])),
             "--num-steps",
-            str(get_config_value(method_config, "num_steps", CDRO_MARKOV_DEFAULTS["num_steps"])),
+            str(get_config_value(method_config, "num_steps", score_defaults["num_steps"])),
             "--total-time",
-            str(get_config_value(method_config, "total_time", CDRO_MARKOV_DEFAULTS["total_time"])),
+            str(get_config_value(method_config, "total_time", score_defaults["total_time"])),
+            "--sde-family",
+            str(get_config_value(method_config, "sde_family", score_defaults["sde_family"])),
             "--beta-min",
-            str(get_config_value(method_config, "beta_min", CDRO_MARKOV_DEFAULTS["beta_min"])),
+            str(get_config_value(method_config, "beta_min", score_defaults["beta_min"])),
             "--beta-max",
-            str(get_config_value(method_config, "beta_max", CDRO_MARKOV_DEFAULTS["beta_max"])),
+            str(get_config_value(method_config, "beta_max", score_defaults["beta_max"])),
+            "--ve-sigma-min",
+            str(get_config_value(method_config, "ve_sigma_min", score_defaults["ve_sigma_min"])),
+            "--ve-sigma-max",
+            str(get_config_value(method_config, "ve_sigma_max", score_defaults["ve_sigma_max"])),
+            "--cosine-s",
+            str(get_config_value(method_config, "cosine_s", score_defaults["cosine_s"])),
             "--score-weight-schedule",
-            str(get_config_value(method_config, "score_weight_schedule", CDRO_MARKOV_DEFAULTS["score_weight_schedule"])),
+            str(get_config_value(method_config, "score_weight_schedule", score_defaults["score_weight_schedule"])),
             "--score-hidden-dim",
-            str(get_config_value(method_config, "score_hidden_dim", get_config_value(method_config, "hidden_dim", CDRO_MARKOV_DEFAULTS["score_hidden_dim"]))),
+            str(get_config_value(method_config, "score_hidden_dim", get_config_value(method_config, "hidden_dim", score_defaults["score_hidden_dim"]))),
             "--score-depth",
-            str(get_config_value(method_config, "score_depth", get_config_value(method_config, "depth", CDRO_MARKOV_DEFAULTS["score_depth"]))),
+            str(get_config_value(method_config, "score_depth", get_config_value(method_config, "depth", score_defaults["score_depth"]))),
             "--score-arch",
-            str(get_config_value(method_config, "score_arch", CDRO_MARKOV_DEFAULTS.get("score_arch", "precond"))),
+            str(get_config_value(method_config, "score_arch", score_defaults["score_arch"])),
             "--control-hidden-dim",
-            str(get_config_value(method_config, "control_hidden_dim", CDRO_MARKOV_DEFAULTS["control_hidden_dim"])),
+            str(get_config_value(method_config, "control_hidden_dim", score_defaults["control_hidden_dim"])),
             "--control-arch",
-            str(get_config_value(method_config, "control_arch", CDRO_MARKOV_DEFAULTS["control_arch"])),
+            str(get_config_value(method_config, "control_arch", score_defaults["control_arch"])),
             "--control-depth",
-            str(get_config_value(method_config, "control_depth", CDRO_MARKOV_DEFAULTS["control_depth"])),
+            str(get_config_value(method_config, "control_depth", score_defaults["control_depth"])),
             "--control-scale",
-            str(get_config_value(method_config, "control_scale", CDRO_MARKOV_DEFAULTS["control_scale"])),
+            str(get_config_value(method_config, "control_scale", score_defaults["control_scale"])),
             "--sigma-data",
             str(get_config_value(method_config, "sigma_data", 0.5)),
             "--reverse-solver",
-            str(get_config_value(method_config, "reverse_solver", "heun")),
+            str(get_config_value(method_config, "reverse_solver", score_defaults["reverse_solver"])),
             "--reverse-noise-scale",
-            str(get_config_value(method_config, "reverse_noise_scale", CDRO_MARKOV_DEFAULTS["reverse_noise_scale"])),
+            str(get_config_value(method_config, "reverse_noise_scale", score_defaults["reverse_noise_scale"])),
+            "--reverse-control-scale",
+            str(get_config_value(method_config, "reverse_control_scale", score_defaults["reverse_control_scale"])),
             "--reverse-tail-noise-scale",
-            str(get_config_value(method_config, "reverse_tail_noise_scale", CDRO_MARKOV_DEFAULTS["reverse_tail_noise_scale"])),
+            str(get_config_value(method_config, "reverse_tail_noise_scale", score_defaults["reverse_tail_noise_scale"])),
             "--reverse-deterministic-tail-steps",
             str(
                 get_config_value(
                     method_config,
                     "reverse_deterministic_tail_steps",
-                    CDRO_MARKOV_DEFAULTS["reverse_deterministic_tail_steps"],
+                    score_defaults["reverse_deterministic_tail_steps"],
                 )
             ),
             "--wdro-k",
@@ -720,11 +823,11 @@ def build_method_command(
             "--wdro-refresh-every",
             str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
         ]
-        if method == "cdro_markov":
+        if score_method == "cdro_markov":
             command.extend(
                 [
                     "--budget-mode",
-                    str(get_config_value(method_config, "budget_mode", CDRO_MARKOV_DEFAULTS.get("budget_mode", "fixed"))),
+                    str(get_config_value(method_config, "budget_mode", score_defaults["budget_mode"])),
                     "--reference-wdro-k",
                     str(get_config_value(method_config, "reference_wdro_k", args.wdro_k)),
                     "--reference-wdro-step-size",
@@ -740,15 +843,48 @@ def build_method_command(
                     "--budget-max-ratio",
                     str(get_config_value(method_config, "budget_max_ratio", 4.0)),
                     "--budget-schedule",
-                    str(get_config_value(method_config, "budget_schedule", "constant")),
+                    str(get_config_value(method_config, "budget_schedule", score_defaults["budget_schedule"])),
                     "--budget-frontload-power",
-                    str(get_config_value(method_config, "budget_frontload_power", 2.0)),
+                    str(get_config_value(method_config, "budget_frontload_power", score_defaults["budget_frontload_power"])),
                     "--budget-frontload-floor",
-                    str(get_config_value(method_config, "budget_frontload_floor", 0.25)),
+                    str(get_config_value(method_config, "budget_frontload_floor", score_defaults["budget_frontload_floor"])),
+                    "--min-budget-utilization",
+                    str(get_config_value(method_config, "min_budget_utilization", score_defaults["min_budget_utilization"])),
+                    "--budget-utilization-patience",
+                    str(get_config_value(method_config, "budget_utilization_patience", score_defaults["budget_utilization_patience"])),
+                    "--budget-utilization-start-epoch",
+                    str(
+                        get_config_value(
+                            method_config,
+                            "budget_utilization_start_epoch",
+                            score_defaults["budget_utilization_start_epoch"],
+                        )
+                    ),
+                    "--max-budget-utilization",
+                    str(get_config_value(method_config, "max_budget_utilization", score_defaults["max_budget_utilization"])),
+                    "--high-budget-utilization-patience",
+                    str(
+                        get_config_value(
+                            method_config,
+                            "high_budget_utilization_patience",
+                            score_defaults["high_budget_utilization_patience"],
+                        )
+                    ),
+                    "--high-budget-utilization-start-epoch",
+                    str(
+                        get_config_value(
+                            method_config,
+                            "high_budget_utilization_start_epoch",
+                            score_defaults["high_budget_utilization_start_epoch"],
+                        )
+                    ),
                 ]
             )
         return command
 
+    legacy_method = resolve_legacy_method(method)
+    if legacy_method is None:
+        raise ValueError(f"Unsupported comparison method: {method}")
     return [
         sys.executable,
         "-m",
@@ -756,9 +892,9 @@ def build_method_command(
         "--dataset",
         dataset,
         "--method",
-        method,
+        legacy_method,
         "--epochs",
-        str(args.epochs),
+        str(get_config_value(method_config, "epochs", args.epochs)),
         "--num-samples",
         str(num_samples),
         "--batch-size",
