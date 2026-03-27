@@ -163,14 +163,14 @@ def export_bundle(
     title_base = f"{dataset} | {fraction_tag} | seed {seed}"
 
     save_card_sheet(
-        path=out_dir / f"{fraction_tag}_samples_{epoch_mode}_seed{seed}.png",
-        title=f"{title_base} | generated samples",
+        path=out_dir / f"{fraction_tag}_denoising_{epoch_mode}_seed{seed}.png",
+        title=f"{title_base} | Denoising",
         cards=sample_cards,
         target_width=target_width,
     )
     save_card_sheet(
-        path=out_dir / f"{fraction_tag}_reverse_{epoch_mode}_seed{seed}.png",
-        title=f"{title_base} | reverse/noise process",
+        path=out_dir / f"{fraction_tag}_noising_process_{epoch_mode}_seed{seed}.png",
+        title=f"{title_base} | Noising Process",
         cards=reverse_cards,
         target_width=target_width,
     )
