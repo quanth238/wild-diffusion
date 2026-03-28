@@ -628,8 +628,6 @@ def sample_reverse_chain(
         if collect_states:
             reverse_states.append(current.detach().cpu())
 
-    if collect_states:
-        reverse_states.reverse()
     return current, reverse_states
 
 

@@ -210,6 +210,15 @@ def run_job(job: dict) -> dict:
         )
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     last_eval = summary["last_eval"]
+    active_control_cost = summary.get("active_control_cost_mean")
+    active_control_cost_max = None
+    if active_control_cost is None:
+        active_control_cost, active_control_cost_max = load_active_control_cost_fallback(job["outdir"])
+    transport_cost = (
+        active_control_cost
+        if active_control_cost is not None
+        else last_eval.get("control_cost", last_eval.get("mean_transport_cost", 0.0))
+    )
     return {
         "dataset": job["dataset"],
         "fraction": job["fraction"],
@@ -222,19 +231,46 @@ def run_job(job: dict) -> dict:
         "last_epoch": last_eval["epoch"],
         "last_swd": last_eval["sliced_wasserstein"],
         "mmd": last_eval["mmd_rbf"],
-        "mean_transport_cost": last_eval.get("mean_transport_cost", last_eval.get("control_cost", 0.0)),
-        "max_transport_cost": last_eval.get("max_transport_cost", last_eval.get("control_cost", 0.0)),
-        "total_transport_cost": last_eval.get(
-            "total_transport_cost", last_eval.get("control_cost", last_eval.get("mean_transport_cost", 0.0))
+        "mean_transport_cost": last_eval.get("mean_transport_cost", transport_cost),
+        "max_transport_cost": last_eval.get(
+            "max_transport_cost",
+            active_control_cost_max if active_control_cost_max is not None else transport_cost,
         ),
+        "total_transport_cost": last_eval.get("total_transport_cost", transport_cost),
         "target_total_budget": last_eval.get("cdro_target_total_budget", last_eval.get("target_total_budget")),
         "max_total_transport_cost": last_eval.get(
-            "max_total_transport_cost", last_eval.get("control_cost", last_eval.get("max_transport_cost", 0.0))
+            "max_total_transport_cost",
+            active_control_cost_max
+            if active_control_cost_max is not None
+            else last_eval.get("control_cost", last_eval.get("max_transport_cost", transport_cost)),
         ),
         "final_loss": summary.get("final_loss", last_eval.get("train_loss", last_eval.get("score_loss"))),
         "runtime_minutes": summary["runtime_minutes"],
         "run_dir": str(job["outdir"]),
     }
+
+
+def load_active_control_cost_fallback(run_dir: Path) -> tuple[float | None, float | None]:
+    metrics_path = run_dir / "metrics.jsonl"
+    if not metrics_path.is_file():
+        return None, None
+
+    active_costs: list[float] = []
+    with metrics_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            control_cost = row.get("control_cost")
+            if control_cost is None:
+                continue
+            if bool(row.get("control_active")) or float(control_cost) > 0.0:
+                active_costs.append(float(control_cost))
+
+    if not active_costs:
+        return None, None
+    return mean(active_costs), max(active_costs)
 
 
 def aggregate_results(*, results: list[dict], args: argparse.Namespace, method_configs: dict[str, dict]) -> dict:
@@ -399,7 +435,7 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     ]
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
-        cells.extend(f"{row[f'{method}_total_transport_cost']:.4f}" for method in methods)
+        cells.extend(format_cost(row[f"{method}_total_transport_cost"]) for method in methods)
         lines.append(markdown_row(cells))
     if "wdro" in methods and "cdro" in methods and any(
         row.get("cdro_target_total_budget") is not None for row in aggregate["summary"]
@@ -425,9 +461,9 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
             cells = [
                 row["dataset"],
                 row["fraction_tag"],
-                f"{row['wdro_total_transport_cost']:.4f}",
-                "n/a" if target_budget is None else f"{target_budget:.4f}",
-                f"{row['cdro_total_transport_cost']:.4f}",
+                format_cost(row["wdro_total_transport_cost"]),
+                "n/a" if target_budget is None else format_cost(target_budget),
+                format_cost(row["cdro_total_transport_cost"]),
                 "n/a"
                 if target_budget is None
                 else f"{row['cdro_target_vs_wdro_gap_pct']:.2f}%",
@@ -442,7 +478,7 @@ def write_outputs(*, outdir: Path, aggregate: dict) -> None:
     ]
     for row in aggregate["summary"]:
         cells = [row["dataset"], row["fraction_tag"]]
-        cells.extend(f"{row[f'{method}_mean_transport_cost']:.4f}" for method in methods)
+        cells.extend(format_cost(row[f"{method}_mean_transport_cost"]) for method in methods)
         lines.append(markdown_row(cells))
     lines += [
         "",
@@ -627,6 +663,17 @@ def format_method_name(method: str) -> str:
     if method == "cdro_markov_raw":
         return "CDRO Markov Raw"
     return method.replace("_", " ").title()
+
+
+def format_cost(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    value = float(value)
+    if value == 0.0:
+        return "0"
+    if abs(value) >= 1e-3:
+        return f"{value:.4f}"
+    return f"{value:.2e}"
 
 
 def resolve_score_method(method: str) -> str | None:
