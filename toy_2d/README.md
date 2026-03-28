@@ -78,12 +78,26 @@ Experimental Markov score-based CDRO pipeline:
 - `--method wdro_score`: score matching with WDRO-style adversarial refreshes on clean points
 - `--method cdro_markov`: score matching with Markov drift control and dual-budget updates
 - keeps the frozen forward control inside reverse-time sampling, rather than fitting a separate reverse model
+- `python -m toy_2d.eval_cdro_markov_checkpoint`: re-evaluates a saved Markov checkpoint with the current sampler/ablation logic and writes fresh metrics without retraining
+- `python -m toy_2d.sweep_cdro_markov_reeval`: sweeps a comparison directory, re-evaluates every `cdro_markov` seed run, and writes one aggregate re-eval report
 - writes checkpoints, sample plots, reverse-process plots, and metric logs
 
 Minimal Markov example:
 
 ```bash
 python -m toy_2d.train_cdro_markov --outdir toy-runs/cdro_markov
+```
+
+Re-evaluate a saved checkpoint:
+
+```bash
+python -m toy_2d.eval_cdro_markov_checkpoint --run-dir toy-runs/cdro_markov --checkpoint-mode best --outdir toy-runs/cdro_markov_reeval
+```
+
+Sweep a comparison directory:
+
+```bash
+python -m toy_2d.sweep_cdro_markov_reeval --comparison-dir toy-runs/score_family_best_200ep_v7
 ```
 
 Minimal end-to-end example:

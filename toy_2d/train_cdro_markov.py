@@ -682,6 +682,17 @@ def evaluate_model(
     if control_model is not None:
         control_model.eval()
 
+    shared_reverse_randomness = build_reverse_sampling_randomness(
+        schedule=schedule,
+        terminal_stats=terminal_stats,
+        num_samples=num_eval_samples,
+        data_dim=2,
+        terminal_sampler=terminal_sampler,
+        terminal_jitter_scale=terminal_jitter_scale,
+        seed=seed + epoch + 100_000,
+        device=device,
+        dtype=torch.float32,
+    )
     generated_std, reverse_states = sample_reverse_chain(
         score_net=score_model,
         control_net=control_model,
@@ -699,6 +710,9 @@ def evaluate_model(
         reverse_control_scale=reverse_control_scale,
         reverse_tail_noise_scale=reverse_tail_noise_scale,
         reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
+        terminal_replay_indices=shared_reverse_randomness["terminal_replay_indices"],
+        terminal_draw_noise=shared_reverse_randomness["terminal_draw_noise"],
+        step_noises=shared_reverse_randomness["step_noises"],
     )
     generated = dataset.destandardize(generated_std.cpu()).cpu()
     real_all = torch.from_numpy(dataset.raw_points)
@@ -721,6 +735,7 @@ def evaluate_model(
         "reverse_control_scale": float(reverse_control_scale),
         "reverse_tail_noise_scale": float(reverse_tail_noise_scale),
         "reverse_deterministic_tail_steps": int(reverse_deterministic_tail_steps),
+        "reverse_ablation_shared_randomness": bool(log_reverse_ablation and control_model is not None and not zero_control),
     }
 
     generated_stats = compute_point_cloud_stats(fake_metric)
@@ -798,32 +813,41 @@ def evaluate_model(
         metrics["diag_control_to_drift_ratio"] = 0.0
 
     if log_reverse_ablation and control_model is not None and not zero_control:
-        generated_no_control_std, _ = sample_reverse_chain(
-            score_net=score_model,
-            control_net=control_model,
-            schedule=schedule,
-            terminal_stats=terminal_stats,
-            num_samples=num_eval_samples,
-            data_dim=2,
-            device=device,
-            zero_control=True,
-            collect_states=False,
-            solver=reverse_solver,
-            terminal_sampler=terminal_sampler,
-            terminal_jitter_scale=terminal_jitter_scale,
-            reverse_noise_scale=reverse_noise_scale,
-            reverse_control_scale=reverse_control_scale,
-            reverse_tail_noise_scale=reverse_tail_noise_scale,
-            reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
-        )
-        generated_no_control = dataset.destandardize(generated_no_control_std.cpu()).cpu()
-        fake_metric_no_control = generated_no_control[fake_idx]
-        reverse_no_control_mmd = mmd_rbf(real_metric, fake_metric_no_control)
-        reverse_no_control_swd = sliced_wasserstein(real_metric, fake_metric_no_control, seed=seed + epoch + 999)
-        metrics["reverse_no_control_mmd_rbf"] = reverse_no_control_mmd
-        metrics["reverse_no_control_sliced_wasserstein"] = reverse_no_control_swd
-        metrics["reverse_control_gain_mmd"] = reverse_no_control_mmd - metrics["mmd_rbf"]
-        metrics["reverse_control_gain_swd"] = reverse_no_control_swd - metrics["sliced_wasserstein"]
+        if float(reverse_control_scale) == 0.0:
+            metrics["reverse_no_control_mmd_rbf"] = metrics["mmd_rbf"]
+            metrics["reverse_no_control_sliced_wasserstein"] = metrics["sliced_wasserstein"]
+            metrics["reverse_control_gain_mmd"] = 0.0
+            metrics["reverse_control_gain_swd"] = 0.0
+        else:
+            generated_no_control_std, _ = sample_reverse_chain(
+                score_net=score_model,
+                control_net=control_model,
+                schedule=schedule,
+                terminal_stats=terminal_stats,
+                num_samples=num_eval_samples,
+                data_dim=2,
+                device=device,
+                zero_control=True,
+                collect_states=False,
+                solver=reverse_solver,
+                terminal_sampler=terminal_sampler,
+                terminal_jitter_scale=terminal_jitter_scale,
+                reverse_noise_scale=reverse_noise_scale,
+                reverse_control_scale=reverse_control_scale,
+                reverse_tail_noise_scale=reverse_tail_noise_scale,
+                reverse_deterministic_tail_steps=reverse_deterministic_tail_steps,
+                terminal_replay_indices=shared_reverse_randomness["terminal_replay_indices"],
+                terminal_draw_noise=shared_reverse_randomness["terminal_draw_noise"],
+                step_noises=shared_reverse_randomness["step_noises"],
+            )
+            generated_no_control = dataset.destandardize(generated_no_control_std.cpu()).cpu()
+            fake_metric_no_control = generated_no_control[fake_idx]
+            reverse_no_control_mmd = mmd_rbf(real_metric, fake_metric_no_control)
+            reverse_no_control_swd = sliced_wasserstein(real_metric, fake_metric_no_control, seed=seed + epoch + 999)
+            metrics["reverse_no_control_mmd_rbf"] = reverse_no_control_mmd
+            metrics["reverse_no_control_sliced_wasserstein"] = reverse_no_control_swd
+            metrics["reverse_control_gain_mmd"] = reverse_no_control_mmd - metrics["mmd_rbf"]
+            metrics["reverse_control_gain_swd"] = reverse_no_control_swd - metrics["sliced_wasserstein"]
     else:
         metrics["reverse_no_control_mmd_rbf"] = metrics["mmd_rbf"]
         metrics["reverse_no_control_sliced_wasserstein"] = metrics["sliced_wasserstein"]
@@ -860,6 +884,46 @@ def evaluate_model(
             title=f"{format_markov_method_name(method_name)} reverse process | epoch {epoch}",
         )
     return metrics
+
+
+def build_reverse_sampling_randomness(
+    *,
+    schedule,
+    terminal_stats: TerminalStats,
+    num_samples: int,
+    data_dim: int,
+    terminal_sampler: str,
+    terminal_jitter_scale: float,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor | None]:
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+
+    terminal_replay_indices: torch.Tensor | None = None
+    terminal_draw_noise: torch.Tensor | None = None
+    if terminal_sampler == "replay" and terminal_stats.replay is not None and terminal_stats.replay.shape[0] > 0:
+        terminal_replay_indices = torch.randint(
+            0,
+            terminal_stats.replay.shape[0],
+            (num_samples,),
+            generator=generator,
+            dtype=torch.int64,
+        ).to(device=device)
+        if terminal_jitter_scale > 0.0:
+            terminal_draw_noise = torch.randn(num_samples, data_dim, generator=generator, dtype=dtype).to(device=device)
+    else:
+        terminal_draw_noise = torch.randn(num_samples, data_dim, generator=generator, dtype=dtype).to(device=device)
+
+    step_noises = torch.randn(schedule.dt.shape[0], num_samples, data_dim, generator=generator, dtype=dtype).to(
+        device=device
+    )
+    return {
+        "terminal_replay_indices": terminal_replay_indices,
+        "terminal_draw_noise": terminal_draw_noise,
+        "step_noises": step_noises,
+    }
 
 
 def initialize_control_head(module) -> None:

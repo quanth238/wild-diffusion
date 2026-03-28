@@ -566,17 +566,52 @@ def sample_reverse_chain(
     reverse_control_scale: float = 1.0,
     reverse_tail_noise_scale: float = 1.0,
     reverse_deterministic_tail_steps: int = 0,
+    terminal_replay_indices: torch.Tensor | None = None,
+    terminal_draw_noise: torch.Tensor | None = None,
+    step_noises: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     mean = terminal_stats.mean.to(device=device)
     var = terminal_stats.var.to(device=device).clamp(min=1e-6)
+    if terminal_replay_indices is not None:
+        terminal_replay_indices = terminal_replay_indices.to(device=device, dtype=torch.int64)
+        if terminal_replay_indices.shape != (num_samples,):
+            raise ValueError(
+                f"terminal_replay_indices must have shape {(num_samples,)}, got {tuple(terminal_replay_indices.shape)}"
+            )
+    if terminal_draw_noise is not None:
+        terminal_draw_noise = terminal_draw_noise.to(device=device, dtype=mean.dtype)
+        if terminal_draw_noise.shape != (num_samples, data_dim):
+            raise ValueError(
+                f"terminal_draw_noise must have shape {(num_samples, data_dim)}, got {tuple(terminal_draw_noise.shape)}"
+            )
+    if step_noises is not None:
+        step_noises = step_noises.to(device=device, dtype=mean.dtype)
+        expected_shape = (schedule.dt.shape[0], num_samples, data_dim)
+        if step_noises.shape != expected_shape:
+            raise ValueError(f"step_noises must have shape {expected_shape}, got {tuple(step_noises.shape)}")
+
     if terminal_sampler == "replay" and terminal_stats.replay is not None and terminal_stats.replay.shape[0] > 0:
         replay = terminal_stats.replay.to(device=device, dtype=mean.dtype)
-        indices = torch.randint(0, replay.shape[0], (num_samples,), device=device)
+        indices = (
+            terminal_replay_indices
+            if terminal_replay_indices is not None
+            else torch.randint(0, replay.shape[0], (num_samples,), device=device)
+        )
         current = replay[indices]
         if terminal_jitter_scale > 0.0:
-            current = current + torch.randn_like(current) * var.sqrt().view(1, data_dim) * float(terminal_jitter_scale)
+            jitter = (
+                terminal_draw_noise
+                if terminal_draw_noise is not None
+                else torch.randn(current.shape, device=device, dtype=current.dtype)
+            )
+            current = current + jitter * var.sqrt().view(1, data_dim) * float(terminal_jitter_scale)
     else:
-        current = mean.view(1, data_dim) + torch.randn(num_samples, data_dim, device=device) * var.sqrt().view(1, data_dim)
+        base_noise = (
+            terminal_draw_noise
+            if terminal_draw_noise is not None
+            else torch.randn(num_samples, data_dim, device=device, dtype=mean.dtype)
+        )
+        current = mean.view(1, data_dim) + base_noise * var.sqrt().view(1, data_dim)
     control_state = initialize_control_state(
         control_net=control_net,
         batch_size=num_samples,
@@ -598,7 +633,11 @@ def sample_reverse_chain(
                 control_state=control_state,
             )
             control = control * float(reverse_control_scale)
-        noise = torch.randn_like(current)
+        noise = (
+            step_noises[step_idx]
+            if step_noises is not None
+            else torch.randn(current.shape, device=device, dtype=current.dtype)
+        )
         dt_step = schedule.dt[step_idx]
         score_scale = schedule.step_sigma[step_idx].square() / dt_step
         reverse_drift = -forward_drift(current, drift_coeff=schedule.drift_coeff[step_idx], control=control) + score_scale * score
