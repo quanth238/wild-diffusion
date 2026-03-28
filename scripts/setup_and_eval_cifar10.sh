@@ -338,7 +338,7 @@ fi
 if [[ "${REF_MODE}" == "compute" ]]; then
   mkdir -p "$(dirname "${REF_PATH}")"
   ref_cmd=(
-    torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py ref
+    python fid.py ref
     "--data=${CIFAR_DIR}"
     "--dest=${REF_PATH}"
     "--batch=${FID_BATCH}"
@@ -391,7 +391,7 @@ echo "[CMD] ${gen_cmd[*]}"
 "${gen_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/generate.log"
 
 fid_cmd=(
-  torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py calc
+  python fid.py calc
   "--images=${SAMPLES_DIR}"
   "--ref=${REF_INPUT}"
   "--num=${NUM_IMAGES}"

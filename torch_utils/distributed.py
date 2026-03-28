@@ -23,11 +23,12 @@ def init():
     if 'WORLD_SIZE' not in os.environ:
         os.environ['WORLD_SIZE'] = '1'
 
-    backend = 'gloo' if os.name == 'nt' else 'nccl'
+    backend = 'gloo' if os.name == 'nt' or not torch.cuda.is_available() else 'nccl'
     torch.distributed.init_process_group(backend=backend, init_method='env://')
-    torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
-    sync_device = torch.device('cuda') if get_world_size() > 1 else None
+    sync_device = torch.device('cuda') if get_world_size() > 1 and torch.cuda.is_available() else None
     training_stats.init_multiprocessing(rank=get_rank(), sync_device=sync_device)
 
 #----------------------------------------------------------------------------

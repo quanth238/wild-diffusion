@@ -125,8 +125,9 @@ env/
 env.bak/
 venv.bak/
 
-# Local toy experiment outputs
+# Local experiment outputs
 toy-runs/
+training-runs/
 
 # Local datasets and download caches
 datasets/

@@ -5,7 +5,7 @@ import click
 import torch
 import dnnlib
 from torch_utils import distributed as dist
-# from training import training_loop
+from training import training_loop
 from training import training_wdro_loop
 
 import warnings
@@ -37,6 +37,7 @@ def parse_int_list(s):
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm',       type=click.Choice(['wdroedm', 'advedm']), default='wdroedm', show_default=True)
+@click.option('--trainer',       help='Training loop', metavar='baseline|wdro',                     type=click.Choice(['baseline', 'wdro']), default='wdro', show_default=True)
 @click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
 @click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
 @click.option('--wdro-k',        help='WDRO inner ascent steps (K)', metavar='INT',                    type=click.IntRange(min=1), default=2, show_default=True)
@@ -175,7 +176,8 @@ def main(**kwargs):
     if opts.seed is not None:
         c.seed = opts.seed
     else:
-        seed = torch.randint(1 << 31, size=[], device=torch.device('cuda'))
+        seed_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        seed = torch.randint(1 << 31, size=[], device=seed_device)
         torch.distributed.broadcast(seed, src=0)
         c.seed = int(seed)
 
@@ -196,7 +198,7 @@ def main(**kwargs):
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
-    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-{opts.trainer:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
@@ -225,14 +227,16 @@ def main(**kwargs):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
-    dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
-    dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
-    dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
-    dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
-    if c.debug_eval_enable:
-        dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
-        dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
-        dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
+    dist.print0(f'Training loop:           {opts.trainer}')
+    if opts.trainer == 'wdro':
+        dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
+        dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
+        dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
+        dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
+        if c.debug_eval_enable:
+            dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
+            dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
+            dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
@@ -241,6 +245,8 @@ def main(**kwargs):
     # Dry run?
     if opts.dry_run:
         dist.print0('Dry run; exiting.')
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         return
 
     # Create output directory.
@@ -252,8 +258,28 @@ def main(**kwargs):
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Train.
-    # training_loop.training_loop(**c)
-    training_wdro_loop.training_loop(**c)
+    if opts.trainer == 'baseline':
+        baseline_config = dnnlib.EasyDict(c)
+        for key in [
+            'wdro_warmup_ratio',
+            'wdro_m_epochs',
+            'wdro_k',
+            'wdro_step_size',
+            'wdro_gamma',
+            'wdro_p_adv',
+            'debug_eval_enable',
+            'debug_eval_init',
+            'debug_eval_num_images',
+            'debug_eval_steps',
+            'debug_eval_batch_size',
+            'debug_eval_num_visual',
+            'debug_eval_ref_path',
+            'debug_adv_num_visual',
+        ]:
+            baseline_config.pop(key, None)
+        training_loop.training_loop(**baseline_config)
+    else:
+        training_wdro_loop.training_loop(**c)
 
 #----------------------------------------------------------------------------
 

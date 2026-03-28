@@ -81,3 +81,12 @@ This branch is not a pure upstream copy. The main changes are:
 ## 5) Notes for paper **comparison**
 1. This run uses CIFAR-10 20% training data (`10000` images) with class-conditional training (`--cond=1`).
 2. Final FID is computed with standard protocol against full CIFAR-10 train reference stats (`50000` real images).
+
+## 6) Fast MNIST Iteration
+
+For quicker image-level iteration on baseline EDM vs WDRO-EDM, use the MNIST wrappers:
+
+- [`scripts/setup_and_train_mnist.sh`](scripts/setup_and_train_mnist.sh)
+- [`scripts/setup_and_eval_mnist.sh`](scripts/setup_and_eval_mnist.sh)
+- [`scripts/run_mnist_compare.sh`](scripts/run_mnist_compare.sh)
+- [`scripts/README_mnist_one_command.md`](scripts/README_mnist_one_command.md)

@@ -175,7 +175,10 @@ def training_loop(
         next_wdro_kimg = wdro_start_kimg
     n = len(dataset_obj)
     p_now = 0.12 if n >= 40000 else (0.15 if n >= 20000 else 0.18)
-    augment_pipe.p = p_now
+    if augment_pipe is not None:
+        augment_pipe.p = p_now
+    else:
+        dist.print0('[WDRO] augment disabled; continuing without an augment pipe.')
     dist.print0(f"[WDRO] schedule start/interval/next (kimg): {wdro_start_kimg}/{wdro_interval_kimg}/{next_wdro_kimg}")
     if debug_eval_enable:
         dist.print0(f"[QuickEval] enabled. init={debug_eval_init}, num={debug_eval_num_images}, steps={debug_eval_steps}, batch={debug_eval_batch_size}, visual={debug_eval_num_visual}, adv_visual={debug_adv_num_visual}")
