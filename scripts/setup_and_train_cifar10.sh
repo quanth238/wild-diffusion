@@ -32,7 +32,17 @@ WORKERS="${WORKERS:-16}"
 AUGMENT="${AUGMENT:-0.12}"
 ARCH="${ARCH:-ddpmpp}"
 PRECOND="${PRECOND:-wdroedm}"
+TRAINER="${TRAINER:-}"
+CBASE="${CBASE:-}"
+CRES="${CRES:-}"
+DROPOUT="${DROPOUT:-}"
 FP16="${FP16:-1}"
+EMA="${EMA:-0.5}"
+TICK="${TICK:-}"
+SNAP="${SNAP:-}"
+DUMP="${DUMP:-}"
+SEED="${SEED:-}"
+DESC="${DESC:-}"
 RESUME="${RESUME:-}"
 WDRO_WARMUP_RATIO="${WDRO_WARMUP_RATIO:-0.2}"
 WDRO_M_EPOCHS="${WDRO_M_EPOCHS:-20}"
@@ -40,6 +50,17 @@ WDRO_K="${WDRO_K:-5}"
 WDRO_STEP_SIZE="${WDRO_STEP_SIZE:-0.01}"
 WDRO_GAMMA="${WDRO_GAMMA:-1.0}"
 WDRO_P_ADV="${WDRO_P_ADV:-1.0}"
+CDRO_MIX="${CDRO_MIX:-0.3}"
+CDRO_ADV_STEPS="${CDRO_ADV_STEPS:-2}"
+CDRO_STEP_SIZE="${CDRO_STEP_SIZE:-0.02}"
+CDRO_MAX_DELTA="${CDRO_MAX_DELTA:-0.05}"
+CDRO_RHO="${CDRO_RHO:-1e-4}"
+CDRO_LAMBDA_INIT="${CDRO_LAMBDA_INIT:-0.1}"
+CDRO_LAMBDA_LR="${CDRO_LAMBDA_LR:-1e-3}"
+CDRO_SIGMA_FLOOR="${CDRO_SIGMA_FLOOR:-0.0}"
+CDRO_SIGMA_CUT="${CDRO_SIGMA_CUT:-0.5}"
+CDRO_GATE_POWER="${CDRO_GATE_POWER:-2.0}"
+CDRO_DELTA_SPACE="${CDRO_DELTA_SPACE:-image}"
 DEBUG_EVAL="${DEBUG_EVAL:-1}"
 DEBUG_EVAL_INIT="${DEBUG_EVAL_INIT:-1}"
 DEBUG_EVAL_NUM="${DEBUG_EVAL_NUM:-128}"
@@ -52,6 +73,7 @@ DEBUG_ADV_VISUAL="${DEBUG_ADV_VISUAL:-16}"
 CIFAR_TRAIN_PERCENT="${CIFAR_TRAIN_PERCENT:-20}"  # 1..100
 CIFAR_TRAIN_SEED="${CIFAR_TRAIN_SEED:-0}"
 TRAIN_CIFAR_DIR="${TRAIN_CIFAR_DIR:-}"
+DRY_RUN="${DRY_RUN:-0}"
 ENV_MODE="${ENV_MODE:-auto}"      # auto|conda|venv
 INSTALL_DEPS="${INSTALL_DEPS:-auto}"  # auto|0|1
 EXPECTED_CONDA_ENV="${EXPECTED_CONDA_ENV:-quanth}"
@@ -61,6 +83,14 @@ DATASET_ONLY="${DATASET_ONLY:-0}"  # 1: prepare CIFAR data then exit (no GPU req
 CIFAR_ALLOW_DOWNLOAD="${CIFAR_ALLOW_DOWNLOAD:-1}"  # 1|0
 CIFAR_DOWNLOAD_RETRIES="${CIFAR_DOWNLOAD_RETRIES:-3}"
 CIFAR_DOWNLOAD_TIMEOUT="${CIFAR_DOWNLOAD_TIMEOUT:-30}"  # seconds
+
+if [[ -z "${TRAINER}" ]]; then
+  if [[ "${PRECOND}" == "cdroedm" ]]; then
+    TRAINER="baseline"
+  else
+    TRAINER="wdro"
+  fi
+fi
 
 if [[ -n "${RESUME}" ]]; then
   if [[ ! -f "${RESUME}" ]]; then
@@ -76,7 +106,7 @@ if [[ -n "${RESUME}" ]]; then
   echo "       ${OUTDIR}"
 fi
 
-python - <<PY
+python3 - <<PY
 try:
     pct = int("${CIFAR_TRAIN_PERCENT}")
 except Exception:
@@ -87,6 +117,12 @@ try:
     int("${CIFAR_TRAIN_SEED}")
 except Exception:
     raise SystemExit("[ERROR] CIFAR_TRAIN_SEED must be an integer.")
+if "${TRAINER}" not in {"baseline", "wdro"}:
+    raise SystemExit("[ERROR] TRAINER must be one of: baseline, wdro")
+if "${PRECOND}" not in {"wdroedm", "advedm", "cdroedm"}:
+    raise SystemExit("[ERROR] PRECOND must be one of: wdroedm, advedm, cdroedm")
+if "${PRECOND}" == "cdroedm" and "${TRAINER}" != "baseline":
+    raise SystemExit("[ERROR] PRECOND=cdroedm currently requires TRAINER=baseline")
 PY
 
 if [[ -z "${TRAIN_CIFAR_DIR}" ]]; then
@@ -160,8 +196,12 @@ try:
     aug = float("${AUGMENT}")
 except Exception:
     raise SystemExit("[ERROR] AUGMENT must be a float.")
-if aug <= 0:
-    raise SystemExit("[ERROR] AUGMENT must be > 0 for this repository's WDRO loop (augment pipe is required).")
+if "${TRAINER}" == "wdro":
+    if aug <= 0:
+        raise SystemExit("[ERROR] AUGMENT must be > 0 when TRAINER=wdro (augment pipe is required).")
+else:
+    if aug < 0:
+        raise SystemExit("[ERROR] AUGMENT must be >= 0 when TRAINER=baseline.")
 PY
 
 if [[ "${INSTALL_DEPS}" == "1" ]]; then
@@ -203,7 +243,16 @@ echo "[INFO] TRAIN_CIFAR_DIR=${TRAIN_CIFAR_DIR}"
 echo "[INFO] CIFAR_TRAIN_PERCENT=${CIFAR_TRAIN_PERCENT}"
 echo "[INFO] CIFAR_TRAIN_SEED=${CIFAR_TRAIN_SEED}"
 echo "[INFO] OUTDIR=${OUTDIR}"
+echo "[INFO] TRAINER=${TRAINER}"
+echo "[INFO] PRECOND=${PRECOND}"
 echo "[INFO] DEBUG_EVAL=${DEBUG_EVAL} (init=${DEBUG_EVAL_INIT}, num=${DEBUG_EVAL_NUM}, steps=${DEBUG_EVAL_STEPS}, batch=${DEBUG_EVAL_BATCH}, visual=${DEBUG_EVAL_VISUAL}, adv_visual=${DEBUG_ADV_VISUAL})"
+if [[ "${PRECOND}" == "cdroedm" ]]; then
+  echo "[INFO] CDRO mix/steps/step=${CDRO_MIX}/${CDRO_ADV_STEPS}/${CDRO_STEP_SIZE}"
+  echo "[INFO] CDRO max_delta/rho=${CDRO_MAX_DELTA}/${CDRO_RHO}"
+  echo "[INFO] CDRO lambda init/lr=${CDRO_LAMBDA_INIT}/${CDRO_LAMBDA_LR}"
+  echo "[INFO] CDRO sigma cut/power=${CDRO_SIGMA_CUT}/${CDRO_GATE_POWER}"
+  echo "[INFO] CDRO delta_space=${CDRO_DELTA_SPACE}"
+fi
 
 if [[ "${INSTALL_ONLY}" == "1" ]]; then
   echo "[INFO] INSTALL_ONLY=1, dependency setup completed. Exiting before dataset prep/training."
@@ -353,19 +402,21 @@ if [[ "${DATASET_ONLY}" == "1" ]]; then
   exit 0
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-  echo "[ERROR] NVIDIA GPU not detected (nvidia-smi missing)."
-  echo "Training requires CUDA/NCCL. Use DATASET_ONLY=1 for data prep on non-GPU nodes."
-  exit 1
-fi
+if [[ "${DRY_RUN}" != "1" ]]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "[ERROR] NVIDIA GPU not detected (nvidia-smi missing)."
+    echo "Training requires CUDA/NCCL. Use DRY_RUN=1 or DATASET_ONLY=1 for non-GPU nodes."
+    exit 1
+  fi
 
-# Final sanity check before launch.
-python - <<'PY'
+  # Final sanity check before launch.
+  python - <<'PY'
 import torch
 if not torch.cuda.is_available():
     raise SystemExit("[ERROR] torch.cuda.is_available() is False. Install a CUDA-enabled PyTorch build.")
 print(f"[INFO] CUDA is available with {torch.cuda.device_count()} GPU(s).")
 PY
+fi
 
 train_cmd=(
   torchrun --standalone --nproc_per_node=1 train.py
@@ -374,12 +425,14 @@ train_cmd=(
   "--cond=1"
   "--arch=${ARCH}"
   "--precond=${PRECOND}"
+  "--trainer=${TRAINER}"
   "--duration=${DURATION_MIMG}"
   "--batch=${BATCH}"
   "--lr=${LR}"
   "--workers=${WORKERS}"
   "--augment=${AUGMENT}"
   "--fp16=${FP16}"
+  "--ema=${EMA}"
   "--wdro-warmup-ratio=${WDRO_WARMUP_RATIO}"
   "--wdro-m-epochs=${WDRO_M_EPOCHS}"
   "--wdro-k=${WDRO_K}"
@@ -395,6 +448,22 @@ train_cmd=(
   "--debug-adv-visual=${DEBUG_ADV_VISUAL}"
 )
 
+if [[ "${PRECOND}" == "cdroedm" ]]; then
+  train_cmd+=(
+    "--cdro-mix=${CDRO_MIX}"
+    "--cdro-adv-steps=${CDRO_ADV_STEPS}"
+    "--cdro-step-size=${CDRO_STEP_SIZE}"
+    "--cdro-max-delta=${CDRO_MAX_DELTA}"
+    "--cdro-rho=${CDRO_RHO}"
+    "--cdro-lambda-init=${CDRO_LAMBDA_INIT}"
+    "--cdro-lambda-lr=${CDRO_LAMBDA_LR}"
+    "--cdro-sigma-floor=${CDRO_SIGMA_FLOOR}"
+    "--cdro-sigma-cut=${CDRO_SIGMA_CUT}"
+    "--cdro-gate-power=${CDRO_GATE_POWER}"
+    "--cdro-delta-space=${CDRO_DELTA_SPACE}"
+  )
+fi
+
 if [[ -n "${DEBUG_EVAL_REF}" ]]; then
   train_cmd+=("--debug-eval-ref=${DEBUG_EVAL_REF}")
 fi
@@ -406,6 +475,42 @@ fi
 
 if [[ -n "${BATCH_GPU}" ]]; then
   train_cmd+=("--batch-gpu=${BATCH_GPU}")
+fi
+
+if [[ -n "${CBASE}" ]]; then
+  train_cmd+=("--cbase=${CBASE}")
+fi
+
+if [[ -n "${CRES}" ]]; then
+  train_cmd+=("--cres=${CRES}")
+fi
+
+if [[ -n "${DROPOUT}" ]]; then
+  train_cmd+=("--dropout=${DROPOUT}")
+fi
+
+if [[ -n "${TICK}" ]]; then
+  train_cmd+=("--tick=${TICK}")
+fi
+
+if [[ -n "${SNAP}" ]]; then
+  train_cmd+=("--snap=${SNAP}")
+fi
+
+if [[ -n "${DUMP}" ]]; then
+  train_cmd+=("--dump=${DUMP}")
+fi
+
+if [[ -n "${SEED}" ]]; then
+  train_cmd+=("--seed=${SEED}")
+fi
+
+if [[ -n "${DESC}" ]]; then
+  train_cmd+=("--desc=${DESC}")
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  train_cmd+=("--dry-run")
 fi
 
 exec "${train_cmd[@]}"

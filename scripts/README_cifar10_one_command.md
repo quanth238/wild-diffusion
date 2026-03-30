@@ -12,6 +12,16 @@ This single command will:
 3. Download CIFAR-10 and convert it into `${DATA_ROOT}/cifar10-32x32` (with `dataset.json`).
 4. Launch training via `torchrun`.
 
+The wrapper now supports three image-training modes through the same entrypoint:
+
+- `TRAINER=wdro PRECOND=wdroedm` for the WILD-Diffusion WDRO path
+- `TRAINER=baseline PRECOND=wdroedm` for plain EDM-style baseline training
+- `TRAINER=baseline PRECOND=cdroedm` for the new training-only CDRO-EDM loss
+
+There is also a compare runner:
+
+- `scripts/run_cifar_compare.sh`
+
 ## Environment mode (important for your server)
 
 - Default is `ENV_MODE=auto`.
@@ -56,6 +66,8 @@ Current default profile is paper-aligned for CIFAR-10 limited-data 20%:
 - `DEBUG_EVAL_STEPS=18`
 - `DEBUG_EVAL_VISUAL=32`
 - `DEBUG_ADV_VISUAL=16`
+- `TRAINER=wdro`
+- `PRECOND=wdroedm`
 
 Override example:
 
@@ -65,10 +77,15 @@ DURATION_MIMG=8 BATCH=1024 BATCH_GPU=512 LR=1e-4 CIFAR_TRAIN_PERCENT=100 bash sc
 
 Other optional overrides:
 - `ARCH=ddpmpp|ncsnpp|adm`
-- `PRECOND=wdroedm|advedm`
+- `TRAINER=baseline|wdro`
+- `PRECOND=wdroedm|advedm|cdroedm`
 - `BATCH=<global_batch>`
 - `BATCH_GPU=<micro_batch_per_gpu>`
+- `CBASE=<int>`
+- `CRES=<comma-separated channel mults>`
+- `DROPOUT=<float>`
 - `FP16=1|0`
+- `EMA=<float>`
 - `WDRO_WARMUP_RATIO=<float>`
 - `WDRO_M_EPOCHS=<int>`
 - `WDRO_K=<int>`
@@ -83,7 +100,22 @@ Other optional overrides:
 - `DEBUG_EVAL_VISUAL=<int>`
 - `DEBUG_EVAL_REF=/path/to/ref_stats.npz` (optional precomputed FID reference stats)
 - `DEBUG_ADV_VISUAL=<int>`
+- `CDRO_MIX=<0..1>`
+- `CDRO_ADV_STEPS=<int>`
+- `CDRO_STEP_SIZE=<float>`
+- `CDRO_MAX_DELTA=<float>`
+- `CDRO_RHO=<float>`
+- `CDRO_LAMBDA_INIT=<float>`
+- `CDRO_LAMBDA_LR=<float>`
+- `CDRO_SIGMA_CUT=<float>`
+- `CDRO_GATE_POWER=<float>`
 - `OUTDIR=/path/to/output`
+- `TICK=<int>`
+- `SNAP=<int>`
+- `DUMP=<int>`
+- `SEED=<int>`
+- `DESC=<string>`
+- `DRY_RUN=1|0`
 - `VENV_DIR=/path/to/venv`
 - `DATA_ROOT=/path/to/datasets`
 - `CIFAR_DIR=/path/to/cifar10-32x32`
@@ -105,6 +137,50 @@ Other optional overrides:
 Memory note:
 - On 1 GPU, `BATCH=1024` in fp32 can OOM.
 - Use smaller `BATCH` (e.g. 128/64), or set `BATCH_GPU` for gradient accumulation, and enable `FP16=1`.
+
+## Example: baseline EDM on CIFAR-10 20%
+
+```bash
+TRAINER=baseline PRECOND=wdroedm \
+DURATION_MIMG=8 BATCH=512 BATCH_GPU=128 FP16=1 LR=1e-4 WORKERS=16 \
+CIFAR_TRAIN_PERCENT=20 CIFAR_TRAIN_SEED=0 \
+bash scripts/setup_and_train_cifar10.sh
+```
+
+## Example: CDRO-EDM on CIFAR-10 20%
+
+```bash
+TRAINER=baseline PRECOND=cdroedm \
+DURATION_MIMG=8 BATCH=512 BATCH_GPU=128 FP16=1 LR=1e-4 WORKERS=16 \
+CIFAR_TRAIN_PERCENT=20 CIFAR_TRAIN_SEED=0 \
+CDRO_MIX=0.3 CDRO_ADV_STEPS=2 CDRO_STEP_SIZE=0.02 CDRO_MAX_DELTA=0.05 \
+CDRO_RHO=1e-4 CDRO_LAMBDA_INIT=0.1 CDRO_LAMBDA_LR=1e-3 \
+CDRO_SIGMA_CUT=0.5 CDRO_GATE_POWER=2.0 \
+bash scripts/setup_and_train_cifar10.sh
+```
+
+## Example: low-memory smoke run
+
+```bash
+TRAINER=baseline PRECOND=cdroedm \
+DURATION_MIMG=1 BATCH=32 BATCH_GPU=16 CBASE=64 DROPOUT=0.0 FP16=1 \
+TICK=1 SNAP=1 DUMP=1 DEBUG_EVAL=0 \
+CIFAR_TRAIN_PERCENT=20 CIFAR_TRAIN_SEED=0 \
+bash scripts/setup_and_train_cifar10.sh
+```
+
+## Run baseline vs WDRO vs CDRO comparison end to end
+
+```bash
+RUN_TAG=cifar10-pilot METHODS="baseline wdro cdro" DURATION_MIMG=8 \
+bash scripts/run_cifar_compare.sh
+```
+
+Notes:
+- If `TRAINER` is left unset, the script defaults to `wdro` for `wdroedm` and `advedm`, and to `baseline` for `cdroedm`.
+- `TRAINER=wdro` still requires `AUGMENT>0`.
+- `PRECOND=cdroedm` currently supports only `TRAINER=baseline`.
+- `DRY_RUN=1` skips the GPU check and forwards `--dry-run` to `train.py`.
 
 Quick debug eval note:
 - With `DEBUG_EVAL=1`, training writes interval diagnostics under `run_dir/quick_eval/`:

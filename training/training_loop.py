@@ -100,6 +100,8 @@ def training_loop(
             torch.distributed.barrier() # other ranks follow
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
         misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
+        if hasattr(loss_fn, 'load_state_dict') and 'loss_fn_state' in data:
+            loss_fn.load_state_dict(data['loss_fn_state'])
         del data # conserve memory
     if resume_state_dump:
         dist.print0(f'Loading training state from "{resume_state_dump}"...')
@@ -108,6 +110,8 @@ def training_loop(
         data = torch.load(resume_state_dump, map_location=torch.device('cpu'), weights_only=False)
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
+        if hasattr(loss_fn, 'load_state_dict') and 'loss_fn_state' in data:
+            loss_fn.load_state_dict(data['loss_fn_state'])
         del data # conserve memory
 
     # Train.
@@ -179,6 +183,8 @@ def training_loop(
         # Save network snapshot.
         if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
             data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
+            if hasattr(loss_fn, 'state_dict'):
+                data['loss_fn_state'] = loss_fn.state_dict()
             for key, value in data.items():
                 if isinstance(value, torch.nn.Module):
                     value = copy.deepcopy(value).eval().requires_grad_(False)
@@ -192,7 +198,10 @@ def training_loop(
 
         # Save full dump of the training state.
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+            state = dict(net=net, optimizer_state=optimizer.state_dict())
+            if hasattr(loss_fn, 'state_dict'):
+                state['loss_fn_state'] = loss_fn.state_dict()
+            torch.save(state, os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
 
         # Update logs.
         training_stats.default_collector.update()

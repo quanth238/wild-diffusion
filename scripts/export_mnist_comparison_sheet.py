@@ -13,8 +13,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", type=Path, required=True, help="Path to MNIST ImageFolder directory.")
     parser.add_argument("--baseline-samples", type=Path, required=True, help="Directory containing baseline PNG samples.")
     parser.add_argument("--wdro-samples", type=Path, required=True, help="Directory containing WDRO PNG samples.")
+    parser.add_argument("--cdro-samples", type=Path, default=None, help="Optional directory containing CDRO PNG samples.")
     parser.add_argument("--baseline-eval", type=Path, default=None, help="Optional baseline evaluation_result.json.")
     parser.add_argument("--wdro-eval", type=Path, default=None, help="Optional WDRO evaluation_result.json.")
+    parser.add_argument("--cdro-eval", type=Path, default=None, help="Optional CDRO evaluation_result.json.")
     parser.add_argument("--output", type=Path, required=True, help="Output PNG path.")
     parser.add_argument("--per-class", type=int, default=8, help="Number of real MNIST examples per class.")
     parser.add_argument("--generated-count", type=int, default=80, help="Number of generated examples per method.")
@@ -91,13 +93,20 @@ def main() -> None:
     real_paths = collect_real_examples(args.dataset_dir, args.per_class)
     baseline_paths = collect_generated_examples(args.baseline_samples, args.generated_count)
     wdro_paths = collect_generated_examples(args.wdro_samples, args.generated_count)
+    cdro_paths = (
+        collect_generated_examples(args.cdro_samples, args.generated_count)
+        if args.cdro_samples is not None
+        else None
+    )
 
     real_grid = make_grid(real_paths, cols=args.cols, scale=args.scale, pad=args.pad)
     baseline_grid = make_grid(baseline_paths, cols=args.cols, scale=args.scale, pad=args.pad)
     wdro_grid = make_grid(wdro_paths, cols=args.cols, scale=args.scale, pad=args.pad)
+    cdro_grid = make_grid(cdro_paths, cols=args.cols, scale=args.scale, pad=args.pad) if cdro_paths is not None else None
 
     baseline_fid = load_eval_fid(args.baseline_eval)
     wdro_fid = load_eval_fid(args.wdro_eval)
+    cdro_fid = load_eval_fid(args.cdro_eval)
 
     panels: list[tuple[str, Image.Image]] = [
         (f"Real MNIST ({args.per_class} per class)", real_grid),
@@ -112,6 +121,14 @@ def main() -> None:
             wdro_grid,
         ),
     ]
+    if cdro_grid is not None:
+        panels.append(
+            (
+                f"CDRO generated"
+                + (f"  |  FID {cdro_fid:.3f}" if cdro_fid is not None else ""),
+                cdro_grid,
+            )
+        )
 
     label_height = 28
     margin = 12

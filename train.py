@@ -36,7 +36,7 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm',       type=click.Choice(['wdroedm', 'advedm']), default='wdroedm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm|cdroedm',       type=click.Choice(['wdroedm', 'advedm', 'cdroedm']), default='wdroedm', show_default=True)
 @click.option('--trainer',       help='Training loop', metavar='baseline|wdro',                     type=click.Choice(['baseline', 'wdro']), default='wdro', show_default=True)
 @click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
 @click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
@@ -44,6 +44,17 @@ def parse_int_list(s):
 @click.option('--wdro-step-size',help='WDRO inner ascent step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=1e-3, show_default=True)
 @click.option('--wdro-gamma',    help='WDRO penalty gamma', metavar='FLOAT',                           type=click.FloatRange(min=0), default=1.0, show_default=True)
 @click.option('--wdro-p-adv',    help='Probability of generating adversarial batch', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.3, show_default=True)
+@click.option('--cdro-mix',      help='CDRO robust loss mix weight', metavar='FLOAT',                  type=click.FloatRange(min=0, max=1), default=0.3, show_default=True)
+@click.option('--cdro-adv-steps',help='CDRO inner ascent steps', metavar='INT',                        type=click.IntRange(min=1), default=2, show_default=True)
+@click.option('--cdro-step-size',help='CDRO inner ascent step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=0.02, show_default=True)
+@click.option('--cdro-max-delta',help='CDRO max RMS perturbation radius in image space', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.05, show_default=True)
+@click.option('--cdro-rho',      help='CDRO target transport budget', metavar='FLOAT',                 type=click.FloatRange(min=0), default=1e-4, show_default=True)
+@click.option('--cdro-lambda-init', help='CDRO initial dual variable', metavar='FLOAT',                type=click.FloatRange(min=0), default=0.1, show_default=True)
+@click.option('--cdro-lambda-lr', help='CDRO dual update step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=1e-3, show_default=True)
+@click.option('--cdro-sigma-floor', help='CDRO sigma floor below which control vanishes', metavar='FLOAT', type=click.FloatRange(min=0), default=0.0, show_default=True)
+@click.option('--cdro-sigma-cut', help='CDRO sigma cutoff above which control vanishes', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.5, show_default=True)
+@click.option('--cdro-gate-power', help='CDRO sigma gate exponent', metavar='FLOAT',                   type=click.FloatRange(min=0, min_open=True), default=2.0, show_default=True)
+@click.option('--cdro-delta-space', help='CDRO perturbation parameterization', metavar='image|noise',  type=click.Choice(['image', 'noise']), default='image', show_default=True)
 @click.option('--debug-eval',    help='Run quick debug evaluation at init and each WDRO interval', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--debug-eval-init', help='Run quick debug evaluation at training start', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--debug-eval-num', help='Number of generated images for quick FID', metavar='INT', type=click.IntRange(min=2), default=512, show_default=True)
@@ -133,10 +144,29 @@ def main(**kwargs):
     if opts.precond == 'advedm':
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLossAdv'
+    elif opts.precond == 'cdroedm':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
+        c.loss_kwargs.class_name = 'training.loss.EDMLossCDRO'
+        c.loss_kwargs.update(
+            robust_mix=opts.cdro_mix,
+            adv_steps=opts.cdro_adv_steps,
+            adv_step_size=opts.cdro_step_size,
+            max_delta=opts.cdro_max_delta,
+            rho_target=opts.cdro_rho,
+            lambda_init=opts.cdro_lambda_init,
+            lambda_lr=opts.cdro_lambda_lr,
+            sigma_floor=opts.cdro_sigma_floor,
+            sigma_cut=opts.cdro_sigma_cut,
+            gate_power=opts.cdro_gate_power,
+            delta_space=opts.cdro_delta_space,
+        )
     else:
         assert opts.precond == 'wdroedm'
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLossWdro'
+
+    if opts.precond == 'cdroedm' and opts.trainer != 'baseline':
+        raise click.ClickException('--precond=cdroedm currently supports only --trainer=baseline')
 
     # Network options.
     if opts.cbase is not None:
@@ -237,6 +267,13 @@ def main(**kwargs):
             dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
             dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
             dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
+    if opts.precond == 'cdroedm':
+        dist.print0(f'CDRO mix/steps/step:     {opts.cdro_mix}/{opts.cdro_adv_steps}/{opts.cdro_step_size}')
+        dist.print0(f'CDRO max_delta/rho:      {opts.cdro_max_delta}/{opts.cdro_rho}')
+        dist.print0(f'CDRO lambda init/lr:     {opts.cdro_lambda_init}/{opts.cdro_lambda_lr}')
+        dist.print0(f'CDRO sigma floor/cut:    {opts.cdro_sigma_floor}/{opts.cdro_sigma_cut}')
+        dist.print0(f'CDRO gate power:         {opts.cdro_gate_power}')
+        dist.print0(f'CDRO delta space:        {opts.cdro_delta_space}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')

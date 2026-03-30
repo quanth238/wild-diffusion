@@ -23,9 +23,12 @@ MNIST_DIR="${MNIST_DIR:-${DATA_ROOT}/mnist-32x32-train}"
 OUTDIR="${OUTDIR:-${DEFAULT_OUTDIR}}"
 
 TRAINER="${TRAINER:-baseline}"   # baseline|wdro
-PRECOND="${PRECOND:-wdroedm}"    # wdroedm|advedm
+PRECOND="${PRECOND:-wdroedm}"    # wdroedm|advedm|cdroedm
 COND="${COND:-1}"
 ARCH="${ARCH:-ddpmpp}"
+CBASE="${CBASE:-}"
+CRES="${CRES:-}"
+DROPOUT="${DROPOUT:-}"
 DURATION_MIMG="${DURATION_MIMG:-10}"
 BATCH="${BATCH:-512}"
 BATCH_GPU="${BATCH_GPU:-256}"
@@ -51,6 +54,17 @@ WDRO_K="${WDRO_K:-3}"
 WDRO_STEP_SIZE="${WDRO_STEP_SIZE:-0.01}"
 WDRO_GAMMA="${WDRO_GAMMA:-1.0}"
 WDRO_P_ADV="${WDRO_P_ADV:-1.0}"
+CDRO_MIX="${CDRO_MIX:-0.3}"
+CDRO_ADV_STEPS="${CDRO_ADV_STEPS:-2}"
+CDRO_STEP_SIZE="${CDRO_STEP_SIZE:-0.02}"
+CDRO_MAX_DELTA="${CDRO_MAX_DELTA:-0.05}"
+CDRO_RHO="${CDRO_RHO:-1e-4}"
+CDRO_LAMBDA_INIT="${CDRO_LAMBDA_INIT:-0.1}"
+CDRO_LAMBDA_LR="${CDRO_LAMBDA_LR:-1e-3}"
+CDRO_SIGMA_FLOOR="${CDRO_SIGMA_FLOOR:-0.0}"
+CDRO_SIGMA_CUT="${CDRO_SIGMA_CUT:-0.5}"
+CDRO_GATE_POWER="${CDRO_GATE_POWER:-2.0}"
+CDRO_DELTA_SPACE="${CDRO_DELTA_SPACE:-image}"
 DEBUG_EVAL="${DEBUG_EVAL:-0}"
 DEBUG_EVAL_INIT="${DEBUG_EVAL_INIT:-1}"
 DEBUG_EVAL_NUM="${DEBUG_EVAL_NUM:-128}"
@@ -93,8 +107,10 @@ if pct < 1 or pct > 100:
     raise SystemExit("[ERROR] MNIST_TRAIN_PERCENT must be in [1, 100].")
 if "${TRAINER}" not in {"baseline", "wdro"}:
     raise SystemExit("[ERROR] TRAINER must be one of: baseline, wdro")
-if "${PRECOND}" not in {"wdroedm", "advedm"}:
-    raise SystemExit("[ERROR] PRECOND must be one of: wdroedm, advedm")
+if "${PRECOND}" not in {"wdroedm", "advedm", "cdroedm"}:
+    raise SystemExit("[ERROR] PRECOND must be one of: wdroedm, advedm, cdroedm")
+if "${PRECOND}" == "cdroedm" and "${TRAINER}" != "baseline":
+    raise SystemExit("[ERROR] PRECOND=cdroedm currently requires TRAINER=baseline")
 PY
 
 if [[ -z "${TRAIN_MNIST_DIR}" ]]; then
@@ -212,6 +228,13 @@ echo "[INFO] TRAINER=${TRAINER}"
 echo "[INFO] PRECOND=${PRECOND}"
 echo "[INFO] MNIST_TRAIN_PERCENT=${MNIST_TRAIN_PERCENT}"
 echo "[INFO] OUTDIR=${OUTDIR}"
+if [[ "${PRECOND}" == "cdroedm" ]]; then
+  echo "[INFO] CDRO mix/steps/step=${CDRO_MIX}/${CDRO_ADV_STEPS}/${CDRO_STEP_SIZE}"
+  echo "[INFO] CDRO max_delta/rho=${CDRO_MAX_DELTA}/${CDRO_RHO}"
+  echo "[INFO] CDRO lambda init/lr=${CDRO_LAMBDA_INIT}/${CDRO_LAMBDA_LR}"
+  echo "[INFO] CDRO sigma cut/power=${CDRO_SIGMA_CUT}/${CDRO_GATE_POWER}"
+  echo "[INFO] CDRO delta_space=${CDRO_DELTA_SPACE}"
+fi
 
 if [[ "${INSTALL_ONLY}" == "1" ]]; then
   echo "[INFO] INSTALL_ONLY=1, dependency setup completed. Exiting before dataset prep/training."
@@ -297,6 +320,17 @@ train_cmd=(
   "--wdro-step-size=${WDRO_STEP_SIZE}"
   "--wdro-gamma=${WDRO_GAMMA}"
   "--wdro-p-adv=${WDRO_P_ADV}"
+  "--cdro-mix=${CDRO_MIX}"
+  "--cdro-adv-steps=${CDRO_ADV_STEPS}"
+  "--cdro-step-size=${CDRO_STEP_SIZE}"
+  "--cdro-max-delta=${CDRO_MAX_DELTA}"
+  "--cdro-rho=${CDRO_RHO}"
+  "--cdro-lambda-init=${CDRO_LAMBDA_INIT}"
+  "--cdro-lambda-lr=${CDRO_LAMBDA_LR}"
+  "--cdro-sigma-floor=${CDRO_SIGMA_FLOOR}"
+  "--cdro-sigma-cut=${CDRO_SIGMA_CUT}"
+  "--cdro-gate-power=${CDRO_GATE_POWER}"
+  "--cdro-delta-space=${CDRO_DELTA_SPACE}"
   "--debug-eval=${DEBUG_EVAL}"
   "--debug-eval-init=${DEBUG_EVAL_INIT}"
   "--debug-eval-num=${DEBUG_EVAL_NUM}"
@@ -317,6 +351,18 @@ fi
 
 if [[ -n "${BATCH_GPU}" ]]; then
   train_cmd+=("--batch-gpu=${BATCH_GPU}")
+fi
+
+if [[ -n "${CBASE}" ]]; then
+  train_cmd+=("--cbase=${CBASE}")
+fi
+
+if [[ -n "${CRES}" ]]; then
+  train_cmd+=("--cres=${CRES}")
+fi
+
+if [[ -n "${DROPOUT}" ]]; then
+  train_cmd+=("--dropout=${DROPOUT}")
 fi
 
 if [[ -n "${TICK}" ]]; then
