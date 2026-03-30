@@ -46,6 +46,7 @@ MNIST_TRAIN_PERCENT="${MNIST_TRAIN_PERCENT:-100}"
 MNIST_TRAIN_SEED="${MNIST_TRAIN_SEED:-0}"
 TRAIN_MNIST_DIR="${TRAIN_MNIST_DIR:-}"
 RESUME="${RESUME:-}"
+TRANSFER="${TRANSFER:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
 WDRO_WARMUP_RATIO="${WDRO_WARMUP_RATIO:-0.2}"
@@ -61,6 +62,8 @@ CDRO_MAX_DELTA="${CDRO_MAX_DELTA:-0.05}"
 CDRO_RHO="${CDRO_RHO:-1e-4}"
 CDRO_LAMBDA_INIT="${CDRO_LAMBDA_INIT:-0.1}"
 CDRO_LAMBDA_LR="${CDRO_LAMBDA_LR:-1e-3}"
+CDRO_START_KIMG="${CDRO_START_KIMG:-0.0}"
+CDRO_RAMP_KIMG="${CDRO_RAMP_KIMG:-0.0}"
 CDRO_SIGMA_FLOOR="${CDRO_SIGMA_FLOOR:-0.0}"
 CDRO_SIGMA_CUT="${CDRO_SIGMA_CUT:-0.5}"
 CDRO_GATE_POWER="${CDRO_GATE_POWER:-2.0}"
@@ -83,6 +86,18 @@ DATASET_ONLY="${DATASET_ONLY:-0}"
 PREPARE_MNIST="${PREPARE_MNIST:-auto}"  # auto|0|1
 MNIST_RGB="${MNIST_RGB:-0}"
 MNIST_FORCE_PREPARE="${MNIST_FORCE_PREPARE:-0}"
+
+if [[ -n "${RESUME}" && -n "${TRANSFER}" ]]; then
+  echo "[ERROR] RESUME and TRANSFER cannot both be set."
+  exit 1
+fi
+
+if [[ -n "${TRANSFER}" ]]; then
+  if [[ ! -f "${TRANSFER}" ]]; then
+    echo "[ERROR] TRANSFER file not found: ${TRANSFER}"
+    exit 1
+  fi
+fi
 
 if [[ -n "${RESUME}" ]]; then
   if [[ ! -f "${RESUME}" ]]; then
@@ -228,11 +243,16 @@ echo "[INFO] TRAINER=${TRAINER}"
 echo "[INFO] PRECOND=${PRECOND}"
 echo "[INFO] MNIST_TRAIN_PERCENT=${MNIST_TRAIN_PERCENT}"
 echo "[INFO] OUTDIR=${OUTDIR}"
+if [[ -n "${TRANSFER}" ]]; then
+  echo "[INFO] TRANSFER=${TRANSFER}"
+fi
 if [[ "${PRECOND}" == "cdroedm" ]]; then
   echo "[INFO] CDRO mix/steps/step=${CDRO_MIX}/${CDRO_ADV_STEPS}/${CDRO_STEP_SIZE}"
   echo "[INFO] CDRO max_delta/rho=${CDRO_MAX_DELTA}/${CDRO_RHO}"
   echo "[INFO] CDRO lambda init/lr=${CDRO_LAMBDA_INIT}/${CDRO_LAMBDA_LR}"
-  echo "[INFO] CDRO sigma cut/power=${CDRO_SIGMA_CUT}/${CDRO_GATE_POWER}"
+  echo "[INFO] CDRO start/ramp kimg=${CDRO_START_KIMG}/${CDRO_RAMP_KIMG}"
+  echo "[INFO] CDRO sigma floor/cut=${CDRO_SIGMA_FLOOR}/${CDRO_SIGMA_CUT}"
+  echo "[INFO] CDRO gate power=${CDRO_GATE_POWER}"
   echo "[INFO] CDRO delta_space=${CDRO_DELTA_SPACE}"
 fi
 
@@ -327,6 +347,8 @@ train_cmd=(
   "--cdro-rho=${CDRO_RHO}"
   "--cdro-lambda-init=${CDRO_LAMBDA_INIT}"
   "--cdro-lambda-lr=${CDRO_LAMBDA_LR}"
+  "--cdro-start-kimg=${CDRO_START_KIMG}"
+  "--cdro-ramp-kimg=${CDRO_RAMP_KIMG}"
   "--cdro-sigma-floor=${CDRO_SIGMA_FLOOR}"
   "--cdro-sigma-cut=${CDRO_SIGMA_CUT}"
   "--cdro-gate-power=${CDRO_GATE_POWER}"
@@ -342,6 +364,10 @@ train_cmd=(
 
 if [[ -n "${DEBUG_EVAL_REF}" ]]; then
   train_cmd+=("--debug-eval-ref=${DEBUG_EVAL_REF}")
+fi
+
+if [[ -n "${TRANSFER}" ]]; then
+  train_cmd+=("--transfer=${TRANSFER}")
 fi
 
 if [[ -n "${RESUME}" ]]; then

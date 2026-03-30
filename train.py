@@ -51,6 +51,8 @@ def parse_int_list(s):
 @click.option('--cdro-rho',      help='CDRO target transport budget', metavar='FLOAT',                 type=click.FloatRange(min=0), default=1e-4, show_default=True)
 @click.option('--cdro-lambda-init', help='CDRO initial dual variable', metavar='FLOAT',                type=click.FloatRange(min=0), default=0.1, show_default=True)
 @click.option('--cdro-lambda-lr', help='CDRO dual update step size', metavar='FLOAT',                  type=click.FloatRange(min=0, min_open=True), default=1e-3, show_default=True)
+@click.option('--cdro-start-kimg', help='CDRO activation start in kimg', metavar='FLOAT',              type=click.FloatRange(min=0), default=0.0, show_default=True)
+@click.option('--cdro-ramp-kimg', help='CDRO activation ramp length in kimg', metavar='FLOAT',         type=click.FloatRange(min=0), default=0.0, show_default=True)
 @click.option('--cdro-sigma-floor', help='CDRO sigma floor below which control vanishes', metavar='FLOAT', type=click.FloatRange(min=0), default=0.0, show_default=True)
 @click.option('--cdro-sigma-cut', help='CDRO sigma cutoff above which control vanishes', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.5, show_default=True)
 @click.option('--cdro-gate-power', help='CDRO sigma gate exponent', metavar='FLOAT',                   type=click.FloatRange(min=0, min_open=True), default=2.0, show_default=True)
@@ -155,6 +157,8 @@ def main(**kwargs):
             rho_target=opts.cdro_rho,
             lambda_init=opts.cdro_lambda_init,
             lambda_lr=opts.cdro_lambda_lr,
+            start_kimg=opts.cdro_start_kimg,
+            ramp_kimg=opts.cdro_ramp_kimg,
             sigma_floor=opts.cdro_sigma_floor,
             sigma_cut=opts.cdro_sigma_cut,
             gate_power=opts.cdro_gate_power,
@@ -271,6 +275,7 @@ def main(**kwargs):
         dist.print0(f'CDRO mix/steps/step:     {opts.cdro_mix}/{opts.cdro_adv_steps}/{opts.cdro_step_size}')
         dist.print0(f'CDRO max_delta/rho:      {opts.cdro_max_delta}/{opts.cdro_rho}')
         dist.print0(f'CDRO lambda init/lr:     {opts.cdro_lambda_init}/{opts.cdro_lambda_lr}')
+        dist.print0(f'CDRO start/ramp kimg:    {opts.cdro_start_kimg}/{opts.cdro_ramp_kimg}')
         dist.print0(f'CDRO sigma floor/cut:    {opts.cdro_sigma_floor}/{opts.cdro_sigma_cut}')
         dist.print0(f'CDRO gate power:         {opts.cdro_gate_power}')
         dist.print0(f'CDRO delta space:        {opts.cdro_delta_space}')

@@ -116,6 +116,8 @@ class EDMLossCDRO:
         rho_target=1e-4,
         lambda_init=0.1,
         lambda_lr=1e-3,
+        start_kimg=0.0,
+        ramp_kimg=0.0,
         sigma_floor=0.0,
         sigma_cut=0.5,
         gate_power=2.0,
@@ -131,6 +133,9 @@ class EDMLossCDRO:
         self.rho_target = rho_target
         self.lambda_dual = float(lambda_init)
         self.lambda_lr = lambda_lr
+        self.start_kimg = float(start_kimg)
+        self.ramp_kimg = float(ramp_kimg)
+        self.current_kimg = 0.0
         self.sigma_floor = sigma_floor
         self.sigma_cut = sigma_cut
         self.gate_power = gate_power
@@ -146,6 +151,22 @@ class EDMLossCDRO:
             return
         self.lambda_dual = float(state_dict.get("lambda_dual", self.lambda_dual))
 
+    def set_training_progress(self, *, cur_nimg=None, cur_kimg=None, total_kimg=None):
+        if cur_kimg is not None:
+            self.current_kimg = float(cur_kimg)
+        elif cur_nimg is not None:
+            self.current_kimg = float(cur_nimg) / 1000.0
+
+    def activation_scale(self):
+        start_kimg = max(float(getattr(self, "start_kimg", 0.0)), 0.0)
+        ramp_kimg = max(float(getattr(self, "ramp_kimg", 0.0)), 0.0)
+        current_kimg = float(getattr(self, "current_kimg", 0.0))
+        if current_kimg < start_kimg:
+            return 0.0
+        if ramp_kimg <= 0.0:
+            return 1.0
+        return min(max((current_kimg - start_kimg) / ramp_kimg, 0.0), 1.0)
+
     def sigma_gate(self, sigma):
         sigma_cut = max(self.sigma_cut, 1e-8)
         gate = (1.0 - sigma / sigma_cut).clamp(min=0.0, max=1.0)
@@ -155,6 +176,7 @@ class EDMLossCDRO:
                 raise ValueError(f"sigma_floor ({sigma_floor}) must be smaller than sigma_cut ({sigma_cut})")
             ramp = ((sigma - sigma_floor) / (sigma_cut - sigma_floor)).clamp(min=0.0, max=1.0)
             gate = gate * ramp
+        gate = gate * self.activation_scale()
         return gate ** self.gate_power
 
     def delta_scale(self, sigma, gate):
@@ -280,6 +302,7 @@ class EDMLossCDRO:
 
         training_stats.report("CDRO/lambda_dual", self.lambda_dual)
         training_stats.report("CDRO/mean_transport_cost", mean_transport)
+        training_stats.report("CDRO/activation_scale", self.activation_scale())
         training_stats.report("CDRO/gate_mean", gate.mean())
         training_stats.report("CDRO/raw_delta_rms", delta.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
         training_stats.report("CDRO/applied_delta_rms", applied_delta.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
