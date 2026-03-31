@@ -583,21 +583,11 @@ def run_experiment(cfg) -> dict:
             "dataset_backend": dataset.name,
             "data_shape": list(dataset.data_shape),
             "limited_data_enabled": bool(cfg.limited_data_enabled),
-            "image_split_seed": int(getattr(cfg, "image_split_seed", 0)),
             "train_points_per_mode": (
                 int(cfg.train_points_per_mode) if dataset.name == "toy_gmm" else None
             ),
             "train_pool_size": int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None,
             "val_pool_size": int(dataset.val_pool.shape[0]),
-            "population_size": (
-                int(dataset.metadata.get("population_size"))
-                if dataset.metadata.get("population_size") is not None
-                else None
-            ),
-            "train_selection_policy": dataset.metadata.get("train_selection_policy"),
-            "train_subset_size_resolved": dataset.metadata.get("train_subset_size_resolved"),
-            "val_subset_size_resolved": dataset.metadata.get("val_subset_size_resolved"),
-            "train_subset_fraction_resolved": dataset.metadata.get("train_subset_fraction_resolved"),
             "train_mode_counts": (
                 [
                     int(v)

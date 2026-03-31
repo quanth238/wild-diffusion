@@ -197,13 +197,122 @@ def _split_indices(total: int, train_size: int, val_size: int, seed: int):
 
 
 def _subsample_indices(total: int, subset_size: int, seed: int) -> torch.Tensor:
-    """Pick a deterministic random subset of indices without replacement."""
+    """Pick a deterministic random subset of indices without replacement.
+
+    This function keeps backward compatibility for global random subsampling.
+    New code paths may call it with additional keyword arguments.
+    """
+
+    return _subsample_indices_with_policy(
+        total=total,
+        subset_size=subset_size,
+        seed=seed,
+        labels=None,
+        strategy="global",
+    )
+
+
+def _resolve_subset_size(total: int, fallback_size: int, percent: float) -> int:
+    """Resolve subset size from percent if provided, else from fallback size."""
+
+    total = int(total)
+    if total <= 0:
+        raise ValueError(f"total must be > 0, got {total}")
+    if float(percent) > 0:
+        resolved = int(round(total * (float(percent) / 100.0)))
+        return min(max(resolved, 1), total)
+    if int(fallback_size) <= 0:
+        raise ValueError(f"fallback_size must be > 0 when percent <= 0, got {fallback_size}")
+    return min(int(fallback_size), total)
+
+
+def _subsample_indices_stratified(labels: torch.Tensor, subset_size: int, seed: int) -> torch.Tensor:
+    """Deterministic stratified subset preserving class proportions as closely as possible."""
+
+    if labels.ndim != 1:
+        raise ValueError(f"labels must be rank-1, got shape={tuple(labels.shape)}")
+    if labels.numel() == 0:
+        raise ValueError("labels must be non-empty for stratified sampling.")
+
+    labels = labels.to(dtype=torch.long, device="cpu")
+    total = int(labels.shape[0])
+    if subset_size <= 0:
+        raise ValueError(f"subset_size must be > 0, got {subset_size}")
+    subset_size = min(int(subset_size), total)
+
+    max_label = int(labels.max().item())
+    counts = torch.bincount(labels, minlength=max_label + 1).to(dtype=torch.long)
+    raw = counts.to(dtype=torch.float64) * (float(subset_size) / float(total))
+    quotas = torch.floor(raw).to(dtype=torch.long)
+
+    remainder = subset_size - int(quotas.sum().item())
+    if remainder > 0:
+        frac = raw - quotas.to(dtype=torch.float64)
+        order = torch.argsort(frac, descending=True)
+        capacity = counts - quotas
+        for cls in order.tolist():
+            if remainder <= 0:
+                break
+            if capacity[cls] > 0:
+                quotas[cls] += 1
+                capacity[cls] -= 1
+                remainder -= 1
+        if remainder > 0:
+            # Fallback: fill leftover quota from classes with remaining capacity.
+            order = torch.argsort(counts - quotas, descending=True)
+            for cls in order.tolist():
+                while remainder > 0 and quotas[cls] < counts[cls]:
+                    quotas[cls] += 1
+                    remainder -= 1
+                if remainder <= 0:
+                    break
+    if int(quotas.sum().item()) != subset_size:
+        raise RuntimeError(
+            f"Stratified allocation failed: expected {subset_size}, got {int(quotas.sum().item())}"
+        )
+
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+    perm = torch.randperm(total, generator=g)
+    taken = torch.zeros_like(quotas)
+    selected = []
+    for idx in perm.tolist():
+        cls = int(labels[idx].item())
+        if taken[cls] < quotas[cls]:
+            selected.append(idx)
+            taken[cls] += 1
+            if len(selected) == subset_size:
+                break
+
+    if len(selected) != subset_size:
+        raise RuntimeError(
+            f"Stratified sampling selected {len(selected)} samples, expected {subset_size}."
+        )
+    return torch.tensor(selected, dtype=torch.long)
+
+
+def _subsample_indices_with_policy(
+    total: int,
+    subset_size: int,
+    seed: int,
+    labels: Optional[torch.Tensor] = None,
+    strategy: str = "global",
+) -> torch.Tensor:
+    """Pick a deterministic subset with policy: global random or stratified by label."""
 
     if subset_size <= 0:
         raise ValueError(f"subset_size must be > 0, got {subset_size}")
+    total = int(total)
+    subset_size = min(int(subset_size), total)
+    strategy = str(strategy).lower()
+    if strategy == "stratified":
+        if labels is None:
+            raise ValueError("labels are required when strategy='stratified'.")
+        return _subsample_indices_stratified(labels=labels, subset_size=subset_size, seed=seed)
+    if strategy != "global":
+        raise ValueError(f"Unknown subset strategy '{strategy}'. Expected 'global' or 'stratified'.")
     g = torch.Generator(device="cpu")
     g.manual_seed(int(seed))
-    subset_size = min(int(subset_size), int(total))
     return torch.randperm(total, generator=g)[:subset_size]
 
 
@@ -427,8 +536,43 @@ def _build_mnist_bundle(cfg, device: torch.device) -> DatasetBundle:
         train_images = F.interpolate(train_images, size=size, mode="bilinear", align_corners=False)
         test_images = F.interpolate(test_images, size=size, mode="bilinear", align_corners=False)
 
-    train_idx = _subsample_indices(train_images.shape[0], cfg.image_train_size, cfg.image_split_seed)
-    val_idx = _subsample_indices(test_images.shape[0], cfg.image_val_size, cfg.image_split_seed + 1001)
+    if cfg.mnist_use_percent_split:
+        train_subset_size = _resolve_subset_size(
+            total=int(train_images.shape[0]),
+            fallback_size=cfg.image_train_size,
+            percent=float(cfg.mnist_train_percent),
+        )
+        val_subset_size = _resolve_subset_size(
+            total=int(test_images.shape[0]),
+            fallback_size=cfg.image_val_size,
+            percent=float(cfg.mnist_val_percent),
+        )
+    else:
+        train_subset_size = _resolve_subset_size(
+            total=int(train_images.shape[0]),
+            fallback_size=cfg.image_train_size,
+            percent=-1.0,
+        )
+        val_subset_size = _resolve_subset_size(
+            total=int(test_images.shape[0]),
+            fallback_size=cfg.image_val_size,
+            percent=-1.0,
+        )
+
+    train_idx = _subsample_indices_with_policy(
+        total=int(train_images.shape[0]),
+        subset_size=int(train_subset_size),
+        seed=int(cfg.image_split_seed),
+        labels=train_labels,
+        strategy="stratified",
+    )
+    val_idx = _subsample_indices_with_policy(
+        total=int(test_images.shape[0]),
+        subset_size=int(val_subset_size),
+        seed=int(cfg.image_split_seed + 1001),
+        labels=test_labels,
+        strategy="stratified",
+    )
 
     train_pool_limited_cpu = train_images[train_idx].clone()
     train_labels_limited_cpu = train_labels[train_idx].clone()
@@ -476,6 +620,17 @@ def _build_mnist_bundle(cfg, device: torch.device) -> DatasetBundle:
         metadata={
             "num_classes": 10,
             "class_names": [str(i) for i in range(10)],
+            "train_selection_policy": {
+                "limited_data_enabled": bool(cfg.limited_data_enabled),
+                "mnist_use_percent_split": bool(cfg.mnist_use_percent_split),
+                "mnist_train_percent": float(cfg.mnist_train_percent),
+                "mnist_val_percent": float(cfg.mnist_val_percent),
+                "mnist_subset_sampling": "stratified",
+                "image_split_seed": int(cfg.image_split_seed),
+            },
+            "train_subset_size_resolved": int(train_pool_limited_cpu.shape[0]),
+            "val_subset_size_resolved": int(val_pool_cpu.shape[0]),
+            "train_subset_fraction_resolved": float(train_pool_limited_cpu.shape[0]) / float(train_images.shape[0]),
             "val_pool_labels": val_labels_cpu,
             "population_size": int(population_pool_cpu.shape[0]),
             "enable_nearest_reference_distance": False,

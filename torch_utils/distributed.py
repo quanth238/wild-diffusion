@@ -13,7 +13,7 @@ from . import training_stats
 
 def init():
     if 'MASTER_ADDR' not in os.environ:
-        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
     if 'MASTER_PORT' not in os.environ:
         os.environ['MASTER_PORT'] = '29500'
     if 'RANK' not in os.environ:

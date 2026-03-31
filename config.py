@@ -18,12 +18,6 @@ class ToyConfig:
     image_train_size: int = 2000
     image_val_size: int = 2000
     image_split_seed: int = 0
-    # MNIST limited-data controls (for fair low-data protocols):
-    # - when enabled, train/val subset sizes are resolved by percent of full split.
-    # - keep image_*_size as backward-compatible fallback by disabling this mode.
-    mnist_use_percent_split: bool = True
-    mnist_train_percent: float = 20.0
-    mnist_val_percent: float = 100.0
     image_gate_min_generated_std: float = 0.10
     image_gate_min_endpoint_std: float = 0.10
     image_gate_max_endpoint_recovery_mse: float = 0.30

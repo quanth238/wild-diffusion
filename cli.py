@@ -88,22 +88,10 @@ def _validate_config(cfg: ToyConfig) -> None:
             )
         if cfg.image_size <= 0:
             raise ValueError(f"--image-size must be > 0, got {cfg.image_size}")
-        if cfg.mnist_use_percent_split:
-            if cfg.mnist_train_percent <= 0 or cfg.mnist_train_percent > 100:
-                raise ValueError(
-                    f"--mnist-train-percent must be in (0, 100], got {cfg.mnist_train_percent}"
-                )
-            if cfg.mnist_val_percent <= 0 or cfg.mnist_val_percent > 100:
-                raise ValueError(
-                    f"--mnist-val-percent must be in (0, 100], got {cfg.mnist_val_percent}"
-                )
-        else:
-            if cfg.image_train_size <= 0 or cfg.image_val_size <= 0:
-                raise ValueError(
-                    "--image-train-size and --image-val-size must be > 0 when "
-                    "--disable-mnist-percent-split is active, got "
-                    f"{cfg.image_train_size}, {cfg.image_val_size}"
-                )
+        if cfg.image_train_size <= 0 or cfg.image_val_size <= 0:
+            raise ValueError(
+                f"--image-train-size and --image-val-size must be > 0, got {cfg.image_train_size}, {cfg.image_val_size}"
+            )
 
     # Keep validation strict on impossible settings only; do not emit runtime warnings
     # that might be misinterpreted as implementation errors.
@@ -135,14 +123,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-train-size", type=int, default=ToyConfig.image_train_size)
     parser.add_argument("--image-val-size", type=int, default=ToyConfig.image_val_size)
     parser.add_argument("--image-split-seed", type=int, default=ToyConfig.image_split_seed)
-    parser.add_argument(
-        "--mnist-use-percent-split",
-        action="store_true",
-        default=ToyConfig.mnist_use_percent_split,
-    )
-    parser.add_argument("--disable-mnist-percent-split", action="store_true")
-    parser.add_argument("--mnist-train-percent", type=float, default=ToyConfig.mnist_train_percent)
-    parser.add_argument("--mnist-val-percent", type=float, default=ToyConfig.mnist_val_percent)
     parser.add_argument("--image-gate-min-generated-std", type=float, default=ToyConfig.image_gate_min_generated_std)
     parser.add_argument("--image-gate-min-endpoint-std", type=float, default=ToyConfig.image_gate_min_endpoint_std)
     parser.add_argument(
@@ -288,7 +268,6 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     force_det_plot = bool(args_dict.pop("plot_deterministic_backward"))
     disable_ema_eval = bool(args_dict.pop("disable_ema_eval"))
     disable_limited_data = bool(args_dict.pop("disable_limited_data"))
-    disable_mnist_percent_split = bool(args_dict.pop("disable_mnist_percent_split"))
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
@@ -315,8 +294,6 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_ema_eval = False
     if disable_limited_data:
         cfg.limited_data_enabled = False
-    if disable_mnist_percent_split:
-        cfg.mnist_use_percent_split = False
     if disable_collapse_diagnostics:
         cfg.collapse_diagnostics_enabled = False
     if disable_time_dependent_kappa:

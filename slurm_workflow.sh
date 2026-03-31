@@ -31,10 +31,9 @@ python3 - <<'PY'
 import torch
 print("[torch] cuda_available:", torch.cuda.is_available())
 print("[torch] device_count:", torch.cuda.device_count())
-if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
-    raise SystemExit("[ERROR] CUDA is required for this workflow, but no GPU is visible.")
-print("[torch] current_device:", torch.cuda.current_device())
-print("[torch] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+if torch.cuda.is_available():
+    print("[torch] current_device:", torch.cuda.current_device())
+    print("[torch] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 PY
 
 # Create outputs dir if not exists
@@ -52,8 +51,8 @@ COMMON_ARGS=(
   --device=cuda
   --steps=2000
   --batch-size=128
-  --mnist-train-percent=20
-  --mnist-val-percent=100
+  --image-train-size=2000
+  --image-val-size=500
   --eval-samples=2000
   --compute-fid
   --fid-samples=2000

@@ -28,6 +28,7 @@ Current runnable targets are:
   - `shared/train_utils.py`, `shared/trainer_common.py`: shared trainer utilities + baseline trainer.
 - `versions/`: version-specific robust method implementations.
   - `versions/v2/`: hard-constrained rollout + robust trainer (implemented).
+  - `versions/v2_1/`: v2.1 non-Markovian reference rollout + hard-constrained trainer (implemented).
   - `versions/v1/`: energy-penalty rollout + robust trainer (implemented, closeness disabled).
   - `versions/wild/`: WDRO surrogate sample-level trainer (implemented).
 - `data.py`: 2D toy data generation (8-mode Gaussian ring).
@@ -276,8 +277,8 @@ python toy/run_toy.py \
   --diagnostics-kind image_basic \
   --image-channels 1 \
   --image-size 28 \
-  --image-train-size 5000 \
-  --image-val-size 2000 \
+  --mnist-train-percent 20 \
+  --mnist-val-percent 100 \
   --training-objective edm \
   --baseline-only
 
@@ -288,12 +289,18 @@ python toy/run_toy.py \
   --diagnostics-kind image_basic \
   --image-channels 1 \
   --image-size 28 \
-  --image-train-size 5000 \
-  --image-val-size 2000 \
+  --mnist-train-percent 20 \
+  --mnist-val-percent 100 \
   --training-objective score \
   --score-matching-weight-power 2.0 \
   --baseline-only
 ```
+
+Subset policy notes:
+- `--mnist-train-percent` supports faithful limited-data sweeps (`20`, `50`, `100`).
+- MNIST subset policy is fixed to **stratified per-label** to keep class proportions stable in low-data runs.
+- Use the same `--image-split-seed` across methods to compare on exactly the same train subset.
+- Legacy fixed-size mode is still available via `--disable-mnist-percent-split` + `--image-train-size/--image-val-size`.
 
 ### One-Command EDM vs Score (+ attack, v2 path-level) on MNIST
 
@@ -334,6 +341,31 @@ python toy/scripts/compare_mnist_wild_objectives.py \
 Outputs:
 - `toy_outputs_mnist_wild_compare/mnist_wildcmp_summary.json`
 - `toy_outputs_mnist_wild_compare/mnist_wildcmp_summary.png`
+
+### One-Command v2 vs v2.1 (multi-seed, auto conclusion table)
+
+```bash
+cd Wild-Diffusion
+python toy/scripts/compare_v2_vs_v21.py \
+  --outdir toy_outputs_v2_vs_v21 \
+  --prefix v2_vs_v21 \
+  --seeds 0,1,2 \
+  --device auto \
+  --mnist-train-percent 20 \
+  --mnist-val-percent 100 \
+  --steps 2000 \
+  --batch-size 128 \
+  --training-objective edm \
+  --compute-fid \
+  --fid-samples 2000 \
+  --disable-baseline-gate \
+  --v21-rho 0.8
+```
+
+Outputs:
+- `toy_outputs_v2_vs_v21/v2_vs_v21_summary_v2_vs_v21.json`
+- `toy_outputs_v2_vs_v21/v2_vs_v21_summary_v2_vs_v21.csv`
+- `toy_outputs_v2_vs_v21/v2_vs_v21_summary_v2_vs_v21.md`
 
 ## One-Command Baseline vs WILD on Toy (EDM + Score)
 
