@@ -17,6 +17,8 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--steps must be > 0, got {cfg.steps}")
     if cfg.batch_size <= 0:
         raise ValueError(f"--batch-size must be > 0, got {cfg.batch_size}")
+    if cfg.baseline_ckpt_path and not isinstance(cfg.baseline_ckpt_path, str):
+        raise ValueError("--baseline-ckpt-path must be a string path.")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
     if cfg.training_objective not in ("edm", "score"):
@@ -47,6 +49,18 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--v1-lambda-lr must be >= 0, got {cfg.v1_lambda_lr}")
     if cfg.v1_lambda_max <= 0:
         raise ValueError(f"--v1-lambda-max must be > 0, got {cfg.v1_lambda_max}")
+    if cfg.v11_step_size <= 0:
+        raise ValueError(f"--v11-step-size must be > 0, got {cfg.v11_step_size}")
+    if cfg.v11_transport_gamma < 0:
+        raise ValueError(f"--v11-transport-gamma must be >= 0, got {cfg.v11_transport_gamma}")
+    if cfg.v11_total_budget_rho < 0:
+        raise ValueError(f"--v11-total-budget-rho must be >= 0, got {cfg.v11_total_budget_rho}")
+    if cfg.v11_projection_mode not in ("global_remaining", "step_clip", "step_exact", "kappa_clip", "none"):
+        raise ValueError(
+            "--v11-projection-mode must be one of "
+            "('global_remaining', 'step_clip', 'step_exact', 'kappa_clip', 'none'), got "
+            f"{cfg.v11_projection_mode}"
+        )
     if cfg.outer_attack_weight < 0 or cfg.outer_clean_weight < 0:
         raise ValueError(
             "outer loss weights must be non-negative, got "
@@ -169,6 +183,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-ema-eval", action="store_true", default=ToyConfig.use_ema_eval)
     parser.add_argument("--disable-ema-eval", action="store_true")
     parser.add_argument("--ema-decay", type=float, default=ToyConfig.ema_decay)
+    parser.add_argument("--disable-baseline-ckpt", action="store_true")
+    parser.add_argument("--baseline-ckpt-path", type=str, default=ToyConfig.baseline_ckpt_path)
+    parser.add_argument("--baseline-ckpt-force-retrain", action="store_true", default=ToyConfig.baseline_ckpt_force_retrain)
+    parser.add_argument("--disable-baseline-ckpt-strict-meta", action="store_true")
 
     parser.add_argument("--hidden-dim", type=int, default=ToyConfig.hidden_dim)
     parser.add_argument("--lr-theta", type=float, default=ToyConfig.lr_theta)
@@ -208,6 +226,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--v1-lambda-init", type=float, default=ToyConfig.v1_lambda_init)
     parser.add_argument("--v1-lambda-lr", type=float, default=ToyConfig.v1_lambda_lr)
     parser.add_argument("--v1-lambda-max", type=float, default=ToyConfig.v1_lambda_max)
+    parser.add_argument("--v11-step-size", type=float, default=ToyConfig.v11_step_size)
+    parser.add_argument("--v11-transport-gamma", type=float, default=ToyConfig.v11_transport_gamma)
+    parser.add_argument("--v11-total-budget-rho", type=float, default=ToyConfig.v11_total_budget_rho)
+    parser.add_argument(
+        "--v11-projection-mode",
+        type=str,
+        default=ToyConfig.v11_projection_mode,
+        choices=["global_remaining", "step_clip", "step_exact", "kappa_clip", "none"],
+    )
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--v21-rho", type=float, default=ToyConfig.v21_rho)
     parser.add_argument("--use-time-dependent-kappa", action="store_true", default=ToyConfig.use_time_dependent_kappa)
@@ -282,6 +309,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     skip_checks = bool(args_dict.pop("skip_checks"))
     disable_lognorm = bool(args_dict.pop("disable_log_normal_sigma_sampling"))
     disable_auto_lognorm = bool(args_dict.pop("disable_auto_log_normal_params"))
+    disable_baseline_ckpt = bool(args_dict.pop("disable_baseline_ckpt"))
+    disable_baseline_ckpt_strict_meta = bool(args_dict.pop("disable_baseline_ckpt_strict_meta"))
     disable_baseline_gate = bool(args_dict.pop("disable_baseline_gate"))
     disable_eval_shared_terminal_noise = bool(args_dict.pop("disable_eval_shared_terminal_noise"))
     disable_eval_shared_reverse_noise = bool(args_dict.pop("disable_eval_shared_reverse_noise"))
@@ -305,6 +334,10 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.auto_log_normal_params = False
     if disable_baseline_gate:
         cfg.baseline_gate_enabled = False
+    if disable_baseline_ckpt:
+        cfg.baseline_ckpt_enabled = False
+    if disable_baseline_ckpt_strict_meta:
+        cfg.baseline_ckpt_strict_meta = False
     if disable_eval_shared_terminal_noise:
         cfg.eval_use_shared_terminal_noise = False
     if disable_eval_shared_reverse_noise:

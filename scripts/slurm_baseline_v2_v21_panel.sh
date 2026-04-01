@@ -46,7 +46,7 @@ EVAL_SAMPLES="2000"
 FID_SAMPLES="2000"
 MNIST_TRAIN_PERCENT="100"
 MNIST_VAL_PERCENT="100"
-OUTDIR="${OUTDIR:-toy_outputs_mnist_baseline_v2_v21}"
+OUTDIR="${OUTDIR:-/mnt/data/quanth/wild_diffusion_outputs/mnist_baseline_v2_v21}"
 PREFIX="${PREFIX:-mnist_fullpct_s${SEED}_t${STEPS}}"
 V21_RHO="${V21_RHO:-0.8}"
 PICK_SEED="${PICK_SEED:-7}"
@@ -64,6 +64,9 @@ export OUTDIR
 export PREFIX
 
 mkdir -p "${OUTDIR}"
+BASELINE_CKPT_DIR="${BASELINE_CKPT_DIR:-/mnt/data/quanth/models/wild_diffusion_baseline_ckpt}"
+mkdir -p "${BASELINE_CKPT_DIR}"
+BASELINE_CKPT_PATH="${BASELINE_CKPT_DIR}/baseline_edm_s${SEED}_st${STEPS}_bs${BATCH_SIZE}_hd${HIDDEN_DIM}_tp${MNIST_TRAIN_PERCENT}.pt"
 
 echo "=== Locked tuned config ==="
 echo "SEED=${SEED}"
@@ -72,6 +75,8 @@ echo "SIGMA_MIN=${SIGMA_MIN} SIGMA_MAX=${SIGMA_MAX} AUTO_LOG_NORMAL=${AUTO_LOG_N
 echo "USE_EMA_EVAL=${USE_EMA_EVAL} EMA_DECAY=${EMA_DECAY}"
 echo "MNIST_TRAIN_PERCENT=${MNIST_TRAIN_PERCENT} MNIST_VAL_PERCENT=${MNIST_VAL_PERCENT}"
 echo "OUTDIR=${OUTDIR} PREFIX=${PREFIX}"
+echo "BASELINE_CKPT_DIR=${BASELINE_CKPT_DIR}"
+echo "BASELINE_CKPT_PATH=${BASELINE_CKPT_PATH}"
 
 echo "=== Ensure MNIST FID reference ==="
 python3 toy/export_mnist_fid_ref.py
@@ -117,17 +122,20 @@ echo "=== 1/4 Baseline EDM (baseline-only) ==="
 python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
   --exp-name "${BASELINE_EXP}" \
   --method-version v2 \
+  --baseline-ckpt-path "${BASELINE_CKPT_PATH}" \
   --baseline-only
 
 echo "=== 2/4 v2 robust ==="
 python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
   --exp-name "${V2_EXP}" \
-  --method-version v2
+  --method-version v2 \
+  --baseline-ckpt-path "${BASELINE_CKPT_PATH}"
 
 echo "=== 3/4 v2.1 robust ==="
 python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
   --exp-name "${V21_EXP}" \
   --method-version 2.1 \
+  --baseline-ckpt-path "${BASELINE_CKPT_PATH}" \
   --v21-rho "${V21_RHO}"
 
 echo "=== 4/4 Build panel (Real | Baseline EDM | v2 | v2.1) ==="

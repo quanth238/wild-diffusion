@@ -1,6 +1,9 @@
 import json
 import os
 import random
+import hashlib
+import uuid
+from datetime import datetime, timezone
 from typing import Dict
 
 import numpy as np
@@ -96,6 +99,198 @@ def _print_dataset_info(cfg, dataset: DatasetBundle) -> None:
             )
 
 
+def _method_rollout_kwargs(cfg, method) -> Dict:
+    """Method-specific rollout kwargs to keep train/eval rollout behavior aligned."""
+
+    method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
+    if method_name in ("v1.1", "1.1"):
+        return {
+            "total_budget": float(cfg.v11_total_budget_rho),
+            "projection_mode": str(cfg.v11_projection_mode).lower(),
+        }
+    return {}
+
+
+def _rollout_for_eval(
+    *,
+    cfg,
+    method,
+    x0: torch.Tensor,
+    target_indices: torch.Tensor,
+    control,
+    sigma_levels: torch.Tensor,
+    kappa_by_step: torch.Tensor,
+    rollout_kwargs: Dict,
+    attack_net,
+):
+    """Method-aware eval rollout. v1.1 can override with denoiser-dependent attack."""
+
+    rollout_eval_fn = getattr(method, "rollout_eval", None)
+    if callable(rollout_eval_fn):
+        return rollout_eval_fn(
+            cfg=cfg,
+            x0=x0,
+            target_indices=target_indices,
+            attack_net=attack_net,
+            sigma_levels=sigma_levels,
+            control_radius_kappa=cfg.control_radius_kappa,
+            kappa_by_step=kappa_by_step,
+        )
+    return method.rollout_controlled_ve(
+        x0=x0,
+        target_indices=target_indices,
+        control_net=control,
+        sigma_levels=sigma_levels,
+        grad_through_control=False,
+        control_radius_kappa=cfg.control_radius_kappa,
+        kappa_by_step=kappa_by_step,
+        **rollout_kwargs,
+    )
+
+
+def _empty_baseline_history() -> Dict:
+    """Baseline history schema used when loading checkpoints without curves."""
+
+    return {"loss": [], "proxy_weighted_denoise_loss": [], "sigma_counts": []}
+
+
+def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_levels: torch.Tensor) -> Dict:
+    """Build a strict signature for fair baseline checkpoint reuse."""
+
+    train_selection_policy = dataset.metadata.get("train_selection_policy")
+    sigma_list = [float(v.item()) for v in sigma_levels.detach().cpu()]
+    # NOTE: `method_version` is intentionally excluded so v2/v2.1/v1.1 can share
+    # one identical baseline checkpoint under the same baseline data+train settings.
+    return {
+        "signature_version": 1,
+        "seed": int(cfg.seed),
+        "dataset_kind": str(dataset.name),
+        "dataset_path": str(getattr(cfg, "dataset_path", "")),
+        "dataset_val_path": str(getattr(cfg, "dataset_val_path", "")),
+        "data_shape": [int(v) for v in dataset.data_shape],
+        "limited_data_enabled": bool(cfg.limited_data_enabled),
+        "train_pool_size": int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None,
+        "val_pool_size": int(dataset.val_pool.shape[0]),
+        "train_selection_policy": train_selection_policy,
+        "train_subset_size_resolved": dataset.metadata.get("train_subset_size_resolved"),
+        "val_subset_size_resolved": dataset.metadata.get("val_subset_size_resolved"),
+        "train_subset_fraction_resolved": dataset.metadata.get("train_subset_fraction_resolved"),
+        "model_backend": str(model_bundle.name),
+        "hidden_dim": int(cfg.hidden_dim),
+        "training_objective": str(cfg.training_objective),
+        "sigma_data": float(cfg.sigma_data),
+        "n_steps_path": int(cfg.n_steps_path),
+        "sigma_min": float(cfg.sigma_min),
+        "sigma_max": float(cfg.sigma_max),
+        "sigma_levels": sigma_list,
+        "baseline_steps": int(cfg.steps),
+        "batch_size": int(cfg.batch_size),
+        "lr_theta": float(cfg.lr_theta),
+        "use_log_normal_sigma_sampling": bool(cfg.use_log_normal_sigma_sampling),
+        "p_mean": float(cfg.p_mean),
+        "p_std": float(cfg.p_std),
+        "use_ema_eval": bool(cfg.use_ema_eval),
+        "ema_decay": float(cfg.ema_decay),
+    }
+
+
+def _resolve_baseline_ckpt_path(cfg, signature: Dict) -> str:
+    """Resolve checkpoint path: explicit path or deterministic auto cache path."""
+
+    explicit = str(getattr(cfg, "baseline_ckpt_path", "")).strip()
+    if explicit:
+        return os.path.abspath(explicit)
+    sig_blob = json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    sig_hash = hashlib.sha1(sig_blob).hexdigest()[:16]
+    cache_dir = os.path.join(cfg.outdir, "_baseline_cache")
+    ensure_dir(cache_dir)
+    return os.path.join(cache_dir, f"baseline_{sig_hash}.pt")
+
+
+def _signature_mismatch_lines(current_signature: Dict, loaded_signature: Dict):
+    """Return human-readable mismatch lines for strict checkpoint validation."""
+
+    mismatches = []
+    all_keys = sorted(set(current_signature.keys()) | set(loaded_signature.keys()))
+    for key in all_keys:
+        cur = current_signature.get(key)
+        old = loaded_signature.get(key)
+        if cur != old:
+            mismatches.append(f"{key}: current={cur} saved={old}")
+    return mismatches
+
+
+def _load_baseline_checkpoint(
+    *,
+    baseline_model,
+    ckpt_path: str,
+    signature: Dict,
+    strict_meta: bool,
+):
+    """Load baseline checkpoint if available and signature is compatible."""
+
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid baseline checkpoint format (expect dict): {ckpt_path}")
+    if "baseline_state_dict" not in payload:
+        raise RuntimeError(f"Missing key 'baseline_state_dict' in baseline checkpoint: {ckpt_path}")
+
+    loaded_signature = payload.get("baseline_signature", {})
+    if not isinstance(loaded_signature, dict):
+        loaded_signature = {}
+
+    mismatch_lines = _signature_mismatch_lines(signature, loaded_signature)
+    if mismatch_lines:
+        preview = "\n  - ".join(mismatch_lines[:12])
+        if len(mismatch_lines) > 12:
+            preview += f"\n  - ... ({len(mismatch_lines) - 12} more)"
+        msg = (
+            "Baseline checkpoint signature mismatch.\n"
+            f"checkpoint={ckpt_path}\n"
+            f"  - {preview}\n"
+            "Use --baseline-ckpt-force-retrain or a different --baseline-ckpt-path."
+        )
+        if strict_meta:
+            raise RuntimeError(msg)
+        print(f"[warn] {msg}", flush=True)
+        return None
+
+    baseline_model.load_state_dict(payload["baseline_state_dict"], strict=True)
+    history = payload.get("baseline_history", _empty_baseline_history())
+    if not isinstance(history, dict):
+        history = _empty_baseline_history()
+    history.setdefault("loss", [])
+    history.setdefault("proxy_weighted_denoise_loss", [])
+    history.setdefault("sigma_counts", [])
+    return {
+        "history": history,
+        "saved_at": payload.get("saved_at"),
+        "signature": loaded_signature,
+    }
+
+
+def _save_baseline_checkpoint(
+    *,
+    ckpt_path: str,
+    baseline_eval,
+    baseline_history: Dict,
+    signature: Dict,
+) -> None:
+    """Persist baseline eval model + history + signature for later fair reuse."""
+
+    ensure_dir(os.path.dirname(ckpt_path) or ".")
+    payload = {
+        "format": "toy_baseline_ckpt_v1",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "baseline_signature": signature,
+        "baseline_history": baseline_history,
+        "baseline_state_dict": baseline_eval.state_dict(),
+    }
+    tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+
+
 def _build_baseline_gate(
     cfg,
     diagnostics,
@@ -105,6 +300,7 @@ def _build_baseline_gate(
     kappa_by_step: torch.Tensor,
     dataset: DatasetBundle,
     method,
+    rollout_kwargs: Dict,
 ) -> Dict:
     """Compute baseline acceptance gate metrics before robust phase.
 
@@ -121,14 +317,16 @@ def _build_baseline_gate(
 
     x_gate = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_gate = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    gate_roll = method.rollout_controlled_ve(
+    gate_roll = _rollout_for_eval(
+        cfg=cfg,
+        method=method,
         x0=x_gate,
         target_indices=idx_gate,
-        control_net=control,
+        control=control,
         sigma_levels=sigma_levels,
-        grad_through_control=False,
-        control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        rollout_kwargs=rollout_kwargs,
+        attack_net=baseline_eval,
     )
     gate_ref_paths = gate_roll.states_ref[:, : gate_terminal_step + 1]
     gate_rev_det = reverse_paths_from_terminal(
@@ -227,6 +425,7 @@ def run_experiment(cfg) -> dict:
         else ("robust_forced_no_gate" if not cfg.baseline_gate_enabled else "robust_with_gate")
     )
     method = resolve_method_module(cfg.method_version)
+    rollout_kwargs = _method_rollout_kwargs(cfg, method)
     if not getattr(method, "IMPLEMENTED", True):
         raise NotImplementedError(
             f"method_version='{cfg.method_version}' is marked IMPLEMENTED=False. "
@@ -293,15 +492,51 @@ def run_experiment(cfg) -> dict:
             flush=True,
         )
 
-    history_baseline, baseline_eval = train_baseline(
-        baseline,
-        centers,
-        sigma_levels,
-        cfg,
-        train_pool=dataset.train_pool,
-        sample_train_batch_fn=dataset.sample_train_batch,
-        sample_population_batch_fn=dataset.sample_population_batch,
-    )
+    baseline_signature = _build_baseline_signature(cfg, dataset, model_bundle, sigma_levels)
+    baseline_signature_hash = hashlib.sha1(
+        json.dumps(baseline_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    baseline_ckpt_path = _resolve_baseline_ckpt_path(cfg, baseline_signature)
+    baseline_ckpt_enabled = bool(getattr(cfg, "baseline_ckpt_enabled", True))
+    baseline_ckpt_force_retrain = bool(getattr(cfg, "baseline_ckpt_force_retrain", False))
+    baseline_ckpt_strict_meta = bool(getattr(cfg, "baseline_ckpt_strict_meta", True))
+    baseline_ckpt_loaded = False
+    baseline_ckpt_saved = False
+    baseline_ckpt_saved_at = None
+
+    if baseline_ckpt_enabled and os.path.isfile(baseline_ckpt_path) and not baseline_ckpt_force_retrain:
+        load_info = _load_baseline_checkpoint(
+            baseline_model=baseline,
+            ckpt_path=baseline_ckpt_path,
+            signature=baseline_signature,
+            strict_meta=baseline_ckpt_strict_meta,
+        )
+        if load_info is not None:
+            history_baseline = load_info["history"]
+            baseline_eval = baseline
+            baseline_ckpt_loaded = True
+            baseline_ckpt_saved_at = load_info.get("saved_at")
+            print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
+    if not baseline_ckpt_loaded:
+        history_baseline, baseline_eval = train_baseline(
+            baseline,
+            centers,
+            sigma_levels,
+            cfg,
+            train_pool=dataset.train_pool,
+            sample_train_batch_fn=dataset.sample_train_batch,
+            sample_population_batch_fn=dataset.sample_population_batch,
+        )
+        if baseline_ckpt_enabled:
+            _save_baseline_checkpoint(
+                ckpt_path=baseline_ckpt_path,
+                baseline_eval=baseline_eval,
+                baseline_history=history_baseline,
+                signature=baseline_signature,
+            )
+            baseline_ckpt_saved = True
+            print(f"[baseline] saved checkpoint: {baseline_ckpt_path}", flush=True)
+    baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
     baseline_gate = _run_with_scoped_seed(
         gate_eval_seed,
@@ -314,6 +549,7 @@ def run_experiment(cfg) -> dict:
             kappa_by_step=kappa_by_step,
             dataset=dataset,
             method=method,
+            rollout_kwargs=rollout_kwargs,
         ),
     )
     baseline_gate["eval_seed"] = int(gate_eval_seed)
@@ -338,14 +574,16 @@ def run_experiment(cfg) -> dict:
     # Evaluate denoise curves on train-pool and held-out pools to expose overfitting under limited data.
     x_train_eval = dataset.sample_train_batch(cfg.debug_eval_batch)
     idx_train_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    train_roll = method.rollout_controlled_ve(
+    train_roll = _rollout_for_eval(
+        cfg=cfg,
+        method=method,
         x0=x_train_eval,
         target_indices=idx_train_eval,
-        control_net=control,
+        control=control,
         sigma_levels=sigma_levels,
-        grad_through_control=False,
-        control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        rollout_kwargs=rollout_kwargs,
+        attack_net=robust,
     )
     denoise_error_curves_train = compute_denoise_error_curves(
         baseline_model=baseline_eval,
@@ -358,14 +596,16 @@ def run_experiment(cfg) -> dict:
 
     x_val_eval = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_val_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    val_roll = method.rollout_controlled_ve(
+    val_roll = _rollout_for_eval(
+        cfg=cfg,
+        method=method,
         x0=x_val_eval,
         target_indices=idx_val_eval,
-        control_net=control,
+        control=control,
         sigma_levels=sigma_levels,
-        grad_through_control=False,
-        control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        rollout_kwargs=rollout_kwargs,
+        attack_net=robust,
     )
     denoise_error_curves_val = compute_denoise_error_curves(
         baseline_model=baseline_eval,
@@ -578,6 +818,14 @@ def run_experiment(cfg) -> dict:
             "eval_seed_metrics": int(metrics_eval_seed),
             "eval_shared_terminal_noise": bool(cfg.eval_use_shared_terminal_noise),
             "eval_shared_reverse_noise": bool(cfg.eval_use_shared_reverse_noise),
+            "baseline_ckpt_enabled": bool(baseline_ckpt_enabled),
+            "baseline_ckpt_path": str(baseline_ckpt_path),
+            "baseline_ckpt_force_retrain": bool(baseline_ckpt_force_retrain),
+            "baseline_ckpt_strict_meta": bool(baseline_ckpt_strict_meta),
+            "baseline_ckpt_loaded": bool(baseline_ckpt_loaded),
+            "baseline_ckpt_saved": bool(baseline_ckpt_saved),
+            "baseline_ckpt_saved_at": baseline_ckpt_saved_at,
+            "baseline_ckpt_signature_hash": baseline_signature_hash,
         },
         "dataset_debug": {
             "dataset_backend": dataset.name,

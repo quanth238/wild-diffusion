@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a visual panel: Real | Baseline EDM | v2 | v2.1."""
+"""Build a visual panel: Real | Baseline EDM | (optional v1.1) | v2 | v2.1."""
 
 from __future__ import annotations
 
@@ -97,12 +97,15 @@ def _draw_panel(columns: Sequence[Image.Image], titles: Sequence[str], out_path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Create side-by-side MNIST panel for Real/Baseline/v2/v2.1.")
+    parser = argparse.ArgumentParser(
+        description="Create side-by-side MNIST panel for Real/Baseline/(optional v1.1)/v2/v2.1."
+    )
     parser.add_argument("--outdir", type=Path, required=True)
     parser.add_argument("--prefix", type=str, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--real-dir", type=Path, default=None)
     parser.add_argument("--baseline-dir", type=Path, default=None)
+    parser.add_argument("--v11-dir", type=Path, default=None)
     parser.add_argument("--v2-dir", type=Path, default=None)
     parser.add_argument("--v21-dir", type=Path, default=None)
     parser.add_argument("--rows", type=int, default=8)
@@ -122,35 +125,57 @@ def main() -> int:
 
     exp_v2 = args.outdir / f"{args.prefix}_v2_s{args.seed}"
     exp_v21 = args.outdir / f"{args.prefix}_2_1_s{args.seed}"
-
     real_dir = args.real_dir or (_repo_root() / "toy_outputs" / "fid_ref_images")
     baseline_dir = args.baseline_dir or (exp_v2 / "fid_baseline")
+    v11_dir = args.v11_dir
     v2_dir = args.v2_dir or (exp_v2 / "fid_robust")
     v21_dir = args.v21_dir or (exp_v21 / "fid_robust")
 
     real_pngs = _pngs_in_dir(real_dir)
     baseline_pngs = _pngs_in_dir(baseline_dir)
+    v11_pngs = _pngs_in_dir(v11_dir) if v11_dir is not None else None
     v2_pngs = _pngs_in_dir(v2_dir)
     v21_pngs = _pngs_in_dir(v21_dir)
 
     n_show = args.rows * args.cols
-    n_common = min(len(real_pngs), len(baseline_pngs), len(v2_pngs), len(v21_pngs))
+    n_common = min(
+        len(real_pngs),
+        len(baseline_pngs),
+        len(v2_pngs),
+        len(v21_pngs),
+        len(v11_pngs) if v11_pngs is not None else 10**12,
+    )
     picked = _pick_indices(n_common, n_show, seed=args.pick_seed)
 
     columns = [
         _build_grid(real_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
         _build_grid(baseline_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
-        _build_grid(v2_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
-        _build_grid(v21_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
     ]
-    titles = ["Real", "Baseline EDM", "v2 Robust", "v2.1 Robust"]
+    titles = ["Real", "Baseline EDM"]
+    if v11_pngs is not None:
+        columns.append(_build_grid(v11_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad))
+        titles.append("v1.1 Robust")
+    columns.extend(
+        [
+            _build_grid(v2_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
+            _build_grid(v21_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
+        ]
+    )
+    titles.extend(["v2 Robust", "v2.1 Robust"])
 
-    output = args.output or (args.outdir / f"{args.prefix}_panel_real_baseline_v2_v21_s{args.seed}.png")
+    default_name = (
+        f"{args.prefix}_panel_real_baseline_v11_v2_v21_s{args.seed}.png"
+        if v11_pngs is not None
+        else f"{args.prefix}_panel_real_baseline_v2_v21_s{args.seed}.png"
+    )
+    output = args.output or (args.outdir / default_name)
     _draw_panel(columns=columns, titles=titles, out_path=output)
 
     print(f"[done] panel: {output}")
     print(f"[info] real_dir={real_dir}")
     print(f"[info] baseline_dir={baseline_dir}")
+    if v11_dir is not None:
+        print(f"[info] v11_dir={v11_dir}")
     print(f"[info] v2_dir={v2_dir}")
     print(f"[info] v21_dir={v21_dir}")
     print(f"[info] picked_images={n_show} (common_pool={n_common}, pick_seed={args.pick_seed})")

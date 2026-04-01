@@ -11,6 +11,7 @@ EXP_NAME="${EXP_NAME:-image_once}"
 OUTDIR="${OUTDIR:-toy_outputs}"
 DEVICE="${DEVICE:-auto}"         # auto|cpu|cuda
 SEED="${SEED:-0}"
+BASELINE_CKPT_PATH="${BASELINE_CKPT_PATH:-}"
 
 DATASET_PATH="${DATASET_PATH:-}"
 DATASET_VAL_PATH="${DATASET_VAL_PATH:-}"
@@ -104,6 +105,10 @@ if [[ -n "${EXTRA_ARGS}" ]]; then
   # shellcheck disable=SC2206
   extra_arr=( ${EXTRA_ARGS} )
   args+=("${extra_arr[@]}")
+fi
+
+if [[ -n "${BASELINE_CKPT_PATH}" ]]; then
+  args+=("--baseline-ckpt-path" "${BASELINE_CKPT_PATH}")
 fi
 
 echo "[run_image_once] mode=${RUN_MODE} exp=${EXP_NAME} outdir=${OUTDIR} device=${DEVICE} seed=${SEED}"
