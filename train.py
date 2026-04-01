@@ -403,11 +403,37 @@ def main(**kwargs):
             'debug_eval_num_visual',
             'debug_eval_ref_path',
             'debug_adv_num_visual',
+            'markov_num_steps',
+            'markov_total_time',
+            'markov_beta_min',
+            'markov_beta_max',
+            'markov_sde_family',
+            'markov_weight_schedule',
+            'markov_control_lr',
+            'markov_lambda_min',
+            'markov_reverse_control_scale',
+            'markov_reverse_noise_scale',
+            'markov_terminal_momentum',
         ]:
             baseline_config.pop(key, None)
         training_loop.training_loop(**baseline_config)
     else:
-        training_wdro_loop.training_loop(**c)
+        wdro_config = dnnlib.EasyDict(c)
+        for key in [
+            'markov_num_steps',
+            'markov_total_time',
+            'markov_beta_min',
+            'markov_beta_max',
+            'markov_sde_family',
+            'markov_weight_schedule',
+            'markov_control_lr',
+            'markov_lambda_min',
+            'markov_reverse_control_scale',
+            'markov_reverse_noise_scale',
+            'markov_terminal_momentum',
+        ]:
+            wdro_config.pop(key, None)
+        training_wdro_loop.training_loop(**wdro_config)
 
 #----------------------------------------------------------------------------
 
