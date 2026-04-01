@@ -661,3 +661,88 @@ class EDMPrecond(torch.nn.Module):
         return torch.as_tensor(sigma)
 
 #----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class EDMPrecondControl(torch.nn.Module):
+    def __init__(self,
+        img_resolution,
+        img_channels,
+        label_dim               = 0,
+        use_fp16                = False,
+        sigma_min               = 0,
+        sigma_max               = float('inf'),
+        sigma_data              = 0.5,
+        model_type              = 'DhariwalUNet',
+        control_model_channels  = 64,
+        control_dropout         = 0.0,
+        **model_kwargs,
+    ):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.use_fp16 = use_fp16
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.sigma_data = sigma_data
+        self.model = globals()[model_type](
+            img_resolution=img_resolution,
+            in_channels=img_channels,
+            out_channels=img_channels,
+            label_dim=label_dim,
+            **model_kwargs,
+        )
+
+        control_kwargs = dict(model_kwargs)
+        if 'model_channels' in control_kwargs:
+            control_kwargs['model_channels'] = min(int(control_kwargs['model_channels']), int(control_model_channels))
+        else:
+            control_kwargs['model_channels'] = int(control_model_channels)
+        control_kwargs['dropout'] = float(control_dropout)
+        self.control_model = globals()[model_type](
+            img_resolution=img_resolution,
+            in_channels=img_channels,
+            out_channels=img_channels,
+            label_dim=label_dim,
+            **control_kwargs,
+        )
+
+    def _model_inputs(self, x, sigma, class_labels=None, force_fp32=False):
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.log() / 4
+        return x, sigma, class_labels, dtype, c_skip, c_out, c_in, c_noise
+
+    def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+        x, sigma, class_labels, dtype, c_skip, c_out, c_in, c_noise = self._model_inputs(
+            x=x,
+            sigma=sigma,
+            class_labels=class_labels,
+            force_fp32=force_fp32,
+        )
+        F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        assert F_x.dtype == dtype
+        D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        return D_x
+
+    def control(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
+        x, sigma, class_labels, dtype, _, _, c_in, c_noise = self._model_inputs(
+            x=x,
+            sigma=sigma,
+            class_labels=class_labels,
+            force_fp32=force_fp32,
+        )
+        U_x = self.control_model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
+        assert U_x.dtype == dtype
+        return torch.tanh(U_x.to(torch.float32))
+
+    def round_sigma(self, sigma):
+        return torch.as_tensor(sigma)
+
+#----------------------------------------------------------------------------

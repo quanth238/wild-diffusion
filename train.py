@@ -7,6 +7,7 @@ import dnnlib
 from torch_utils import distributed as dist
 from training import training_loop
 from training import training_wdro_loop
+from training import training_cdro_markov_loop
 
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
@@ -36,7 +37,7 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm|cdroedm',       type=click.Choice(['wdroedm', 'advedm', 'cdroedm']), default='wdroedm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm|cdroedm|cdromarkovedm|cdromarkovfull',       type=click.Choice(['wdroedm', 'advedm', 'cdroedm', 'cdromarkovedm', 'cdromarkovfull']), default='wdroedm', show_default=True)
 @click.option('--trainer',       help='Training loop', metavar='baseline|wdro',                     type=click.Choice(['baseline', 'wdro']), default='wdro', show_default=True)
 @click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
 @click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
@@ -57,6 +58,19 @@ def parse_int_list(s):
 @click.option('--cdro-sigma-cut', help='CDRO sigma cutoff above which control vanishes', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.5, show_default=True)
 @click.option('--cdro-gate-power', help='CDRO sigma gate exponent', metavar='FLOAT',                   type=click.FloatRange(min=0, min_open=True), default=2.0, show_default=True)
 @click.option('--cdro-delta-space', help='CDRO perturbation parameterization', metavar='image|noise',  type=click.Choice(['image', 'noise']), default='image', show_default=True)
+@click.option('--cdro-control-cbase', help='Control head base channels for non-plug-in CDRO', metavar='INT', type=click.IntRange(min=8), default=64, show_default=True)
+@click.option('--cdro-control-dropout', help='Control head dropout for non-plug-in CDRO', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.0, show_default=True)
+@click.option('--markov-num-steps', help='Full Markov forward/reverse steps', metavar='INT', type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--markov-total-time', help='Full Markov total time horizon', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1.0, show_default=True)
+@click.option('--markov-beta-min', help='Full Markov beta min', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.1, show_default=True)
+@click.option('--markov-beta-max', help='Full Markov beta max', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=12.0, show_default=True)
+@click.option('--markov-sde-family', help='Full Markov SDE family', metavar='vp_linear|vp_cosine', type=click.Choice(['vp_linear', 'vp_cosine']), default='vp_cosine', show_default=True)
+@click.option('--markov-weight-schedule', help='Full Markov loss weighting', metavar='uniform|sigma_sq|inv_sigma_sq', type=click.Choice(['uniform', 'sigma_sq', 'inv_sigma_sq']), default='uniform', show_default=True)
+@click.option('--markov-control-lr', help='Full Markov control optimizer LR', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=2e-4, show_default=True)
+@click.option('--markov-lambda-min', help='Full Markov minimum dual value', metavar='FLOAT', type=click.FloatRange(min=0), default=0.0, show_default=True)
+@click.option('--markov-reverse-control-scale', help='Full Markov reverse-time control scale', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
+@click.option('--markov-reverse-noise-scale', help='Full Markov reverse-time noise scale', metavar='FLOAT', type=click.FloatRange(min=0), default=1.0, show_default=True)
+@click.option('--markov-terminal-momentum', help='Full Markov terminal stats EMA momentum', metavar='FLOAT', type=click.FloatRange(min=0, max=1), default=0.95, show_default=True)
 @click.option('--debug-eval',    help='Run quick debug evaluation at init and each WDRO interval', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--debug-eval-init', help='Run quick debug evaluation at training start', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--debug-eval-num', help='Number of generated images for quick FID', metavar='INT', type=click.IntRange(min=2), default=512, show_default=True)
@@ -164,13 +178,47 @@ def main(**kwargs):
             gate_power=opts.cdro_gate_power,
             delta_space=opts.cdro_delta_space,
         )
+    elif opts.precond == 'cdromarkovedm':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecondControl'
+        c.network_kwargs.update(
+            control_model_channels=opts.cdro_control_cbase,
+            control_dropout=opts.cdro_control_dropout,
+        )
+        c.loss_kwargs.class_name = 'training.loss.EDMLossCDROMarkov'
+        c.loss_kwargs.update(
+            robust_mix=opts.cdro_mix,
+            max_delta=opts.cdro_max_delta,
+            rho_target=opts.cdro_rho,
+            lambda_init=opts.cdro_lambda_init,
+            lambda_lr=opts.cdro_lambda_lr,
+            start_kimg=opts.cdro_start_kimg,
+            ramp_kimg=opts.cdro_ramp_kimg,
+            sigma_floor=opts.cdro_sigma_floor,
+            sigma_cut=opts.cdro_sigma_cut,
+            gate_power=opts.cdro_gate_power,
+            delta_space=opts.cdro_delta_space,
+        )
+    elif opts.precond == 'cdromarkovfull':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecondControl'
+        c.network_kwargs.update(
+            control_model_channels=opts.cdro_control_cbase,
+            control_dropout=opts.cdro_control_dropout,
+        )
+        c.loss_kwargs.update(
+            max_delta=opts.cdro_max_delta,
+            rho_target=opts.cdro_rho,
+            lambda_init=opts.cdro_lambda_init,
+            lambda_lr=opts.cdro_lambda_lr,
+            start_kimg=opts.cdro_start_kimg,
+            ramp_kimg=opts.cdro_ramp_kimg,
+        )
     else:
         assert opts.precond == 'wdroedm'
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLossWdro'
 
-    if opts.precond == 'cdroedm' and opts.trainer != 'baseline':
-        raise click.ClickException('--precond=cdroedm currently supports only --trainer=baseline')
+    if opts.precond in {'cdroedm', 'cdromarkovedm', 'cdromarkovfull'} and opts.trainer != 'baseline':
+        raise click.ClickException(f'--precond={opts.precond} currently supports only --trainer=baseline')
 
     # Network options.
     if opts.cbase is not None:
@@ -204,6 +252,17 @@ def main(**kwargs):
         debug_eval_num_visual=opts.debug_eval_visual,
         debug_eval_ref_path=(opts.debug_eval_ref if opts.debug_eval_ref else None),
         debug_adv_num_visual=opts.debug_adv_visual,
+        markov_num_steps=opts.markov_num_steps,
+        markov_total_time=opts.markov_total_time,
+        markov_beta_min=opts.markov_beta_min,
+        markov_beta_max=opts.markov_beta_max,
+        markov_sde_family=opts.markov_sde_family,
+        markov_weight_schedule=opts.markov_weight_schedule,
+        markov_control_lr=opts.markov_control_lr,
+        markov_lambda_min=opts.markov_lambda_min,
+        markov_reverse_control_scale=opts.markov_reverse_control_scale,
+        markov_reverse_noise_scale=opts.markov_reverse_noise_scale,
+        markov_terminal_momentum=opts.markov_terminal_momentum,
     )
 
     # Random seed.
@@ -271,7 +330,7 @@ def main(**kwargs):
             dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
             dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
             dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
-    if opts.precond == 'cdroedm':
+    if opts.precond in {'cdroedm', 'cdromarkovedm', 'cdromarkovfull'}:
         dist.print0(f'CDRO mix/steps/step:     {opts.cdro_mix}/{opts.cdro_adv_steps}/{opts.cdro_step_size}')
         dist.print0(f'CDRO max_delta/rho:      {opts.cdro_max_delta}/{opts.cdro_rho}')
         dist.print0(f'CDRO lambda init/lr:     {opts.cdro_lambda_init}/{opts.cdro_lambda_lr}')
@@ -279,6 +338,13 @@ def main(**kwargs):
         dist.print0(f'CDRO sigma floor/cut:    {opts.cdro_sigma_floor}/{opts.cdro_sigma_cut}')
         dist.print0(f'CDRO gate power:         {opts.cdro_gate_power}')
         dist.print0(f'CDRO delta space:        {opts.cdro_delta_space}')
+    if opts.precond in {'cdromarkovedm', 'cdromarkovfull'}:
+        dist.print0(f'CDRO control cbase/drop: {opts.cdro_control_cbase}/{opts.cdro_control_dropout}')
+    if opts.precond == 'cdromarkovfull':
+        dist.print0(f'Markov steps/time:       {opts.markov_num_steps}/{opts.markov_total_time}')
+        dist.print0(f'Markov beta min/max:     {opts.markov_beta_min}/{opts.markov_beta_max}')
+        dist.print0(f'Markov family/weights:   {opts.markov_sde_family}/{opts.markov_weight_schedule}')
+        dist.print0(f'Markov ctrl lr/lmin:     {opts.markov_control_lr}/{opts.markov_lambda_min}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
@@ -300,7 +366,27 @@ def main(**kwargs):
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Train.
-    if opts.trainer == 'baseline':
+    if opts.precond == 'cdromarkovfull':
+        markov_config = dnnlib.EasyDict(c)
+        for key in [
+            'wdro_warmup_ratio',
+            'wdro_m_epochs',
+            'wdro_k',
+            'wdro_step_size',
+            'wdro_gamma',
+            'wdro_p_adv',
+            'debug_eval_enable',
+            'debug_eval_init',
+            'debug_eval_num_images',
+            'debug_eval_steps',
+            'debug_eval_batch_size',
+            'debug_eval_num_visual',
+            'debug_eval_ref_path',
+            'debug_adv_num_visual',
+        ]:
+            markov_config.pop(key, None)
+        training_cdro_markov_loop.training_loop(**markov_config)
+    elif opts.trainer == 'baseline':
         baseline_config = dnnlib.EasyDict(c)
         for key in [
             'wdro_warmup_ratio',

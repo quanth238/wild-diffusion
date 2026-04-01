@@ -31,9 +31,9 @@ latest_run_dir() {
 }
 
 for method in ${METHODS}; do
-  if [[ "${method}" != "baseline" && "${method}" != "wdro" && "${method}" != "cdro" ]]; then
+  if [[ "${method}" != "baseline" && "${method}" != "wdro" && "${method}" != "cdro" && "${method}" != "cdro_markov" ]]; then
     echo "[ERROR] Unsupported method in METHODS: ${method}"
-    echo "        Supported methods: baseline wdro cdro"
+    echo "        Supported methods: baseline wdro cdro cdro_markov"
     exit 1
   fi
 
@@ -42,6 +42,9 @@ for method in ${METHODS}; do
   if [[ "${method}" == "cdro" ]]; then
     trainer="baseline"
     precond="cdroedm"
+  elif [[ "${method}" == "cdro_markov" ]]; then
+    trainer="baseline"
+    precond="cdromarkovedm"
   fi
 
   method_outdir="${RUNS_DIR}/${method}"

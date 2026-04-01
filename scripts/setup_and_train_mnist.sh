@@ -23,7 +23,7 @@ MNIST_DIR="${MNIST_DIR:-${DATA_ROOT}/mnist-32x32-train}"
 OUTDIR="${OUTDIR:-${DEFAULT_OUTDIR}}"
 
 TRAINER="${TRAINER:-baseline}"   # baseline|wdro
-PRECOND="${PRECOND:-wdroedm}"    # wdroedm|advedm|cdroedm
+PRECOND="${PRECOND:-wdroedm}"    # wdroedm|advedm|cdroedm|cdromarkovedm|cdromarkovfull
 COND="${COND:-1}"
 ARCH="${ARCH:-ddpmpp}"
 CBASE="${CBASE:-}"
@@ -68,6 +68,19 @@ CDRO_SIGMA_FLOOR="${CDRO_SIGMA_FLOOR:-0.0}"
 CDRO_SIGMA_CUT="${CDRO_SIGMA_CUT:-0.5}"
 CDRO_GATE_POWER="${CDRO_GATE_POWER:-2.0}"
 CDRO_DELTA_SPACE="${CDRO_DELTA_SPACE:-image}"
+CDRO_CONTROL_CBASE="${CDRO_CONTROL_CBASE:-64}"
+CDRO_CONTROL_DROPOUT="${CDRO_CONTROL_DROPOUT:-0.0}"
+MARKOV_NUM_STEPS="${MARKOV_NUM_STEPS:-8}"
+MARKOV_TOTAL_TIME="${MARKOV_TOTAL_TIME:-1.0}"
+MARKOV_BETA_MIN="${MARKOV_BETA_MIN:-0.1}"
+MARKOV_BETA_MAX="${MARKOV_BETA_MAX:-12.0}"
+MARKOV_SDE_FAMILY="${MARKOV_SDE_FAMILY:-vp_cosine}"
+MARKOV_WEIGHT_SCHEDULE="${MARKOV_WEIGHT_SCHEDULE:-uniform}"
+MARKOV_CONTROL_LR="${MARKOV_CONTROL_LR:-2e-4}"
+MARKOV_LAMBDA_MIN="${MARKOV_LAMBDA_MIN:-0.0}"
+MARKOV_REVERSE_CONTROL_SCALE="${MARKOV_REVERSE_CONTROL_SCALE:-1.0}"
+MARKOV_REVERSE_NOISE_SCALE="${MARKOV_REVERSE_NOISE_SCALE:-1.0}"
+MARKOV_TERMINAL_MOMENTUM="${MARKOV_TERMINAL_MOMENTUM:-0.95}"
 DEBUG_EVAL="${DEBUG_EVAL:-0}"
 DEBUG_EVAL_INIT="${DEBUG_EVAL_INIT:-1}"
 DEBUG_EVAL_NUM="${DEBUG_EVAL_NUM:-128}"
@@ -122,10 +135,10 @@ if pct < 1 or pct > 100:
     raise SystemExit("[ERROR] MNIST_TRAIN_PERCENT must be in [1, 100].")
 if "${TRAINER}" not in {"baseline", "wdro"}:
     raise SystemExit("[ERROR] TRAINER must be one of: baseline, wdro")
-if "${PRECOND}" not in {"wdroedm", "advedm", "cdroedm"}:
-    raise SystemExit("[ERROR] PRECOND must be one of: wdroedm, advedm, cdroedm")
-if "${PRECOND}" == "cdroedm" and "${TRAINER}" != "baseline":
-    raise SystemExit("[ERROR] PRECOND=cdroedm currently requires TRAINER=baseline")
+if "${PRECOND}" not in {"wdroedm", "advedm", "cdroedm", "cdromarkovedm", "cdromarkovfull"}:
+    raise SystemExit("[ERROR] PRECOND must be one of: wdroedm, advedm, cdroedm, cdromarkovedm, cdromarkovfull")
+if "${PRECOND}" in {"cdroedm", "cdromarkovedm", "cdromarkovfull"} and "${TRAINER}" != "baseline":
+    raise SystemExit("[ERROR] PRECOND=${PRECOND} currently requires TRAINER=baseline")
 PY
 
 if [[ -z "${TRAIN_MNIST_DIR}" ]]; then
@@ -246,7 +259,7 @@ echo "[INFO] OUTDIR=${OUTDIR}"
 if [[ -n "${TRANSFER}" ]]; then
   echo "[INFO] TRANSFER=${TRANSFER}"
 fi
-if [[ "${PRECOND}" == "cdroedm" ]]; then
+if [[ "${PRECOND}" == "cdroedm" || "${PRECOND}" == "cdromarkovedm" || "${PRECOND}" == "cdromarkovfull" ]]; then
   echo "[INFO] CDRO mix/steps/step=${CDRO_MIX}/${CDRO_ADV_STEPS}/${CDRO_STEP_SIZE}"
   echo "[INFO] CDRO max_delta/rho=${CDRO_MAX_DELTA}/${CDRO_RHO}"
   echo "[INFO] CDRO lambda init/lr=${CDRO_LAMBDA_INIT}/${CDRO_LAMBDA_LR}"
@@ -254,6 +267,17 @@ if [[ "${PRECOND}" == "cdroedm" ]]; then
   echo "[INFO] CDRO sigma floor/cut=${CDRO_SIGMA_FLOOR}/${CDRO_SIGMA_CUT}"
   echo "[INFO] CDRO gate power=${CDRO_GATE_POWER}"
   echo "[INFO] CDRO delta_space=${CDRO_DELTA_SPACE}"
+  if [[ "${PRECOND}" == "cdromarkovedm" || "${PRECOND}" == "cdromarkovfull" ]]; then
+    echo "[INFO] CDRO control cbase/dropout=${CDRO_CONTROL_CBASE}/${CDRO_CONTROL_DROPOUT}"
+  fi
+  if [[ "${PRECOND}" == "cdromarkovfull" ]]; then
+    echo "[INFO] Markov steps/time=${MARKOV_NUM_STEPS}/${MARKOV_TOTAL_TIME}"
+    echo "[INFO] Markov beta min/max=${MARKOV_BETA_MIN}/${MARKOV_BETA_MAX}"
+    echo "[INFO] Markov family/weights=${MARKOV_SDE_FAMILY}/${MARKOV_WEIGHT_SCHEDULE}"
+    echo "[INFO] Markov control lr/lambda min=${MARKOV_CONTROL_LR}/${MARKOV_LAMBDA_MIN}"
+    echo "[INFO] Markov reverse control/noise=${MARKOV_REVERSE_CONTROL_SCALE}/${MARKOV_REVERSE_NOISE_SCALE}"
+    echo "[INFO] Markov terminal momentum=${MARKOV_TERMINAL_MOMENTUM}"
+  fi
 fi
 
 if [[ "${INSTALL_ONLY}" == "1" ]]; then
@@ -353,6 +377,19 @@ train_cmd=(
   "--cdro-sigma-cut=${CDRO_SIGMA_CUT}"
   "--cdro-gate-power=${CDRO_GATE_POWER}"
   "--cdro-delta-space=${CDRO_DELTA_SPACE}"
+  "--cdro-control-cbase=${CDRO_CONTROL_CBASE}"
+  "--cdro-control-dropout=${CDRO_CONTROL_DROPOUT}"
+  "--markov-num-steps=${MARKOV_NUM_STEPS}"
+  "--markov-total-time=${MARKOV_TOTAL_TIME}"
+  "--markov-beta-min=${MARKOV_BETA_MIN}"
+  "--markov-beta-max=${MARKOV_BETA_MAX}"
+  "--markov-sde-family=${MARKOV_SDE_FAMILY}"
+  "--markov-weight-schedule=${MARKOV_WEIGHT_SCHEDULE}"
+  "--markov-control-lr=${MARKOV_CONTROL_LR}"
+  "--markov-lambda-min=${MARKOV_LAMBDA_MIN}"
+  "--markov-reverse-control-scale=${MARKOV_REVERSE_CONTROL_SCALE}"
+  "--markov-reverse-noise-scale=${MARKOV_REVERSE_NOISE_SCALE}"
+  "--markov-terminal-momentum=${MARKOV_TERMINAL_MOMENTUM}"
   "--debug-eval=${DEBUG_EVAL}"
   "--debug-eval-init=${DEBUG_EVAL_INIT}"
   "--debug-eval-num=${DEBUG_EVAL_NUM}"
