@@ -62,6 +62,7 @@ export MNIST_TRAIN_PERCENT
 export MNIST_VAL_PERCENT
 export OUTDIR
 export PREFIX
+export PICK_SEED
 
 mkdir -p "${OUTDIR}"
 BASELINE_CKPT_DIR="${BASELINE_CKPT_DIR:-/mnt/data/quanth/models/wild_diffusion_baseline_ckpt}"
@@ -138,24 +139,14 @@ python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
   --baseline-ckpt-path "${BASELINE_CKPT_PATH}" \
   --v21-rho "${V21_RHO}"
 
-echo "=== 4/4 Build panel (Real | Baseline EDM | v2 | v2.1) ==="
-python3 toy/scripts/make_v2_v21_panel.py \
-  --outdir "${OUTDIR}" \
-  --prefix "${PREFIX}" \
-  --seed "${SEED}" \
-  --baseline-dir "${OUTDIR}/${BASELINE_EXP}/fid_baseline" \
-  --v2-dir "${OUTDIR}/${V2_EXP}/fid_robust" \
-  --v21-dir "${OUTDIR}/${V21_EXP}/fid_robust" \
-  --rows 8 \
-  --cols 8 \
-  --tile-size 32 \
-  --tile-pad 2 \
-  --pick-seed "${PICK_SEED}" \
-  --output "${OUTDIR}/${PREFIX}_panel_real_baseline_v2_v21_s${SEED}.png"
-
+echo "=== 4/4 Aggregate metrics + build annotated panel ==="
 python3 - <<'PY'
+import csv
 import json
+import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 outdir = Path(os.environ['OUTDIR'])
@@ -166,30 +157,166 @@ baseline_exp = f"{prefix}_baseline_s{seed}"
 v2_exp = f"{prefix}_v2_s{seed}"
 v21_exp = f"{prefix}_2_1_s{seed}"
 
-def load_fid(exp: str):
+def _safe_float(v):
+    if v is None:
+        return float("nan")
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+def _fmt_fid(v):
+    return "nan" if not math.isfinite(v) else f"{v:.2f}"
+
+def _fmt_runtime(v):
+    if not math.isfinite(v):
+        return "n/a"
+    if v < 60:
+        return f"{v:.1f}s"
+    if v < 3600:
+        return f"{v/60.0:.1f}m"
+    return f"{v/3600.0:.2f}h"
+
+def load_row(exp: str):
     p = outdir / exp / 'metrics.json'
     m = json.loads(p.read_text())
-    q = m['metrics']['sample_quality_debug']
-    return float(q['baseline_fid']), float(q['robust_fid'])
+    q = m['metrics'].get('sample_quality_debug', {})
+    flow = m['metrics'].get('flow_debug', {})
+    runtime = flow.get('runtime', {})
+    fid_base_t = _safe_float(runtime.get('fid_baseline', 0.0))
+    fid_rob_t = _safe_float(runtime.get('fid_robust', 0.0))
+    if not math.isfinite(fid_base_t):
+        fid_base_t = 0.0
+    if not math.isfinite(fid_rob_t):
+        fid_rob_t = 0.0
+    return {
+        'exp': exp,
+        'baseline_fid': _safe_float(q.get('baseline_fid')),
+        'robust_fid': _safe_float(q.get('robust_fid')),
+        'runtime_total_sec': _safe_float(runtime.get('total', flow.get('runtime_total_sec'))),
+        'runtime_total_without_fid_sec': _safe_float(runtime.get('total_without_fid')),
+        'runtime_baseline_train_sec': _safe_float(runtime.get('baseline_train')),
+        'runtime_robust_phase_sec': _safe_float(runtime.get('robust_phase')),
+        'runtime_post_eval_sec': _safe_float(runtime.get('post_train_eval')),
+        'runtime_fid_total_sec': float(fid_base_t + fid_rob_t),
+    }
 
-b_base, b_rob = load_fid(baseline_exp)
-v2_base, v2_rob = load_fid(v2_exp)
-v21_base, v21_rob = load_fid(v21_exp)
+rows = {
+    'baseline_only': load_row(baseline_exp),
+    'v2': load_row(v2_exp),
+    'v2_1': load_row(v21_exp),
+}
+
+runtime_table_path = outdir / f"{prefix}_runtime_table_baseline_v2_v21_s{seed}.csv"
+with runtime_table_path.open("w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow(
+        [
+            "method",
+            "exp",
+            "baseline_fid",
+            "robust_fid",
+            "runtime_total_sec",
+            "runtime_total_without_fid_sec",
+            "runtime_baseline_train_sec",
+            "runtime_robust_phase_sec",
+            "runtime_post_eval_sec",
+            "runtime_fid_total_sec",
+        ]
+    )
+    for method_name in ("baseline_only", "v2", "v2_1"):
+        r = rows[method_name]
+        writer.writerow(
+            [
+                method_name,
+                r["exp"],
+                r["baseline_fid"],
+                r["robust_fid"],
+                r["runtime_total_sec"],
+                r["runtime_total_without_fid_sec"],
+                r["runtime_baseline_train_sec"],
+                r["runtime_robust_phase_sec"],
+                r["runtime_post_eval_sec"],
+                r["runtime_fid_total_sec"],
+            ]
+        )
+
+def _panel_note(row):
+    return (
+        f"FID={_fmt_fid(_safe_float(row['robust_fid']))} | "
+        f"total={_fmt_runtime(_safe_float(row['runtime_total_sec']))} | "
+        f"robust={_fmt_runtime(_safe_float(row['runtime_robust_phase_sec']))}"
+    )
+
+panel_path = outdir / f"{prefix}_panel_real_baseline_v2_v21_s{seed}.png"
+panel_cmd = [
+    sys.executable,
+    "toy/scripts/make_v2_v21_panel.py",
+    "--outdir",
+    str(outdir),
+    "--prefix",
+    str(prefix),
+    "--seed",
+    str(seed),
+    "--baseline-dir",
+    str(outdir / baseline_exp / "fid_baseline"),
+    "--v2-dir",
+    str(outdir / v2_exp / "fid_robust"),
+    "--v21-dir",
+    str(outdir / v21_exp / "fid_robust"),
+    "--rows",
+    "8",
+    "--cols",
+    "8",
+    "--tile-size",
+    "32",
+    "--tile-pad",
+    "2",
+    "--pick-seed",
+    str(os.environ.get("PICK_SEED", "7")),
+    "--real-note",
+    f"N={8*8}",
+    "--baseline-note",
+    _panel_note(rows["baseline_only"]),
+    "--v2-note",
+    _panel_note(rows["v2"]),
+    "--v21-note",
+    _panel_note(rows["v2_1"]),
+    "--output",
+    str(panel_path),
+]
+subprocess.run(panel_cmd, check=True)
+
+def _ranking(metric_key: str):
+    items = []
+    for method_name, row in rows.items():
+        val = _safe_float(row.get(metric_key))
+        if math.isfinite(val):
+            items.append((method_name, float(val)))
+    return [ {'method': k, 'seconds': v} for k, v in sorted(items, key=lambda kv: kv[1]) ]
 
 summary = {
     'seed': int(seed),
     'steps': int(os.environ['STEPS']),
     'mnist_train_percent': float(os.environ['MNIST_TRAIN_PERCENT']),
     'mnist_val_percent': float(os.environ['MNIST_VAL_PERCENT']),
-    'baseline_only': {'exp': baseline_exp, 'baseline_fid': b_base, 'robust_fid': b_rob},
-    'v2': {'exp': v2_exp, 'baseline_fid': v2_base, 'robust_fid': v2_rob},
-    'v2_1': {'exp': v21_exp, 'baseline_fid': v21_base, 'robust_fid': v21_rob},
-    'panel': str(outdir / f"{prefix}_panel_real_baseline_v2_v21_s{seed}.png"),
+    'rows': rows,
+    'runtime_ranking': {
+        'by_total_sec': _ranking('runtime_total_sec'),
+        'by_robust_phase_sec': _ranking('runtime_robust_phase_sec'),
+        'by_total_without_fid_sec': _ranking('runtime_total_without_fid_sec'),
+    },
+    'panel': str(panel_path),
+    'runtime_table_csv': str(runtime_table_path),
 }
-(outdir / f"{prefix}_summary_baseline_v2_v21_s{seed}.json").write_text(json.dumps(summary, indent=2))
+summary_path = outdir / f"{prefix}_summary_baseline_v2_v21_s{seed}.json"
+summary_path.write_text(json.dumps(summary, indent=2))
 
-print('[done] summary:', outdir / f"{prefix}_summary_baseline_v2_v21_s{seed}.json")
-print('[done] panel:', outdir / f"{prefix}_panel_real_baseline_v2_v21_s{seed}.png")
+print('[done] summary:', summary_path)
+print('[done] panel:', panel_path)
+print('[done] runtime_table:', runtime_table_path)
+print('[runtime] fastest_by_total=', summary['runtime_ranking']['by_total_sec'][0] if summary['runtime_ranking']['by_total_sec'] else None)
+print('[runtime] fastest_by_robust_phase=', summary['runtime_ranking']['by_robust_phase_sec'][0] if summary['runtime_ranking']['by_robust_phase_sec'] else None)
 PY
 
 echo "[*] Finished baseline-v2-v2.1 panel workflow"

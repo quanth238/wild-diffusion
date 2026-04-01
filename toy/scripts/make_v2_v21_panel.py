@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Build a visual panel: Real | Baseline EDM | (optional v1.1) | v2 | v2.1."""
+"""Build a visual panel: Real | Baseline EDM | (optional v1.1) | v2 | v2.1.
+
+Supports optional per-column notes (e.g., FID/runtime) under each title.
+"""
 
 from __future__ import annotations
 
 import argparse
 import random
 from pathlib import Path
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -63,9 +66,18 @@ def _build_grid(
     return Image.fromarray(canvas, mode="L").convert("RGB")
 
 
-def _draw_panel(columns: Sequence[Image.Image], titles: Sequence[str], out_path: Path) -> None:
+def _draw_panel(
+    columns: Sequence[Image.Image],
+    titles: Sequence[str],
+    out_path: Path,
+    notes: Optional[Sequence[Optional[str]]] = None,
+) -> None:
     if len(columns) != len(titles):
         raise ValueError("columns and titles must have the same length.")
+    if notes is None:
+        notes = [None] * len(columns)
+    if len(notes) != len(columns):
+        raise ValueError("notes must be None or have the same length as columns.")
 
     col_w = max(im.width for im in columns)
     col_h = max(im.height for im in columns)
@@ -73,22 +85,38 @@ def _draw_panel(columns: Sequence[Image.Image], titles: Sequence[str], out_path:
 
     outer_pad = 16
     col_gap = 18
-    title_h = 28
+    header_pad_top = 6
+    header_pad_bottom = 8
+    header_blocks = []
+    header_h = 0
+    probe = Image.new("RGB", (4, 4), color=(255, 255, 255))
+    probe_draw = ImageDraw.Draw(probe)
+    for title, note in zip(titles, notes):
+        note_text = (note or "").strip()
+        block = title if not note_text else f"{title}\n{note_text}"
+        bbox = probe_draw.multiline_textbbox((0, 0), block, spacing=2, align="center")
+        text_h = bbox[3] - bbox[1]
+        header_h = max(header_h, text_h)
+        header_blocks.append(block)
+    header_h = header_h + header_pad_top + header_pad_bottom
+
     total_w = outer_pad * 2 + n * col_w + (n - 1) * col_gap
-    total_h = outer_pad * 2 + title_h + col_h
+    total_h = outer_pad * 2 + header_h + col_h
 
     panel = Image.new("RGB", (total_w, total_h), color=(232, 232, 232))
     draw = ImageDraw.Draw(panel)
 
-    for i, (title, col_img) in enumerate(zip(titles, columns)):
+    for i, (title, col_img, block_text) in enumerate(zip(titles, columns, header_blocks)):
         x = outer_pad + i * (col_w + col_gap)
-        y = outer_pad + title_h
+        y = outer_pad + header_h
         panel.paste(col_img, (x, y))
 
-        bbox = draw.textbbox((0, 0), title)
+        bbox = draw.multiline_textbbox((0, 0), block_text, spacing=2, align="center")
         text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
         text_x = x + (col_w - text_w) // 2
-        draw.text((text_x, outer_pad), title, fill=(16, 16, 16))
+        text_y = outer_pad + (header_h - text_h) // 2
+        draw.multiline_text((text_x, text_y), block_text, fill=(16, 16, 16), spacing=2, align="center")
 
         draw.rectangle([x - 1, y - 1, x + col_img.width, y + col_img.height], outline=(80, 80, 80), width=1)
 
@@ -113,7 +141,17 @@ def main() -> int:
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument("--tile-pad", type=int, default=2)
     parser.add_argument("--pick-seed", type=int, default=0)
+    parser.add_argument("--real-title", type=str, default="Real")
+    parser.add_argument("--baseline-title", type=str, default="Baseline EDM")
+    parser.add_argument("--v11-title", type=str, default="v1.1 Robust")
+    parser.add_argument("--v2-title", type=str, default="v2 Robust")
+    parser.add_argument("--v21-title", type=str, default="v2.1 Robust")
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--real-note", type=str, default="")
+    parser.add_argument("--baseline-note", type=str, default="")
+    parser.add_argument("--v11-note", type=str, default="")
+    parser.add_argument("--v2-note", type=str, default="")
+    parser.add_argument("--v21-note", type=str, default="")
     args = parser.parse_args()
 
     if args.rows <= 0 or args.cols <= 0:
@@ -151,17 +189,20 @@ def main() -> int:
         _build_grid(real_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
         _build_grid(baseline_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
     ]
-    titles = ["Real", "Baseline EDM"]
+    titles = [str(args.real_title), str(args.baseline_title)]
+    notes = [args.real_note, args.baseline_note]
     if v11_pngs is not None:
         columns.append(_build_grid(v11_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad))
-        titles.append("v1.1 Robust")
+        titles.append(str(args.v11_title))
+        notes.append(args.v11_note)
     columns.extend(
         [
             _build_grid(v2_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
             _build_grid(v21_pngs, picked, args.rows, args.cols, args.tile_size, args.tile_pad),
         ]
     )
-    titles.extend(["v2 Robust", "v2.1 Robust"])
+    titles.extend([str(args.v2_title), str(args.v21_title)])
+    notes.extend([args.v2_note, args.v21_note])
 
     default_name = (
         f"{args.prefix}_panel_real_baseline_v11_v2_v21_s{args.seed}.png"
@@ -169,7 +210,7 @@ def main() -> int:
         else f"{args.prefix}_panel_real_baseline_v2_v21_s{args.seed}.png"
     )
     output = args.output or (args.outdir / default_name)
-    _draw_panel(columns=columns, titles=titles, out_path=output)
+    _draw_panel(columns=columns, titles=titles, out_path=output, notes=notes)
 
     print(f"[done] panel: {output}")
     print(f"[info] real_dir={real_dir}")

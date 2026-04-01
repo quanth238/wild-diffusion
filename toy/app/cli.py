@@ -61,6 +61,37 @@ def _validate_config(cfg: ToyConfig) -> None:
             "('global_remaining', 'step_clip', 'step_exact', 'kappa_clip', 'none'), got "
             f"{cfg.v11_projection_mode}"
         )
+    if cfg.v12_step_size <= 0:
+        raise ValueError(f"--v12-step-size must be > 0, got {cfg.v12_step_size}")
+    if cfg.v12_lambda_init < 0:
+        raise ValueError(f"--v12-lambda-init must be >= 0, got {cfg.v12_lambda_init}")
+    if cfg.v12_lambda_lr < 0:
+        raise ValueError(f"--v12-lambda-lr must be >= 0, got {cfg.v12_lambda_lr}")
+    if cfg.v12_rho_target < 0:
+        raise ValueError(f"--v12-rho-target must be >= 0, got {cfg.v12_rho_target}")
+    if cfg.v12_robust_mix < 0 or cfg.v12_robust_mix > 1:
+        raise ValueError(f"--v12-robust-mix must be in [0, 1], got {cfg.v12_robust_mix}")
+    if cfg.v12_start_step < 0:
+        raise ValueError(f"--v12-start-step must be >= 0, got {cfg.v12_start_step}")
+    if cfg.v12_ramp_steps < 0:
+        raise ValueError(f"--v12-ramp-steps must be >= 0, got {cfg.v12_ramp_steps}")
+    if cfg.v12_max_delta <= 0:
+        raise ValueError(f"--v12-max-delta must be > 0, got {cfg.v12_max_delta}")
+    if cfg.v12_sigma_floor < 0:
+        raise ValueError(f"--v12-sigma-floor must be >= 0, got {cfg.v12_sigma_floor}")
+    if cfg.v12_sigma_cut <= 0:
+        raise ValueError(f"--v12-sigma-cut must be > 0, got {cfg.v12_sigma_cut}")
+    if cfg.v12_sigma_floor >= cfg.v12_sigma_cut and cfg.v12_sigma_floor > 0:
+        raise ValueError(
+            f"--v12-sigma-floor must be < --v12-sigma-cut when positive, got "
+            f"{cfg.v12_sigma_floor} >= {cfg.v12_sigma_cut}"
+        )
+    if cfg.v12_gate_power <= 0:
+        raise ValueError(f"--v12-gate-power must be > 0, got {cfg.v12_gate_power}")
+    if str(cfg.v12_delta_space).lower() not in ("image", "noise"):
+        raise ValueError(
+            f"--v12-delta-space must be one of ('image', 'noise'), got {cfg.v12_delta_space}"
+        )
     if cfg.outer_attack_weight < 0 or cfg.outer_clean_weight < 0:
         raise ValueError(
             "outer loss weights must be non-negative, got "
@@ -235,6 +266,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ToyConfig.v11_projection_mode,
         choices=["global_remaining", "step_clip", "step_exact", "kappa_clip", "none"],
     )
+    parser.add_argument("--v12-step-size", type=float, default=ToyConfig.v12_step_size)
+    parser.add_argument("--v12-lambda-init", type=float, default=ToyConfig.v12_lambda_init)
+    parser.add_argument("--v12-lambda-lr", type=float, default=ToyConfig.v12_lambda_lr)
+    parser.add_argument("--v12-rho-target", type=float, default=ToyConfig.v12_rho_target)
+    parser.add_argument("--v12-robust-mix", type=float, default=ToyConfig.v12_robust_mix)
+    parser.add_argument("--v12-start-step", type=int, default=ToyConfig.v12_start_step)
+    parser.add_argument("--v12-ramp-steps", type=int, default=ToyConfig.v12_ramp_steps)
+    parser.add_argument("--v12-max-delta", type=float, default=ToyConfig.v12_max_delta)
+    parser.add_argument("--v12-sigma-floor", type=float, default=ToyConfig.v12_sigma_floor)
+    parser.add_argument("--v12-sigma-cut", type=float, default=ToyConfig.v12_sigma_cut)
+    parser.add_argument("--v12-gate-power", type=float, default=ToyConfig.v12_gate_power)
+    parser.add_argument("--v12-delta-space", type=str, default=ToyConfig.v12_delta_space, choices=["image", "noise"])
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--v21-rho", type=float, default=ToyConfig.v21_rho)
     parser.add_argument("--use-time-dependent-kappa", action="store_true", default=ToyConfig.use_time_dependent_kappa)

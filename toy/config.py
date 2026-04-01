@@ -95,6 +95,19 @@ class ToyConfig:
     # - kappa_clip: fallback to v2-style local radius kappa_k * Delta_sigma_k.
     # - none: no projection.
     v11_projection_mode: str = "global_remaining"
+    # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
+    v12_step_size: float = 0.02
+    v12_lambda_init: float = 0.1
+    v12_lambda_lr: float = 1e-3
+    v12_rho_target: float = 1e-4
+    v12_robust_mix: float = 0.3
+    v12_start_step: int = 0
+    v12_ramp_steps: int = 0
+    v12_max_delta: float = 0.05
+    v12_sigma_floor: float = 0.0
+    v12_sigma_cut: float = 0.5
+    v12_gate_power: float = 2.0
+    v12_delta_space: str = "image"  # image|noise
     control_radius_kappa: float = 0.15
     # v2.1 non-Markovian reference update parameter in [0,1].
     v21_rho: float = 0.8

@@ -68,6 +68,8 @@ def _extract_row(exp_name: str, seed: int, method_version: str, payload: Dict[st
     metrics = payload["metrics"]
     sample = metrics.get("sample_quality_debug", {})
     gate = metrics.get("baseline_gate", {})
+    flow = metrics.get("flow_debug", {})
+    runtime = flow.get("runtime", {})
     constraint = metrics.get("constraint_debug", {})
     recovery = metrics.get("recovery_debug", {})
 
@@ -101,6 +103,9 @@ def _extract_row(exp_name: str, seed: int, method_version: str, payload: Dict[st
         "recovery_mse_attack_terminal": _safe_float(recovery.get("baseline_x0_mse_from_attack_terminal")),
         "paired_reverse_x0_l2": _safe_float(paired.get("x0_step_mean_l2")),
         "paired_reverse_terminal_l2": _safe_float(paired.get("terminal_step_mean_l2")),
+        "runtime_total_sec": _safe_float(runtime.get("total", flow.get("runtime_total_sec"))),
+        "runtime_total_without_fid_sec": _safe_float(runtime.get("total_without_fid")),
+        "runtime_robust_phase_sec": _safe_float(runtime.get("robust_phase")),
     }
     return row
 
@@ -130,6 +135,10 @@ def _aggregate(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             "recovery_mse_attack_terminal_mean": _safe_mean([r["recovery_mse_attack_terminal"] for r in sub]),
             "paired_reverse_x0_l2_mean": _safe_mean([r["paired_reverse_x0_l2"] for r in sub]),
             "paired_reverse_terminal_l2_mean": _safe_mean([r["paired_reverse_terminal_l2"] for r in sub]),
+            "runtime_total_sec_mean": _safe_mean([r["runtime_total_sec"] for r in sub]),
+            "runtime_total_sec_std": _safe_std([r["runtime_total_sec"] for r in sub]),
+            "runtime_robust_phase_sec_mean": _safe_mean([r["runtime_robust_phase_sec"] for r in sub]),
+            "runtime_robust_phase_sec_std": _safe_std([r["runtime_robust_phase_sec"] for r in sub]),
         }
     return out
 
@@ -201,8 +210,8 @@ def _write_markdown(path: Path, rows: List[Dict[str, Any]], agg: Dict[str, Dict[
     lines.append("")
     lines.append("## Per-run Metrics")
     lines.append("")
-    lines.append("| method | seed | attack_exec | gate_pass | baseline_fid | robust_fid | fid_gain | attack_gap_overall | attack_gap_high | attack_win | delta_ratio_mean | near_boundary_mean | rec_mse_ref | rec_mse_attack |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| method | seed | attack_exec | gate_pass | baseline_fid | robust_fid | fid_gain | runtime_total_s | runtime_robust_s | attack_gap_overall | attack_gap_high | attack_win | delta_ratio_mean | near_boundary_mean | rec_mse_ref | rec_mse_attack |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in sorted(rows, key=lambda z: (str(z["method_version"]), int(z["seed"]))):
         lines.append(
             "| "
@@ -215,6 +224,8 @@ def _write_markdown(path: Path, rows: List[Dict[str, Any]], agg: Dict[str, Dict[
                     _fmt(r["baseline_fid"]),
                     _fmt(r["robust_fid"]),
                     _fmt(r["fid_gain"]),
+                    _fmt(r["runtime_total_sec"]),
+                    _fmt(r["runtime_robust_phase_sec"]),
                     _fmt(r["attack_gap_overall"]),
                     _fmt(r["attack_gap_high_noise"]),
                     _fmt(r["attack_win_ratio_overall"]),
@@ -230,12 +241,14 @@ def _write_markdown(path: Path, rows: List[Dict[str, Any]], agg: Dict[str, Dict[
     lines.append("")
     lines.append("## Aggregate (mean ± std)")
     lines.append("")
-    lines.append("| method | runs | attack_exec_rate | gate_pass_rate | robust_fid | fid_gain | attack_gap_overall | attack_gap_high | attack_win | delta_ratio_mean | near_boundary_mean | rec_mse_ref | rec_mse_attack |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("| method | runs | attack_exec_rate | gate_pass_rate | robust_fid | fid_gain | runtime_total_s | runtime_robust_s | attack_gap_overall | attack_gap_high | attack_win | delta_ratio_mean | near_boundary_mean | rec_mse_ref | rec_mse_attack |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for method in sorted(agg.keys()):
         a = agg[method]
         robust_fid_text = f"{_fmt(a['robust_fid_mean'])} ± {_fmt(a['robust_fid_std'])}"
         fid_gain_text = f"{_fmt(a['fid_gain_mean'])} ± {_fmt(a['fid_gain_std'])}"
+        runtime_total_text = f"{_fmt(a['runtime_total_sec_mean'])} ± {_fmt(a['runtime_total_sec_std'])}"
+        runtime_robust_text = f"{_fmt(a['runtime_robust_phase_sec_mean'])} ± {_fmt(a['runtime_robust_phase_sec_std'])}"
         lines.append(
             "| "
             + " | ".join(
@@ -246,6 +259,8 @@ def _write_markdown(path: Path, rows: List[Dict[str, Any]], agg: Dict[str, Dict[
                     _fmt(a["gate_pass_rate"]),
                     robust_fid_text,
                     fid_gain_text,
+                    runtime_total_text,
+                    runtime_robust_text,
                     _fmt(a["attack_gap_overall_mean"]),
                     _fmt(a["attack_gap_high_noise_mean"]),
                     _fmt(a["attack_win_ratio_overall_mean"]),

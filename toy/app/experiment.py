@@ -3,6 +3,7 @@ import os
 import random
 import hashlib
 import uuid
+import time
 from datetime import datetime, timezone
 from typing import Dict
 
@@ -123,7 +124,7 @@ def _rollout_for_eval(
     rollout_kwargs: Dict,
     attack_net,
 ):
-    """Method-aware eval rollout. v1.1 can override with denoiser-dependent attack."""
+    """Method-aware eval rollout. v1.1/v1.2 may override with denoiser-dependent attack."""
 
     rollout_eval_fn = getattr(method, "rollout_eval", None)
     if callable(rollout_eval_fn):
@@ -415,6 +416,21 @@ def run_experiment(cfg) -> dict:
 
     device = pick_device(cfg.device)
     set_seed(cfg.seed)
+    run_t0 = time.perf_counter()
+    run_wall_start = datetime.now(timezone.utc).isoformat()
+    runtime_sec = {
+        "preflight": 0.0,
+        "baseline_phase": 0.0,
+        "baseline_ckpt_load": 0.0,
+        "baseline_train": 0.0,
+        "baseline_ckpt_save": 0.0,
+        "baseline_gate_eval": 0.0,
+        "robust_phase": 0.0,
+        "post_train_eval": 0.0,
+        "fid_baseline": 0.0,
+        "fid_robust": 0.0,
+        "plotting_and_persist": 0.0,
+    }
 
     ensure_dir(cfg.outdir)
     exp_dir = os.path.join(cfg.outdir, cfg.exp_name)
@@ -476,6 +492,7 @@ def run_experiment(cfg) -> dict:
 
     check_report = {}
     if cfg.run_checks:
+        t_phase = time.perf_counter()
         check_report = run_preflight_checks(
             robust,
             control,
@@ -485,6 +502,7 @@ def run_experiment(cfg) -> dict:
             sample_batch_fn=dataset.sample_population_batch,
             method=method,
         )
+        runtime_sec["preflight"] = float(time.perf_counter() - t_phase)
         print("[check] preflight passed", flush=True)
         print(
             f"[check] grad_rel_err denoiser={check_report['gradcheck_denoiser']['relative_error']:.3e} "
@@ -503,14 +521,17 @@ def run_experiment(cfg) -> dict:
     baseline_ckpt_loaded = False
     baseline_ckpt_saved = False
     baseline_ckpt_saved_at = None
+    t_baseline_phase = time.perf_counter()
 
     if baseline_ckpt_enabled and os.path.isfile(baseline_ckpt_path) and not baseline_ckpt_force_retrain:
+        t_phase = time.perf_counter()
         load_info = _load_baseline_checkpoint(
             baseline_model=baseline,
             ckpt_path=baseline_ckpt_path,
             signature=baseline_signature,
             strict_meta=baseline_ckpt_strict_meta,
         )
+        runtime_sec["baseline_ckpt_load"] += float(time.perf_counter() - t_phase)
         if load_info is not None:
             history_baseline = load_info["history"]
             baseline_eval = baseline
@@ -518,6 +539,7 @@ def run_experiment(cfg) -> dict:
             baseline_ckpt_saved_at = load_info.get("saved_at")
             print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
     if not baseline_ckpt_loaded:
+        t_phase = time.perf_counter()
         history_baseline, baseline_eval = train_baseline(
             baseline,
             centers,
@@ -527,17 +549,22 @@ def run_experiment(cfg) -> dict:
             sample_train_batch_fn=dataset.sample_train_batch,
             sample_population_batch_fn=dataset.sample_population_batch,
         )
+        runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
         if baseline_ckpt_enabled:
+            t_phase = time.perf_counter()
             _save_baseline_checkpoint(
                 ckpt_path=baseline_ckpt_path,
                 baseline_eval=baseline_eval,
                 baseline_history=history_baseline,
                 signature=baseline_signature,
             )
+            runtime_sec["baseline_ckpt_save"] += float(time.perf_counter() - t_phase)
             baseline_ckpt_saved = True
             print(f"[baseline] saved checkpoint: {baseline_ckpt_path}", flush=True)
+    runtime_sec["baseline_phase"] = float(time.perf_counter() - t_baseline_phase)
     baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
+    t_phase = time.perf_counter()
     baseline_gate = _run_with_scoped_seed(
         gate_eval_seed,
         lambda: _build_baseline_gate(
@@ -552,9 +579,11 @@ def run_experiment(cfg) -> dict:
             rollout_kwargs=rollout_kwargs,
         ),
     )
+    runtime_sec["baseline_gate_eval"] = float(time.perf_counter() - t_phase)
     baseline_gate["eval_seed"] = int(gate_eval_seed)
     baseline_gate["eval_seed_scoped"] = True
 
+    t_phase = time.perf_counter()
     attack_training_executed, history_robust, robust = _run_robust_phase(
         cfg=cfg,
         robust=robust,
@@ -565,11 +594,13 @@ def run_experiment(cfg) -> dict:
         baseline_gate=baseline_gate,
         method=method,
     )
+    runtime_sec["robust_phase"] = float(time.perf_counter() - t_phase)
     if not attack_training_executed:
         robust = baseline_eval
 
     # Re-seed post-training diagnostics to keep v2/v2.1 comparisons reproducible.
     set_seed(metrics_eval_seed)
+    t_post_eval = time.perf_counter()
 
     # Evaluate denoise curves on train-pool and held-out pools to expose overfitting under limited data.
     x_train_eval = dataset.sample_train_batch(cfg.debug_eval_batch)
@@ -751,6 +782,7 @@ def run_experiment(cfg) -> dict:
         noise_schedule=shared_gen_reverse_noise,
     )
     robust_gen_np = tensor_to_numpy(robust_gen_paths[:, 0])
+    runtime_sec["post_train_eval"] = float(time.perf_counter() - t_post_eval)
     val_pool_np = tensor_to_numpy(dataset.val_pool)
     train_pool_np = tensor_to_numpy(dataset.train_pool) if dataset.train_pool is not None else None
     enable_ref_dist = bool(dataset.metadata.get("enable_nearest_reference_distance", True))
@@ -1040,6 +1072,8 @@ def run_experiment(cfg) -> dict:
             return float(match.group(1))
 
         def calc_fid_for_batch(batch_np, prefix):
+            t_fid = time.perf_counter()
+
             fid_dir = os.path.join(exp_dir, f"fid_{prefix}")
             if os.path.isdir(fid_dir):
                 shutil.rmtree(fid_dir)
@@ -1052,7 +1086,7 @@ def run_experiment(cfg) -> dict:
                     f"[WARN] Need at least 2 generated images for FID, got {n_available} ({prefix}).",
                     flush=True,
                 )
-                return None
+                return None, float(time.perf_counter() - t_fid)
             n_images = min(n_available, max(2, n_requested))
             batch_np = batch_np[:n_images]
 
@@ -1072,7 +1106,7 @@ def run_experiment(cfg) -> dict:
                     f"[WARN] FID reference not found. Checked: {ref_candidates}",
                     flush=True,
                 )
-                return None
+                return None, float(time.perf_counter() - t_fid)
 
             fid_env = os.environ.copy()
             detector_path = fid_env.get("FID_DETECTOR_PATH", "").strip()
@@ -1133,24 +1167,29 @@ def run_experiment(cfg) -> dict:
                     print(f"[WARN] FID stderr (tail):\n{res.stderr[-2000:]}", flush=True)
                 if res.stdout:
                     print(f"[WARN] FID stdout (tail):\n{res.stdout[-1000:]}", flush=True)
-                return None
+                return None, float(time.perf_counter() - t_fid)
 
             fid_value = _extract_float(res.stdout)
             if fid_value is None:
                 fid_value = _extract_float(res.stderr)
             if fid_value is not None:
-                return fid_value
+                return fid_value, float(time.perf_counter() - t_fid)
 
             print(
                 f"[WARN] FID output did not contain a parseable float for {prefix}. "
                 f"See {log_path}",
                 flush=True,
             )
-            return None
+            return None, float(time.perf_counter() - t_fid)
 
-        metrics["sample_quality_debug"]["baseline_fid"] = calc_fid_for_batch(baseline_gen_np, "baseline")
-        metrics["sample_quality_debug"]["robust_fid"] = calc_fid_for_batch(robust_gen_np, "robust")
+        baseline_fid, runtime_fid_baseline = calc_fid_for_batch(baseline_gen_np, "baseline")
+        robust_fid, runtime_fid_robust = calc_fid_for_batch(robust_gen_np, "robust")
+        metrics["sample_quality_debug"]["baseline_fid"] = baseline_fid
+        metrics["sample_quality_debug"]["robust_fid"] = robust_fid
+        runtime_sec["fid_baseline"] = float(runtime_fid_baseline)
+        runtime_sec["fid_robust"] = float(runtime_fid_robust)
 
+    t_plot = time.perf_counter()
     diagnostics.plot_forward_backward_debug(
         fwd_baseline_paths=tensor_to_numpy(ref_paths_plot),
         bwd_baseline_paths=rev_baseline_from_ref_np,
@@ -1167,6 +1206,34 @@ def run_experiment(cfg) -> dict:
         recovery_attack_curve=recovery_attack_curve,
         out_path=os.path.join(exp_dir, "debug_losses_and_recovery.png"),
     )
+    runtime_sec["plotting_and_persist"] = float(time.perf_counter() - t_plot)
+
+    run_total_sec = float(time.perf_counter() - run_t0)
+    run_wall_end = datetime.now(timezone.utc).isoformat()
+    runtime_sec["total"] = run_total_sec
+    runtime_sec["robust_train_only"] = float(runtime_sec["robust_phase"])
+    runtime_sec["baseline_train_only"] = float(runtime_sec["baseline_train"])
+    runtime_sec["total_without_fid"] = float(
+        run_total_sec - runtime_sec["fid_baseline"] - runtime_sec["fid_robust"]
+    )
+    runtime_sec["total_without_fid"] = max(runtime_sec["total_without_fid"], 0.0)
+    runtime_sec["effective_train_total"] = float(runtime_sec["baseline_train"] + runtime_sec["robust_phase"])
+    runtime_sec["baseline_steps_per_sec"] = (
+        float(cfg.steps) / float(runtime_sec["baseline_train"])
+        if runtime_sec["baseline_train"] > 0
+        else None
+    )
+    runtime_sec["robust_steps_per_sec"] = (
+        float(cfg.steps) / float(runtime_sec["robust_phase"])
+        if attack_training_executed and runtime_sec["robust_phase"] > 0
+        else None
+    )
+    runtime_sec["run_started_utc"] = run_wall_start
+    runtime_sec["run_finished_utc"] = run_wall_end
+    runtime_sec["attack_training_executed"] = bool(attack_training_executed)
+
+    metrics["flow_debug"]["runtime"] = runtime_sec
+    metrics["flow_debug"]["runtime_total_sec"] = run_total_sec
 
     payload = {"config": vars(cfg), "metrics": as_jsonable_metrics(metrics)}
     with open(os.path.join(exp_dir, "metrics.json"), "w", encoding="utf-8") as f:
@@ -1226,5 +1293,15 @@ def run_experiment(cfg) -> dict:
         print(f"  [warn] {warning}", flush=True)
     if check_report:
         print(f"  checks: {check_report}", flush=True)
+    print(
+        "  runtime_debug:"
+        f" total={runtime_sec['total']:.2f}s,"
+        f" baseline_train={runtime_sec['baseline_train']:.2f}s,"
+        f" robust_phase={runtime_sec['robust_phase']:.2f}s,"
+        f" post_eval={runtime_sec['post_train_eval']:.2f}s,"
+        f" fid_baseline={runtime_sec['fid_baseline']:.2f}s,"
+        f" fid_robust={runtime_sec['fid_robust']:.2f}s",
+        flush=True,
+    )
     print(f"[result] artifacts saved to: {exp_dir}", flush=True)
     return payload
