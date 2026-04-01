@@ -1,11 +1,12 @@
-from .diffusion import build_kappa_schedule, rollout_controlled_ve, rollout_path_heuristic_attack
+from ...shared.train_utils import zero_control
+from .diffusion import build_kappa_schedule, rollout_controlled_ve
 from .trainer import train_trajectory_robust_constrained
 
 NAME = "v1.2"
 IMPLEMENTED = True
 DESCRIPTION = (
-    "CDRO-EDM-inspired upgrade of v1.1: path-heuristic attack with adaptive dual-lambda "
-    "transport regularization, sigma-gated perturbations, and robust/clean outer-loss mixing."
+    "CDRO-EDM aligned training (single-sigma adversarial batch): inner ascent over delta on "
+    "noisy samples, sigma-gated perturbations, dual-lambda transport control, and clean/robust mix."
 )
 
 
@@ -23,23 +24,15 @@ def rollout_eval(
     control_radius_kappa,
     kappa_by_step=None,
 ):
-    """Evaluation rollout for v1.2 using denoiser-dependent path-heuristic attack."""
+    """CDRO-EDM has no path control policy; eval uses reference rollout (delta=0)."""
 
-    return rollout_path_heuristic_attack(
-        cfg=cfg,
+    del cfg, attack_net
+    return rollout_controlled_ve(
         x0=x0,
         target_indices=target_indices,
-        attack_net=attack_net,
+        control_net=zero_control,
         sigma_levels=sigma_levels,
-        inner_steps=int(cfg.inner_steps),
-        step_size=float(cfg.v12_step_size),
-        lambda_dual=float(cfg.v12_lambda_init),
-        activation_scale=1.0,
-        max_delta=float(cfg.v12_max_delta),
-        sigma_floor=float(cfg.v12_sigma_floor),
-        sigma_cut=float(cfg.v12_sigma_cut),
-        gate_power=float(cfg.v12_gate_power),
-        delta_space=str(cfg.v12_delta_space).lower(),
+        grad_through_control=False,
         control_radius_kappa=float(control_radius_kappa),
         kappa_by_step=kappa_by_step,
     )

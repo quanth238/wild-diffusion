@@ -70,6 +70,7 @@ WILD_DELTA_RATIO_DENOM="${WILD_DELTA_RATIO_DENOM:-1.0}"
 
 # v1.2 (CDRO-EDM-inspired path-heuristic)
 V12_STEP_SIZE="${V12_STEP_SIZE:-0.02}"
+V12_ADV_STEPS="${V12_ADV_STEPS:-1}"
 V12_LAMBDA_INIT="${V12_LAMBDA_INIT:-0.1}"
 V12_LAMBDA_LR="${V12_LAMBDA_LR:-0.001}"
 V12_RHO_TARGET="${V12_RHO_TARGET:-0.0001}"
@@ -110,7 +111,7 @@ echo "WARMUP_CLEAN_STEPS=${WARMUP_CLEAN_STEPS} WARMUP_RAMP_STEPS=${WARMUP_RAMP_S
 echo "OUTDIR=${OUTDIR} PREFIX=${PREFIX}"
 echo "BASELINE_CKPT_PATH=${BASELINE_CKPT_PATH}"
 echo "WILD: interval=${WILD_UPDATE_INTERVAL} cache_batches=${WILD_CACHE_BATCHES} inner_steps=${WILD_INNER_STEPS} step_size=${WILD_STEP_SIZE} gamma=${WILD_GAMMA}"
-echo "v1.2: step_size=${V12_STEP_SIZE} lambda_init=${V12_LAMBDA_INIT} lambda_lr=${V12_LAMBDA_LR} rho_target=${V12_RHO_TARGET} robust_mix=${V12_ROBUST_MIX}"
+echo "v1.2: adv_steps=${V12_ADV_STEPS} step_size=${V12_STEP_SIZE} lambda_init=${V12_LAMBDA_INIT} lambda_lr=${V12_LAMBDA_LR} rho_target=${V12_RHO_TARGET} robust_mix=${V12_ROBUST_MIX}"
 echo "STRICT_FAIRNESS_CHECK=${STRICT_FAIRNESS_CHECK} BASELINE_FID_SPREAD_TOL=${BASELINE_FID_SPREAD_TOL}"
 
 echo "=== Ensure MNIST FID reference ==="
@@ -171,6 +172,7 @@ if [[ "${WILD_CLAMP_SAMPLES}" == "1" ]]; then
 fi
 
 V12_ARGS=(
+  --inner-steps "${V12_ADV_STEPS}"
   --v12-step-size "${V12_STEP_SIZE}"
   --v12-lambda-init "${V12_LAMBDA_INIT}"
   --v12-lambda-lr "${V12_LAMBDA_LR}"
