@@ -207,6 +207,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-only", action="store_true", default=ToyConfig.baseline_only)
     parser.add_argument("--compute-fid", action="store_true", default=ToyConfig.compute_fid)
     parser.add_argument("--fid-samples", type=int, default=ToyConfig.fid_samples)
+    parser.add_argument("--fid-ref-path", type=str, default=ToyConfig.fid_ref_path)
+    parser.add_argument("--fid-ref-policy", type=str, default=ToyConfig.fid_ref_policy)
     parser.add_argument("--eval-seed-offset-gate", type=int, default=ToyConfig.eval_seed_offset_gate)
     parser.add_argument("--eval-seed-offset-metrics", type=int, default=ToyConfig.eval_seed_offset_metrics)
     parser.add_argument("--disable-eval-shared-terminal-noise", action="store_true")

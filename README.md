@@ -1,5 +1,11 @@
-# v2.1 Alias
+# Wild Diffusion
 
-`v2.1` implementation is located in `toy/versions/v2_1/`.
+Start with [docs/CODEBASE_MAP.md](/root/wild-diffusion/docs/CODEBASE_MAP.md).
 
-This alias folder exists for project naming consistency only.
+Canonical entrypoints:
+
+- Toy experiments: `python toy/run_toy.py ...`
+- Image-scale EDM/WDRO training: `python train.py ...`
+- Image generation from saved EDM checkpoints: `python generate.py ...`
+
+The repo contains some root-level toy-named files (`cli.py`, `experiment.py`, `method.py`, `registry.py`) that are not the main path used by the current scripts. Treat the `toy/` package as the canonical toy implementation unless you have a specific reason not to.

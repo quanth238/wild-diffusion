@@ -39,6 +39,8 @@ class ToyConfig:
     baseline_only: bool = False
     use_ema_eval: bool = False
     ema_decay: float = 0.995
+    fid_ref_path: str = ""
+    fid_ref_policy: str = "auto"
     # Baseline checkpoint cache for fair cross-version comparison:
     # - if enabled and checkpoint exists: load baseline (skip baseline retrain).
     # - else: train baseline once, then save it for reuse by later runs.

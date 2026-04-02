@@ -5,7 +5,7 @@ import hashlib
 import uuid
 import time
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -67,6 +67,19 @@ def _run_with_scoped_seed(seed: int, fn):
         return fn()
     finally:
         _restore_rng_state(state)
+
+
+def _load_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
+    """Load small JSON sidecar metadata when present."""
+
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
 
 
 def _print_dataset_info(cfg, dataset: DatasetBundle) -> None:
@@ -819,6 +832,9 @@ def run_experiment(cfg) -> dict:
             abs(diag_gap_ratio_summary["mean_last"]) <= float(cfg.collapse_gap_ratio_tol)
             and diag_delta_ratio_summary["mean_last"] <= float(cfg.collapse_delta_ratio_tol)
         )
+    baseline_images_seen_total = int(0 if baseline_ckpt_loaded else int(cfg.steps) * int(cfg.batch_size))
+    robust_images_seen_total = int(int(cfg.steps) * int(cfg.batch_size) if attack_training_executed else 0)
+    effective_train_images_seen_total = int(baseline_images_seen_total + robust_images_seen_total)
 
     metrics = {
         "flow_debug": {
@@ -869,6 +885,16 @@ def run_experiment(cfg) -> dict:
                     "a forward over B*T path states counts as T units."
                 ),
                 "diagnostics_included": False,
+            },
+            "budget_accounting": {
+                "image_unit_name": "images_seen",
+                "image_unit_definition": (
+                    "One training sample drawn for one optimizer step counts as 1 image seen."
+                ),
+                "batch_size": int(cfg.batch_size),
+                "baseline_images_seen_total": baseline_images_seen_total,
+                "robust_images_seen_total": robust_images_seen_total,
+                "effective_train_images_seen_total": effective_train_images_seen_total,
             },
         },
         "dataset_debug": {
@@ -1039,6 +1065,19 @@ def run_experiment(cfg) -> dict:
                 "shared_terminal_noise": bool(cfg.eval_use_shared_terminal_noise),
                 "shared_reverse_noise": bool(cfg.eval_use_shared_reverse_noise),
             },
+            "fid_reference": {
+                "policy_name": str(getattr(cfg, "fid_ref_policy", "auto")),
+                "requested_path": (
+                    os.path.abspath(str(getattr(cfg, "fid_ref_path", "")).strip())
+                    if str(getattr(cfg, "fid_ref_path", "")).strip()
+                    else None
+                ),
+                "resolved_path": None,
+                "resolved_via": None,
+                "checked_candidates": [],
+                "metadata_path": None,
+                "metadata": None,
+            },
             "baseline_generated_metrics": dataset.evaluate_sample_metrics(baseline_gen_np),
             "robust_generated_metrics": dataset.evaluate_sample_metrics(robust_gen_np),
             "baseline_generated_to_train_min_dist": (
@@ -1077,10 +1116,16 @@ def run_experiment(cfg) -> dict:
 
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         fid_script = os.path.join(repo_root, "fid.py")
-        ref_candidates = [
-            os.path.join(repo_root, cfg.outdir, "mnist_ref.npz"),
-            os.path.join(repo_root, "toy_outputs", "mnist_ref.npz"),
-        ]
+        fid_ref_info = metrics["sample_quality_debug"]["fid_reference"]
+        explicit_ref_path = str(getattr(cfg, "fid_ref_path", "")).strip()
+        if explicit_ref_path:
+            ref_candidates = [os.path.abspath(explicit_ref_path)]
+        else:
+            ref_candidates = [
+                os.path.join(repo_root, cfg.outdir, "mnist_ref.npz"),
+                os.path.join(repo_root, "toy_outputs", "mnist_ref.npz"),
+            ]
+        fid_ref_info["checked_candidates"] = [str(p) for p in ref_candidates]
 
         # Training/eval models are no longer used after this point; release VRAM
         # before spawning FID subprocess (helps avoid CUDA OOM in child process).
@@ -1136,6 +1181,12 @@ def run_experiment(cfg) -> dict:
                     flush=True,
                 )
                 return None, float(time.perf_counter() - t_fid)
+            fid_ref_info["resolved_path"] = str(ref_path)
+            fid_ref_info["resolved_via"] = "explicit" if explicit_ref_path else "fallback_search"
+            ref_meta_path = f"{ref_path}.json"
+            ref_meta = _load_json_if_exists(ref_meta_path)
+            fid_ref_info["metadata_path"] = ref_meta_path if ref_meta is not None else None
+            fid_ref_info["metadata"] = ref_meta
 
             fid_env = os.environ.copy()
             detector_path = fid_env.get("FID_DETECTOR_PATH", "").strip()
@@ -1257,6 +1308,9 @@ def run_experiment(cfg) -> dict:
         if attack_training_executed and runtime_sec["robust_phase"] > 0
         else None
     )
+    runtime_sec["baseline_images_seen_total"] = baseline_images_seen_total
+    runtime_sec["robust_images_seen_total"] = robust_images_seen_total
+    runtime_sec["effective_train_images_seen_total"] = effective_train_images_seen_total
     robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
     runtime_sec["robust_batch_equiv_denoiser_evals_total"] = robust_batch_equiv_total
     runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (

@@ -35,6 +35,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+else:
+    from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+
 
 def _repo_root() -> Path:
     # .../toy/scripts/compare_fid_curve_methods.py -> repo root
@@ -239,6 +245,11 @@ class RunRow:
     baseline_ckpt_signature_hash: str
     baseline_ckpt_path: str
     attack_training_executed: bool
+    robust_images_seen_total: float
+    effective_train_images_seen_total: float
+    robust_batch_equiv_denoiser_evals_total: float
+    fid_ref_policy_name: str
+    fid_ref_resolved_path: str
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -257,6 +268,11 @@ class RunRow:
             "baseline_ckpt_signature_hash": self.baseline_ckpt_signature_hash,
             "baseline_ckpt_path": self.baseline_ckpt_path,
             "attack_training_executed": self.attack_training_executed,
+            "robust_images_seen_total": self.robust_images_seen_total,
+            "effective_train_images_seen_total": self.effective_train_images_seen_total,
+            "robust_batch_equiv_denoiser_evals_total": self.robust_batch_equiv_denoiser_evals_total,
+            "fid_ref_policy_name": self.fid_ref_policy_name,
+            "fid_ref_resolved_path": self.fid_ref_resolved_path,
         }
 
 
@@ -264,6 +280,7 @@ def _load_row(metrics_path: Path, method: str, step: int, exp_name: str) -> RunR
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     metrics = payload.get("metrics", {})
     sq = metrics.get("sample_quality_debug", {})
+    fid_ref = sq.get("fid_reference", {})
     flow = metrics.get("flow_debug", {})
     runtime = flow.get("runtime", {})
     gate = metrics.get("baseline_gate", {})
@@ -288,6 +305,11 @@ def _load_row(metrics_path: Path, method: str, step: int, exp_name: str) -> RunR
         baseline_ckpt_signature_hash=str(flow.get("baseline_ckpt_signature_hash", "")),
         baseline_ckpt_path=str(flow.get("baseline_ckpt_path", "")),
         attack_training_executed=bool(gate.get("attack_training_executed", False)),
+        robust_images_seen_total=_safe_float(runtime.get("robust_images_seen_total")),
+        effective_train_images_seen_total=_safe_float(runtime.get("effective_train_images_seen_total")),
+        robust_batch_equiv_denoiser_evals_total=_safe_float(runtime.get("robust_batch_equiv_denoiser_evals_total")),
+        fid_ref_policy_name=str(fid_ref.get("policy_name", "")),
+        fid_ref_resolved_path=str(fid_ref.get("resolved_path", "")),
     )
 
 
@@ -312,6 +334,65 @@ def _group_rows(rows: List[RunRow]) -> Dict[str, List[RunRow]]:
     for method in out:
         out[method] = sorted(out[method], key=lambda r: r.step)
     return out
+
+
+def _budget_value(row: RunRow, budget_field: str) -> float:
+    return _safe_float(getattr(row, budget_field))
+
+
+def _budget_label(budget_field: str) -> str:
+    return {
+        "robust_batch_equiv_denoiser_evals_total": "Robust Batch-Equivalent Denoiser Evals",
+        "robust_images_seen_total": "Robust Images Seen",
+    }[budget_field]
+
+
+def _budget_summary_rows(rows: List[RunRow], methods: List[str], budget_field: str) -> List[Dict[str, Any]]:
+    grouped = _group_rows(rows)
+    budgets = sorted(
+        {
+            float(v)
+            for row in rows
+            for v in [_budget_value(row, budget_field)]
+            if math.isfinite(v)
+        }
+    )
+    summary_rows: List[Dict[str, Any]] = []
+    for method in methods:
+        sub = sorted(
+            grouped.get(method, []),
+            key=lambda r: (_budget_value(r, budget_field), r.step),
+        )
+        for budget_limit in budgets:
+            eligible = [
+                row
+                for row in sub
+                if math.isfinite(_budget_value(row, budget_field)) and _budget_value(row, budget_field) <= budget_limit
+            ]
+            if not eligible:
+                continue
+            eligible_finite = [row for row in eligible if math.isfinite(row.robust_fid)]
+            best_row = min(
+                eligible_finite,
+                key=lambda r: (r.robust_fid, _budget_value(r, budget_field), r.step),
+            ) if eligible_finite else None
+            final_row = max(eligible, key=lambda r: (_budget_value(r, budget_field), r.step))
+            summary_rows.append(
+                {
+                    "budget_metric": budget_field,
+                    "budget_metric_label": _budget_label(budget_field),
+                    "method": method,
+                    "method_label": _method_label(method),
+                    "budget_limit": float(budget_limit),
+                    "best_within_budget_fid": None if best_row is None else float(best_row.robust_fid),
+                    "best_within_budget_step": None if best_row is None else int(best_row.step),
+                    "best_within_budget_budget": None if best_row is None else float(_budget_value(best_row, budget_field)),
+                    "final_at_budget_fid": float(final_row.robust_fid) if math.isfinite(final_row.robust_fid) else None,
+                    "final_at_budget_step": int(final_row.step),
+                    "final_at_budget_budget": float(_budget_value(final_row, budget_field)),
+                }
+            )
+    return summary_rows
 
 
 def _plot_panel(rows: List[RunRow], methods: List[str], out_path: Path) -> None:
@@ -351,6 +432,46 @@ def _plot_panel(rows: List[RunRow], methods: List[str], out_path: Path) -> None:
     plt.close(fig)
 
 
+def _plot_budget_panel(rows: List[RunRow], methods: List[str], out_path: Path, budget_field: str) -> None:
+    grouped = _group_rows(rows)
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
+    axes_flat = axes.flatten()
+    x_label = _budget_label(budget_field)
+
+    for ax_idx, method in enumerate(methods):
+        ax = axes_flat[ax_idx]
+        sub = [
+            row for row in grouped.get(method, []) if math.isfinite(_budget_value(row, budget_field))
+        ]
+        sub = sorted(sub, key=lambda r: (_budget_value(r, budget_field), r.step))
+        if not sub:
+            ax.set_title(f"{_method_label(method)} (no data)")
+            ax.axis("off")
+            continue
+        x = [_budget_value(r, budget_field) for r in sub]
+        y_rob = [r.robust_fid for r in sub]
+        y_base = [r.baseline_fid for r in sub]
+        ax.plot(x, y_rob, marker="o", linewidth=2.0, label="robust_fid")
+        ax.plot(x, y_base, linestyle="--", linewidth=1.8, label="baseline_fid")
+        ax.grid(alpha=0.25)
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("FID (lower is better)")
+        finite_pairs = [(xv, yv, row.step) for xv, yv, row in zip(x, y_rob, sub) if math.isfinite(yv)]
+        if finite_pairs:
+            best_budget, best_fid, best_step = min(finite_pairs, key=lambda item: (item[1], item[0], item[2]))
+            ax.set_title(f"{_method_label(method)} | best={best_fid:.3f} @ {best_budget:.1f} ({best_step} st)")
+        else:
+            ax.set_title(_method_label(method))
+        ax.legend(loc="best", fontsize=8)
+
+    for idx in range(len(methods), 4):
+        axes_flat[idx].axis("off")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
 def _fairness_checks(rows: List[RunRow], steps: List[int]) -> Dict[str, Any]:
     by_step: Dict[int, List[RunRow]] = {}
     for row in rows:
@@ -374,6 +495,8 @@ def _fairness_checks(rows: List[RunRow], steps: List[int]) -> Dict[str, Any]:
         "baseline_fid_spread_by_step": spread_by_step,
         "baseline_ckpt_hash_unique_count_by_step": hash_count_by_step,
         "all_baseline_ckpt_loaded_by_step": all_loaded_by_step,
+        "fid_ref_policy_unique_count": int(len({r.fid_ref_policy_name for r in rows if r.fid_ref_policy_name})),
+        "fid_ref_path_unique_count": int(len({r.fid_ref_resolved_path for r in rows if r.fid_ref_resolved_path})),
     }
 
 
@@ -404,6 +527,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ema-decay", type=float, default=0.999)
     p.add_argument("--eval-samples", type=int, default=2000)
     p.add_argument("--fid-samples", type=int, default=2000)
+    p.add_argument("--fid-ref-split", type=str, default="test", choices=["train", "test"])
+    p.add_argument("--fid-ref-subset-percent", type=float, default=100.0)
+    p.add_argument(
+        "--fid-ref-subset-sampling",
+        type=str,
+        default="stratified",
+        choices=["first", "global", "stratified"],
+    )
+    p.add_argument("--fid-ref-subset-seed", type=int, default=0)
+    p.add_argument("--fid-ref-max-images", type=int, default=5000)
+    p.add_argument("--force-ref-refresh", action="store_true")
     p.add_argument("--warmup-clean-steps", type=int, default=900)
     p.add_argument("--warmup-ramp-steps", type=int, default=600)
     p.add_argument("--device", type=str, default="cuda")
@@ -468,7 +602,6 @@ def main() -> None:
     methods = _parse_methods(args.methods)
     repo_root = _repo_root()
     run_toy = repo_root / "toy" / "run_toy.py"
-    export_ref = repo_root / "toy" / "export_mnist_fid_ref.py"
 
     if args.require_cuda and not torch.cuda.is_available():
         raise SystemExit("[ERROR] --require-cuda is set but torch.cuda.is_available() is False.")
@@ -479,8 +612,42 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     alias_dir = (args.alias_ckpt_dir or (outdir / "_baseline_alias_ckpt")).resolve()
     alias_dir.mkdir(parents=True, exist_ok=True)
-
-    _run([sys.executable, str(export_ref)], cwd=repo_root, dry_run=args.dry_run)
+    fid_ref_policy_name = default_mnist_fid_policy_name(
+        split=str(args.fid_ref_split),
+        image_size=int(args.image_size),
+        subset_percent=float(args.fid_ref_subset_percent),
+        subset_sampling=str(args.fid_ref_subset_sampling),
+        subset_seed=int(args.fid_ref_subset_seed),
+        max_images=int(args.fid_ref_max_images),
+    )
+    fid_ref_dir = (outdir / "_fid_refs").resolve()
+    fid_ref_path = fid_ref_dir / f"{fid_ref_policy_name}.npz"
+    fid_ref_meta: Dict[str, Any]
+    if args.dry_run:
+        fid_ref_meta = {
+            "policy_name": fid_ref_policy_name,
+            "split": str(args.fid_ref_split),
+            "image_size": int(args.image_size),
+            "subset_percent_requested": float(args.fid_ref_subset_percent),
+            "subset_sampling": str(args.fid_ref_subset_sampling),
+            "subset_seed": int(args.fid_ref_subset_seed),
+            "max_images_requested": int(args.fid_ref_max_images),
+            "dest": str(fid_ref_path),
+        }
+        print(f"[dry-run] would ensure MNIST FID reference: {fid_ref_path}", flush=True)
+    else:
+        fid_ref_meta = build_mnist_fid_reference(
+            split=str(args.fid_ref_split),
+            image_size=int(args.image_size),
+            subset_percent=float(args.fid_ref_subset_percent),
+            subset_sampling=str(args.fid_ref_subset_sampling),
+            subset_seed=int(args.fid_ref_subset_seed),
+            max_images=int(args.fid_ref_max_images),
+            dest=fid_ref_path,
+            images_dir=fid_ref_dir / f"{fid_ref_policy_name}_images",
+            policy_name=fid_ref_policy_name,
+            force=bool(args.force_ref_refresh),
+        )
 
     rows: List[RunRow] = []
     for step in steps:
@@ -538,6 +705,10 @@ def main() -> None:
                     "--compute-fid",
                     "--fid-samples",
                     str(args.fid_samples),
+                    "--fid-ref-path",
+                    str(fid_ref_path),
+                    "--fid-ref-policy",
+                    fid_ref_policy_name,
                     "--skip-checks",
                     "--disable-baseline-gate",
                     "--seed",
@@ -570,6 +741,8 @@ def main() -> None:
                 "[row]"
                 f" method={row.method_label} step={row.step}"
                 f" baseline_fid={_fmt(row.baseline_fid)} robust_fid={_fmt(row.robust_fid)}"
+                f" robust_images={_fmt(row.robust_images_seen_total, 1)}"
+                f" robust_be={_fmt(row.robust_batch_equiv_denoiser_evals_total, 1)}"
                 f" delta={_fmt(row.fid_delta)} runtime_total={_fmt(row.runtime_total_sec, 2)}s",
                 flush=True,
             )
@@ -584,6 +757,15 @@ def main() -> None:
 
     panel_path = outdir / f"{args.prefix}_fid_curve_panel_s{args.seed}.png"
     _plot_panel(rows, methods, panel_path)
+    budget_panel_path = outdir / f"{args.prefix}_fid_curve_budget_panel_s{args.seed}.png"
+    _plot_budget_panel(rows, methods, budget_panel_path, "robust_batch_equiv_denoiser_evals_total")
+
+    budget_frontier_compute_rows = _budget_summary_rows(rows, methods, "robust_batch_equiv_denoiser_evals_total")
+    budget_frontier_images_rows = _budget_summary_rows(rows, methods, "robust_images_seen_total")
+    budget_frontier_compute_csv = outdir / f"{args.prefix}_budget_frontier_compute_s{args.seed}.csv"
+    budget_frontier_images_csv = outdir / f"{args.prefix}_budget_frontier_images_s{args.seed}.csv"
+    _write_csv(budget_frontier_compute_csv, budget_frontier_compute_rows)
+    _write_csv(budget_frontier_images_csv, budget_frontier_images_rows)
 
     checks = _fairness_checks(rows, steps)
     summary = {
@@ -593,18 +775,33 @@ def main() -> None:
         "methods": methods,
         "protocol": {
             "name": "fixed_baseline_finetune_curve",
+            "family": "fixed_baseline_finetune_curve",
             "description": (
                 "Each point trains robust method for S steps from the same baseline weights. "
                 "Per-step alias checkpoint adjusts baseline_steps metadata only."
             ),
+            "comparison_question": (
+                "Compare robust fine-tuning behavior from a shared pretrained baseline, "
+                "not from-scratch convergence."
+            ),
             "baseline_ckpt_source": str(args.baseline_ckpt_source.resolve()),
             "alias_ckpt_dir": str(alias_dir),
+            "warmup_clean_steps": int(args.warmup_clean_steps),
+            "warmup_ramp_steps": int(args.warmup_ramp_steps),
+            "fid_reference": fid_ref_meta,
         },
         "rows": [r.to_dict() for r in rows],
+        "budget_frontiers": {
+            "robust_batch_equiv_denoiser_evals_total": budget_frontier_compute_rows,
+            "robust_images_seen_total": budget_frontier_images_rows,
+        },
         "fairness_checks": checks,
         "artifacts": {
             "csv": str(csv_path),
             "panel": str(panel_path),
+            "budget_panel": str(budget_panel_path),
+            "budget_frontier_compute_csv": str(budget_frontier_compute_csv),
+            "budget_frontier_images_csv": str(budget_frontier_images_csv),
         },
     }
     summary_path = outdir / f"{args.prefix}_fid_curve_summary_s{args.seed}.json"
@@ -618,4 +815,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
