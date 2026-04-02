@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch_utils import persistence, training_stats
 
@@ -9,6 +11,10 @@ def _sample_edm_corruption(images, *, P_mean, P_std, sigma_data, augment_pipe):
     y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
     noise = torch.randn_like(y) * sigma
     return sigma, weight, y, augment_labels, noise
+
+
+def _per_sample_rms(x):
+    return x.square().mean(dim=[1, 2, 3]).sqrt()
 
 
 class _GradReverse(torch.autograd.Function):
@@ -271,7 +277,9 @@ class EDMLossCDRO:
 
             grad_view = grad_delta.view(grad_delta.shape[0], -1)
             grad_norm = grad_view.norm(p=2, dim=1, keepdim=True).clamp(min=1e-12)
-            step = self.adv_step_size * (grad_view / grad_norm).view_as(delta)
+            # Interpret adv_step_size in per-sample RMS units, not raw L2 length.
+            step_l2 = self.adv_step_size * math.sqrt(delta[0].numel())
+            step = step_l2 * (grad_view / grad_norm).view_as(delta)
             delta = (delta + step).detach()
             delta = self.project_l2(delta, radius).detach()
 
@@ -315,12 +323,17 @@ class EDMLossCDRO:
             self.lambda_dual + self.lambda_lr * (mean_transport.item() - self.rho_target),
         )
 
+        raw_delta_rms = _per_sample_rms(delta.detach()).mean()
+        applied_delta_rms = _per_sample_rms(applied_delta.detach()).mean()
+        radius_utilization = applied_delta_rms / max(float(self.max_delta), 1e-8)
+
         training_stats.report("CDRO/lambda_dual", self.lambda_dual)
         training_stats.report("CDRO/mean_transport_cost", mean_transport)
         training_stats.report("CDRO/activation_scale", self.activation_scale())
         training_stats.report("CDRO/gate_mean", gate.mean())
-        training_stats.report("CDRO/raw_delta_rms", delta.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
-        training_stats.report("CDRO/applied_delta_rms", applied_delta.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
+        training_stats.report("CDRO/raw_delta_rms", raw_delta_rms)
+        training_stats.report("CDRO/applied_delta_rms", applied_delta_rms)
+        training_stats.report("CDRO/radius_utilization", radius_utilization)
 
         return loss
 
@@ -467,11 +480,16 @@ class EDMLossCDROMarkov:
             self.lambda_dual + self.lambda_lr * (mean_transport.item() - self.rho_target),
         )
 
+        control_rms = _per_sample_rms(control.detach()).mean()
+        applied_delta_rms = _per_sample_rms(applied_delta.detach()).mean()
+        radius_utilization = applied_delta_rms / max(float(self.max_delta), 1e-8)
+
         training_stats.report("CDROMarkov/lambda_dual", self.lambda_dual)
         training_stats.report("CDROMarkov/mean_transport_cost", mean_transport)
         training_stats.report("CDROMarkov/activation_scale", self.activation_scale())
         training_stats.report("CDROMarkov/gate_mean", gate.mean())
-        training_stats.report("CDROMarkov/control_rms", control.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
-        training_stats.report("CDROMarkov/applied_delta_rms", applied_delta.detach().square().mean(dim=[1, 2, 3]).sqrt().mean())
+        training_stats.report("CDROMarkov/control_rms", control_rms)
+        training_stats.report("CDROMarkov/applied_delta_rms", applied_delta_rms)
+        training_stats.report("CDROMarkov/radius_utilization", radius_utilization)
 
         return loss

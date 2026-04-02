@@ -90,3 +90,9 @@ For quicker image-level iteration on baseline EDM vs WDRO-EDM, use the MNIST wra
 - [`scripts/setup_and_eval_mnist.sh`](scripts/setup_and_eval_mnist.sh)
 - [`scripts/run_mnist_compare.sh`](scripts/run_mnist_compare.sh)
 - [`scripts/README_mnist_one_command.md`](scripts/README_mnist_one_command.md)
+
+Status note as of 2026-04-02:
+
+- `PRECOND=cdroedm` is currently kept as an archival plug-in ablation path, not a recommended mainline method.
+- Matched 0.1 MIMG MNIST smoke tests, before and after fixing an RMS-vs-L2 step-scaling bug in `EDMLossCDRO`, still showed about 2.6x compute cost with no material loss or FID gain.
+- For new CDRO work, do not start from `cdroedm` by default. Use it only as a historical control and read [`docs/cdro_locked_method.md`](docs/cdro_locked_method.md) first.

@@ -35,8 +35,10 @@ def load_snapshot(path: Path):
     with path.open("rb") as f:
         data = pickle.load(f)
     net = data["ema"].eval().requires_grad_(False)
-    loss_fn = data.get("loss_fn", None)
-    if (loss_fn is None or not hasattr(loss_fn, "build_batch")) and path.parent.joinpath("training_options.json").is_file():
+    loss_fn = None
+    # Prefer reconstructing from training_options so local code edits are reflected
+    # when analyzing an older snapshot.
+    if path.parent.joinpath("training_options.json").is_file():
         training_options = json.loads(path.parent.joinpath("training_options.json").read_text(encoding="utf-8"))
         loss_kwargs = training_options.get("loss_kwargs", {})
         class_name = loss_kwargs.pop("class_name", None)
@@ -44,6 +46,8 @@ def load_snapshot(path: Path):
             module_name, class_attr = class_name.rsplit(".", 1)
             loss_cls = getattr(importlib.import_module(module_name), class_attr)
             loss_fn = loss_cls(**loss_kwargs)
+    if loss_fn is None:
+        loss_fn = data.get("loss_fn", None)
     if loss_fn is not None and "loss_fn_state" in data and hasattr(loss_fn, "load_state_dict"):
         loss_fn.load_state_dict(data["loss_fn_state"])
     return net, loss_fn

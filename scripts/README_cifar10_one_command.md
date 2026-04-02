@@ -16,11 +16,17 @@ The wrapper now supports three image-training modes through the same entrypoint:
 
 - `TRAINER=wdro PRECOND=wdroedm` for the WILD-Diffusion WDRO path
 - `TRAINER=baseline PRECOND=wdroedm` for plain EDM-style baseline training
-- `TRAINER=baseline PRECOND=cdroedm` for the new training-only CDRO-EDM loss
+- `TRAINER=baseline PRECOND=cdroedm` for the archived plug-in CDRO-EDM ablation path
 
 There is also a compare runner:
 
 - `scripts/run_cifar_compare.sh`
+
+Status note as of 2026-04-02:
+
+- `PRECOND=cdroedm` is currently kept for archival comparisons and diagnostics, not as a recommended starting point for new sweeps.
+- Matched MNIST smoke tests, before and after an RMS-step repair, still showed about 2.6x compute cost with no useful loss or FID gain.
+- Read `docs/cdro_locked_method.md` before launching new `cdroedm` runs.
 
 ## Environment mode (important for your server)
 
@@ -147,7 +153,7 @@ CIFAR_TRAIN_PERCENT=20 CIFAR_TRAIN_SEED=0 \
 bash scripts/setup_and_train_cifar10.sh
 ```
 
-## Example: CDRO-EDM on CIFAR-10 20%
+## Example: archived plug-in CDRO-EDM on CIFAR-10 20%
 
 ```bash
 TRAINER=baseline PRECOND=cdroedm \
@@ -159,6 +165,8 @@ CDRO_SIGMA_CUT=0.5 CDRO_GATE_POWER=2.0 \
 bash scripts/setup_and_train_cifar10.sh
 ```
 
+Use this path only for archival or diagnostic comparison.
+
 ## Example: low-memory smoke run
 
 ```bash
@@ -169,7 +177,7 @@ CIFAR_TRAIN_PERCENT=20 CIFAR_TRAIN_SEED=0 \
 bash scripts/setup_and_train_cifar10.sh
 ```
 
-## Run baseline vs WDRO vs CDRO comparison end to end
+## Run baseline vs WDRO vs archived CDRO comparison end to end
 
 ```bash
 RUN_TAG=cifar10-pilot METHODS="baseline wdro cdro" DURATION_MIMG=8 \
@@ -179,7 +187,8 @@ bash scripts/run_cifar_compare.sh
 Notes:
 - If `TRAINER` is left unset, the script defaults to `wdro` for `wdroedm` and `advedm`, and to `baseline` for `cdroedm`.
 - `TRAINER=wdro` still requires `AUGMENT>0`.
-- `PRECOND=cdroedm` currently supports only `TRAINER=baseline`.
+- `PRECOND=cdroedm` currently supports only `TRAINER=baseline` and is kept for archival/ablation use rather than recommended mainline training.
+- `stats.jsonl` now reports `CDRO/radius_utilization`; check it before concluding that a `cdroedm` run used a meaningful fraction of its perturbation budget.
 - `DRY_RUN=1` skips the GPU check and forwards `--dry-run` to `train.py`.
 
 Quick debug eval note:
