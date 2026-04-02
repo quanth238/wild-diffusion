@@ -6,6 +6,14 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v python >/dev/null 2>&1; then
+  if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    python() { "${PYTHON_BIN}" "$@"; }
+  else
+    echo "[ERROR] Neither 'python' nor '${PYTHON_BIN}' is available."
+    exit 1
+  fi
+fi
 SERVER_STORAGE_ROOT="${SERVER_STORAGE_ROOT:-/mnt/data/quanth}"
 if [[ -d "${SERVER_STORAGE_ROOT}" && -w "${SERVER_STORAGE_ROOT}" ]]; then
   DEFAULT_VENV_DIR="${SERVER_STORAGE_ROOT}/venvs/wild-diffusion"
@@ -50,6 +58,11 @@ DEBUG_EVAL_VISUAL="${DEBUG_EVAL_VISUAL:-32}"
 DEBUG_EVAL_REF="${DEBUG_EVAL_REF:-}"
 DEBUG_ADV_VISUAL="${DEBUG_ADV_VISUAL:-16}"
 SEED="${SEED:-}"
+DESC="${DESC:-}"
+TICK_KIMG="${TICK_KIMG:-}"
+SNAP_TICKS="${SNAP_TICKS:-}"
+DUMP_TICKS="${DUMP_TICKS:-}"
+EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 # Limited-data setting: use only 20% of CIFAR-10 by default (10,000 images).
 CIFAR_TRAIN_PERCENT="${CIFAR_TRAIN_PERCENT:-20}"  # 1..100
 CIFAR_TRAIN_SEED="${CIFAR_TRAIN_SEED:-0}"
@@ -435,6 +448,28 @@ fi
 
 if [[ -n "${SEED}" ]]; then
   train_cmd+=("--seed=${SEED}")
+fi
+
+if [[ -n "${DESC}" ]]; then
+  train_cmd+=("--desc=${DESC}")
+fi
+
+if [[ -n "${TICK_KIMG}" ]]; then
+  train_cmd+=("--tick=${TICK_KIMG}")
+fi
+
+if [[ -n "${SNAP_TICKS}" ]]; then
+  train_cmd+=("--snap=${SNAP_TICKS}")
+fi
+
+if [[ -n "${DUMP_TICKS}" ]]; then
+  train_cmd+=("--dump=${DUMP_TICKS}")
+fi
+
+if [[ -n "${EXTRA_TRAIN_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  extra_train_args=( ${EXTRA_TRAIN_ARGS} )
+  train_cmd+=("${extra_train_args[@]}")
 fi
 
 exec "${train_cmd[@]}"

@@ -1,1 +1,2 @@
-"""v2.1: hard-constrained control with rho-non-Markovian reference rollout."""
+"""v1.1: path-heuristic robust variant with gamma transport penalty and explicit budget projection."""
+

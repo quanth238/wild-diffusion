@@ -13,7 +13,35 @@ from ...shared.train_utils import (
     zero_control,
 )
 from ...utils import has_nan_or_inf, scalarize
-from .diffusion import build_kappa_schedule, rollout_controlled_ve
+from .diffusion import build_kappa_schedule, rollout_controlled_ve, rollout_path_heuristic_attack
+
+
+def _path_transport_cost(states_ctrl: torch.Tensor, states_ref: torch.Tensor) -> torch.Tensor:
+    """Mean path transport cost: E[sum_t 0.5 * ||x_ctrl_t - x_ref_t||^2]."""
+
+    if states_ctrl.shape != states_ref.shape:
+        raise ValueError(f"states_ctrl/states_ref shape mismatch: {states_ctrl.shape} vs {states_ref.shape}")
+    diff = states_ctrl[:, 1:] - states_ref[:, 1:]
+    diff_sq = diff.reshape(diff.shape[0], diff.shape[1], -1).pow(2).sum(dim=2)
+    return 0.5 * diff_sq.sum(dim=1).mean()
+
+
+def _path_average_training_loss(
+    cfg,
+    denoiser,
+    states: torch.Tensor,
+    x0: torch.Tensor,
+    sigma_levels: torch.Tensor,
+) -> torch.Tensor:
+    """Average weighted denoise loss over all rollout timesteps k=1..N."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    if states.shape[1] != n_steps + 1:
+        raise ValueError(f"states step dim must be {n_steps + 1}, got {states.shape[1]}")
+    x_noisy = states[:, 1:].reshape(x0.shape[0] * n_steps, *x0.shape[1:])
+    x_clean = x0[:, None, ...].expand(x0.shape[0], n_steps, *x0.shape[1:]).reshape_as(x_noisy)
+    sigma = sigma_levels[1:].view(1, n_steps).expand(x0.shape[0], n_steps).reshape(x0.shape[0] * n_steps)
+    return compute_training_loss(cfg, denoiser, x_noisy, x_clean, sigma)
 
 
 def train_trajectory_robust_constrained(
@@ -26,10 +54,9 @@ def train_trajectory_robust_constrained(
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
 ):
-    """Bilevel robust training with hard per-step control and non-Markovian ref rollout."""
+    """v1.1 robust training: legacy path-heuristic attack (batch-local control ascent)."""
 
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
-    optimizer_phi = torch.optim.Adam(control.parameters(), lr=cfg.lr_phi)
     kappa_by_step = build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -44,6 +71,7 @@ def train_trajectory_robust_constrained(
         "outer_loss_attack": [],
         "outer_loss_clean": [],
         "inner_obj": [],
+        "energy": [],
         "delta_norm_mean": [],
         "delta_norm_max": [],
         "delta_norm_ratio_mean": [],
@@ -64,6 +92,17 @@ def train_trajectory_robust_constrained(
         "diag_terminal_delta_mean": [],
     }
 
+    # v1.1 path-heuristic does not learn a global control policy.
+    set_requires_grad(control, False)
+    with torch.no_grad():
+        for p in control.parameters():
+            p.zero_()
+
+    step_size = float(cfg.v11_step_size)
+    gamma = float(cfg.v11_transport_gamma)
+    total_budget = float(cfg.v11_total_budget_rho)
+    projection_mode = str(cfg.v11_projection_mode).lower()
+
     for step in range(1, cfg.steps + 1):
         x0 = sample_train_batch(
             cfg,
@@ -83,94 +122,74 @@ def train_trajectory_robust_constrained(
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
 
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
-        for group in optimizer_phi.param_groups:
-            group["lr"] = float(cfg.lr_phi) * float(phi_lr_scale)
+        attack_enabled = bool(control_updates_enabled and attack_weight > 0.0 and cfg.inner_steps > 0)
 
         set_requires_grad(denoiser, False)
-        set_requires_grad(control, True)
-        last_inner_obj = 0.0
-        last_delta_norm_mean = 0.0
-        last_delta_norm_max = 0.0
-        last_delta_ratio_mean = 0.0
-        last_delta_ratio_max = 0.0
+        if attack_enabled:
+            roll = rollout_path_heuristic_attack(
+                cfg=cfg,
+                x0=x0,
+                target_indices=indices,
+                attack_net=denoiser,
+                sigma_levels=sigma_levels,
+                inner_steps=int(cfg.inner_steps),
+                step_size=step_size,
+                gamma=gamma,
+                total_budget=total_budget,
+                projection_mode=projection_mode,
+                control_radius_kappa=cfg.control_radius_kappa,
+                kappa_by_step=kappa_by_step,
+            )
+        else:
+            roll = rollout_controlled_ve(
+                x0=x0,
+                target_indices=indices,
+                control_net=zero_control,
+                sigma_levels=sigma_levels,
+                grad_through_control=False,
+                control_radius_kappa=cfg.control_radius_kappa,
+                kappa_by_step=kappa_by_step,
+                total_budget=total_budget,
+                projection_mode=projection_mode,
+            )
 
-        if control_updates_enabled and phi_lr_scale > 0.0 and cfg.inner_steps > 0:
-            for _ in range(cfg.inner_steps):
-                optimizer_phi.zero_grad(set_to_none=True)
-                roll = rollout_controlled_ve(
-                    x0=x0,
-                    target_indices=indices,
-                    control_net=control,
-                    sigma_levels=sigma_levels,
-                    grad_through_control=True,
-                    control_radius_kappa=cfg.control_radius_kappa,
-                    non_markov_rho=cfg.v21_rho,
-                    kappa_by_step=kappa_by_step,
-                )
-                train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
-                inner_obj = inner_objective_attack_only(train_loss)
-                if has_nan_or_inf(inner_obj):
-                    raise RuntimeError("NaN/Inf detected in inner objective.")
-                (-inner_obj).backward()
-                if cfg.clip_phi_grad > 0:
-                    torch.nn.utils.clip_grad_norm_(control.parameters(), cfg.clip_phi_grad)
-                optimizer_phi.step()
-                last_inner_obj = scalarize(inner_obj)
-                delta_l2 = pathwise_l2(roll.delta_path)
-                last_delta_norm_mean = scalarize(delta_l2.mean())
-                last_delta_norm_max = scalarize(delta_l2.max())
-                sigma_k = sigma_levels[:-1]
-                sigma_next = sigma_levels[1:]
-                delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
-                radius = (kappa_by_step * delta_sigma).view(1, -1).to(
-                    device=delta_l2.device, dtype=delta_l2.dtype
-                )
-                delta_ratio = delta_l2 / radius.clamp_min(1e-8)
-                last_delta_ratio_mean = scalarize(delta_ratio.mean())
-                last_delta_ratio_max = scalarize(delta_ratio.max())
+        attack_loss_inner = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
+        transport_inner = _path_transport_cost(roll.states_ctrl, roll.states_ref)
+        inner_obj = inner_objective_attack_only(attack_loss_inner) - gamma * transport_inner
+        if has_nan_or_inf(inner_obj):
+            raise RuntimeError("NaN/Inf detected in v1.1 inner objective.")
+
+        delta_l2 = pathwise_l2(roll.delta_path)
+        last_inner_obj = scalarize(inner_obj) if attack_enabled else 0.0
+        last_transport = scalarize(transport_inner)
+        last_delta_norm_mean = scalarize(delta_l2.mean())
+        last_delta_norm_max = scalarize(delta_l2.max())
+        sigma_k = sigma_levels[:-1]
+        sigma_next = sigma_levels[1:]
+        delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+        radius = (kappa_by_step * delta_sigma).view(1, -1).to(device=delta_l2.device, dtype=delta_l2.dtype)
+        delta_ratio = delta_l2 / radius.clamp_min(1e-8)
+        last_delta_ratio_mean = scalarize(delta_ratio.mean())
+        last_delta_ratio_max = scalarize(delta_ratio.max())
 
         set_requires_grad(denoiser, True)
-        set_requires_grad(control, False)
         optimizer_theta.zero_grad(set_to_none=True)
-        roll = rollout_controlled_ve(
-            x0=x0,
-            target_indices=indices,
-            control_net=control,
-            sigma_levels=sigma_levels,
-            grad_through_control=False,
-            control_radius_kappa=cfg.control_radius_kappa,
-            non_markov_rho=cfg.v21_rho,
-            kappa_by_step=kappa_by_step,
-        )
-        outer_loss_attack = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
+        outer_loss_attack = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
         outer_loss_clean = torch.zeros((), device=x0.device, dtype=x0.dtype)
         if clean_weight > 0.0:
-            x_ref_target = roll.states_ref[torch.arange(x0.shape[0], device=x0.device), indices]
-            outer_loss_clean = compute_training_loss(cfg, denoiser, x_ref_target, x0, roll.sigma_target)
+            outer_loss_clean = _path_average_training_loss(cfg, denoiser, roll.states_ref, x0, sigma_levels)
         outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
+        transport_outer = _path_transport_cost(roll.states_ctrl, roll.states_ref)
         if has_nan_or_inf(outer_loss):
-            raise RuntimeError("NaN/Inf detected in outer loss.")
+            raise RuntimeError("NaN/Inf detected in v1.1 outer loss.")
         outer_loss.backward()
         optimizer_theta.step()
-        set_requires_grad(control, True)
-        if not control_updates_enabled:
-            delta_l2 = pathwise_l2(roll.delta_path)
-            last_delta_norm_mean = scalarize(delta_l2.mean())
-            last_delta_norm_max = scalarize(delta_l2.max())
-            sigma_k = sigma_levels[:-1]
-            sigma_next = sigma_levels[1:]
-            delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
-            radius = (kappa_by_step * delta_sigma).view(1, -1).to(
-                device=delta_l2.device, dtype=delta_l2.dtype
-            )
-            delta_ratio = delta_l2 / radius.clamp_min(1e-8)
-            last_delta_ratio_mean = scalarize(delta_ratio.mean())
-            last_delta_ratio_max = scalarize(delta_ratio.max())
 
         history["outer_loss"].append(scalarize(outer_loss))
         history["outer_loss_attack"].append(scalarize(outer_loss_attack))
         history["outer_loss_clean"].append(scalarize(outer_loss_clean))
         history["inner_obj"].append(last_inner_obj)
+        history["energy"].append(scalarize(transport_outer))
         history["delta_norm_mean"].append(last_delta_norm_mean)
         history["delta_norm_max"].append(last_delta_norm_max)
         history["delta_norm_ratio_mean"].append(last_delta_ratio_mean)
@@ -184,25 +203,41 @@ def train_trajectory_robust_constrained(
             and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(cfg.steps))
         )
         if run_diag:
-            with torch.no_grad():
-                roll_cur_diag = rollout_controlled_ve(
+            if attack_weight > 0.0 and cfg.inner_steps > 0:
+                set_requires_grad(denoiser, False)
+                roll_cur_diag = rollout_path_heuristic_attack(
+                    cfg=cfg,
                     x0=x0,
                     target_indices=indices,
-                    control_net=control,
+                    attack_net=denoiser,
                     sigma_levels=sigma_levels,
-                    grad_through_control=False,
+                    inner_steps=int(cfg.inner_steps),
+                    step_size=step_size,
+                    gamma=gamma,
+                    total_budget=total_budget,
+                    projection_mode=projection_mode,
                     control_radius_kappa=cfg.control_radius_kappa,
-                    non_markov_rho=cfg.v21_rho,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss_cur = compute_training_loss(
-                    cfg,
-                    denoiser,
-                    roll_cur_diag.x_target,
-                    x0,
-                    roll_cur_diag.sigma_target,
-                )
-                inner_obj_cur = inner_objective_attack_only(train_loss_cur)
+                set_requires_grad(denoiser, True)
+            else:
+                with torch.no_grad():
+                    roll_cur_diag = rollout_controlled_ve(
+                        x0=x0,
+                        target_indices=indices,
+                        control_net=zero_control,
+                        sigma_levels=sigma_levels,
+                        grad_through_control=False,
+                        control_radius_kappa=cfg.control_radius_kappa,
+                        kappa_by_step=kappa_by_step,
+                        total_budget=total_budget,
+                        projection_mode=projection_mode,
+                    )
+
+            with torch.no_grad():
+                attack_cur = _path_average_training_loss(cfg, denoiser, roll_cur_diag.states_ctrl, x0, sigma_levels)
+                transport_cur = _path_transport_cost(roll_cur_diag.states_ctrl, roll_cur_diag.states_ref)
+                inner_obj_cur = inner_objective_attack_only(attack_cur) - gamma * transport_cur
 
                 roll_zero_diag = rollout_controlled_ve(
                     x0=x0,
@@ -211,17 +246,12 @@ def train_trajectory_robust_constrained(
                     sigma_levels=sigma_levels,
                     grad_through_control=False,
                     control_radius_kappa=cfg.control_radius_kappa,
-                    non_markov_rho=cfg.v21_rho,
                     kappa_by_step=kappa_by_step,
+                    total_budget=total_budget,
+                    projection_mode=projection_mode,
                 )
-                train_loss_zero = compute_training_loss(
-                    cfg,
-                    denoiser,
-                    roll_zero_diag.x_target,
-                    x0,
-                    roll_zero_diag.sigma_target,
-                )
-                inner_obj_zero = inner_objective_attack_only(train_loss_zero)
+                attack_zero = _path_average_training_loss(cfg, denoiser, roll_zero_diag.states_ctrl, x0, sigma_levels)
+                inner_obj_zero = inner_objective_attack_only(attack_zero)
                 gap = inner_obj_cur - inner_obj_zero
                 gap_ratio = gap / (inner_obj_zero.abs() + 1e-8)
                 (
@@ -260,11 +290,12 @@ def train_trajectory_robust_constrained(
                     f"diag_path_delta={history['diag_path_delta_mean'][-1]:.6f}"
                 )
             print(
-                f"[robust] step={step:05d} outer_loss={outer_loss.item():.6f} "
+                f"[robust-v1.1] step={step:05d} outer_loss={outer_loss.item():.6f} "
                 f"attack={outer_loss_attack.item():.6f} clean={outer_loss_clean.item():.6f} "
-                f"inner_obj={last_inner_obj:.6f} "
+                f"inner_obj={last_inner_obj:.6f} transport={last_transport:.6f} "
                 f"delta_norm={last_delta_norm_mean:.6f} delta_ratio={last_delta_ratio_mean:.6f} "
-                f"w_attack={attack_weight:.3f} w_clean={clean_weight:.3f} phi_lr_scale={phi_lr_scale:.3f}"
+                f"w_attack={attack_weight:.3f} w_clean={clean_weight:.3f} phi_lr_scale={phi_lr_scale:.3f} "
+                f"step_size={step_size:.6f} gamma={gamma:.4f} budget={total_budget:.4f} mode={projection_mode}"
                 f"{diag_msg}",
                 flush=True,
             )
@@ -282,7 +313,7 @@ def train_trajectory_robust_energy(
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
 ):
-    """Backward-compatible alias to constrained robust training."""
+    """Backward-compatible alias."""
 
     return train_trajectory_robust_constrained(
         denoiser,

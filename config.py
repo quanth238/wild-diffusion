@@ -7,7 +7,7 @@ class ToyConfig:
     exp_name: str = "constrained_v2"
     seed: int = 0
     device: str = "auto"  # auto|cpu|cuda
-    method_version: str = "v2"  # v2 implemented; v1 is scaffold-only in /toy.
+    method_version: str = "v2"  # one of supported versions in toy/versions/registry.py
     dataset_kind: str = "toy_gmm"  # extension point: add image dataset backends later.
     model_kind: str = "auto"  # auto|toy_mlp|...
     diagnostics_kind: str = "auto"  # auto|toy_gmm|...
@@ -18,6 +18,12 @@ class ToyConfig:
     image_train_size: int = 2000
     image_val_size: int = 2000
     image_split_seed: int = 0
+    # MNIST limited-data controls (for fair low-data protocols):
+    # - when enabled, train/val subset sizes are resolved by percent of full split.
+    # - keep image_*_size as backward-compatible fallback by disabling this mode.
+    mnist_use_percent_split: bool = True
+    mnist_train_percent: float = 20.0
+    mnist_val_percent: float = 100.0
     image_gate_min_generated_std: float = 0.10
     image_gate_min_endpoint_std: float = 0.10
     image_gate_max_endpoint_recovery_mse: float = 0.30
@@ -33,6 +39,13 @@ class ToyConfig:
     baseline_only: bool = False
     use_ema_eval: bool = False
     ema_decay: float = 0.995
+    # Baseline checkpoint cache for fair cross-version comparison:
+    # - if enabled and checkpoint exists: load baseline (skip baseline retrain).
+    # - else: train baseline once, then save it for reuse by later runs.
+    baseline_ckpt_enabled: bool = True
+    baseline_ckpt_path: str = ""
+    baseline_ckpt_force_retrain: bool = False
+    baseline_ckpt_strict_meta: bool = True
 
     # Model.
     hidden_dim: int = 128
@@ -71,6 +84,17 @@ class ToyConfig:
     v1_lambda_init: float = 1.0
     v1_lambda_lr: float = 5e-4
     v1_lambda_max: float = 100.0
+    # v1.1 path-heuristic style options (gamma-penalized + explicit budget projection).
+    v11_step_size: float = 5e-4
+    v11_transport_gamma: float = 2.0
+    v11_total_budget_rho: float = 0.02
+    # projection mode for rollout controls:
+    # - global_remaining: shared global budget with remaining-cost projection.
+    # - step_clip: clip each step to rho/T.
+    # - step_exact: force each step to exact rho/T norm.
+    # - kappa_clip: fallback to v2-style local radius kappa_k * Delta_sigma_k.
+    # - none: no projection.
+    v11_projection_mode: str = "global_remaining"
     control_radius_kappa: float = 0.15
     # v2.1 non-Markovian reference update parameter in [0,1].
     v21_rho: float = 0.8

@@ -316,6 +316,12 @@ def main() -> int:
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--disable-baseline-gate", action="store_true")
     parser.add_argument("--run-checks", action="store_true")
+    parser.add_argument(
+        "--baseline-ckpt-dir",
+        type=Path,
+        default=None,
+        help="Optional shared baseline checkpoint directory. Defaults to <outdir>/_baseline_cache_shared.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -400,7 +406,10 @@ def main() -> int:
         common.append("--disable-eval-shared-reverse-noise")
 
     methods = ["v2", "2.1"]
+    baseline_ckpt_dir = args.baseline_ckpt_dir or (args.outdir / "_baseline_cache_shared")
+    baseline_ckpt_dir.mkdir(parents=True, exist_ok=True)
     for seed in seeds:
+        baseline_ckpt_path = baseline_ckpt_dir / f"baseline_seed_{seed}.pt"
         for method in methods:
             exp_name = f"{args.prefix}_{str(method).replace('.', '_')}_s{seed}"
             cmd = [
@@ -412,6 +421,8 @@ def main() -> int:
                 str(seed),
                 "--exp-name",
                 exp_name,
+                "--baseline-ckpt-path",
+                str(baseline_ckpt_path),
             ]
             if method in ("2.1", "v2.1"):
                 cmd.extend(["--v21-rho", str(args.v21_rho)])
@@ -447,6 +458,7 @@ def main() -> int:
             "compute_fid": bool(args.compute_fid),
             "fid_samples": int(args.fid_samples),
             "disable_baseline_gate": bool(args.disable_baseline_gate),
+            "baseline_ckpt_dir": str(baseline_ckpt_dir),
             "v21_rho": float(args.v21_rho),
             "eval_seed_offset_gate": int(args.eval_seed_offset_gate),
             "eval_seed_offset_metrics": int(args.eval_seed_offset_metrics),

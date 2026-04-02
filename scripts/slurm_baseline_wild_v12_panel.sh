@@ -68,7 +68,7 @@ WILD_SAMPLE_MIN="${WILD_SAMPLE_MIN:--1.0}"
 WILD_SAMPLE_MAX="${WILD_SAMPLE_MAX:-1.0}"
 WILD_DELTA_RATIO_DENOM="${WILD_DELTA_RATIO_DENOM:-1.0}"
 
-# v1.2 (CDRO-EDM-inspired path-heuristic)
+# v1.2 (CDRO-EDM-aligned single-sigma robust training)
 V12_STEP_SIZE="${V12_STEP_SIZE:-0.02}"
 V12_ADV_STEPS="${V12_ADV_STEPS:-1}"
 V12_LAMBDA_INIT="${V12_LAMBDA_INIT:-0.1}"
@@ -85,6 +85,10 @@ V12_DELTA_SPACE="${V12_DELTA_SPACE:-image}"
 
 STRICT_FAIRNESS_CHECK="${STRICT_FAIRNESS_CHECK:-1}"
 BASELINE_FID_SPREAD_TOL="${BASELINE_FID_SPREAD_TOL:-1e-6}"
+SKIP_BASELINE="${SKIP_BASELINE:-0}"
+SKIP_WILD="${SKIP_WILD:-0}"
+SKIP_V12="${SKIP_V12:-0}"
+SKIP_AGG="${SKIP_AGG:-0}"
 
 export SEED
 export STEPS
@@ -113,6 +117,7 @@ echo "BASELINE_CKPT_PATH=${BASELINE_CKPT_PATH}"
 echo "WILD: interval=${WILD_UPDATE_INTERVAL} cache_batches=${WILD_CACHE_BATCHES} inner_steps=${WILD_INNER_STEPS} step_size=${WILD_STEP_SIZE} gamma=${WILD_GAMMA}"
 echo "v1.2: adv_steps=${V12_ADV_STEPS} step_size=${V12_STEP_SIZE} lambda_init=${V12_LAMBDA_INIT} lambda_lr=${V12_LAMBDA_LR} rho_target=${V12_RHO_TARGET} robust_mix=${V12_ROBUST_MIX}"
 echo "STRICT_FAIRNESS_CHECK=${STRICT_FAIRNESS_CHECK} BASELINE_FID_SPREAD_TOL=${BASELINE_FID_SPREAD_TOL}"
+echo "SKIP_BASELINE=${SKIP_BASELINE} SKIP_WILD=${SKIP_WILD} SKIP_V12=${SKIP_V12} SKIP_AGG=${SKIP_AGG}"
 
 echo "=== Ensure MNIST FID reference ==="
 python3 toy/export_mnist_fid_ref.py
@@ -191,26 +196,41 @@ BASELINE_EXP="${PREFIX}_baseline_s${SEED}"
 WILD_EXP="${PREFIX}_wild_s${SEED}"
 V12_EXP="${PREFIX}_1_2_s${SEED}"
 
-echo "=== 1/4 Baseline EDM (baseline-only) ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
-  --exp-name "${BASELINE_EXP}" \
-  --method-version v2 \
-  --baseline-only
+if [[ "${SKIP_BASELINE}" == "1" ]]; then
+  echo "=== 1/4 Baseline EDM (baseline-only) [SKIPPED] ==="
+else
+  echo "=== 1/4 Baseline EDM (baseline-only) ==="
+  python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+    --exp-name "${BASELINE_EXP}" \
+    --method-version v2 \
+    --baseline-only
+fi
 
-echo "=== 2/4 WILD robust ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
-  --exp-name "${WILD_EXP}" \
-  --method-version wild \
-  "${WILD_ARGS[@]}"
+if [[ "${SKIP_WILD}" == "1" ]]; then
+  echo "=== 2/4 WILD robust [SKIPPED] ==="
+else
+  echo "=== 2/4 WILD robust ==="
+  python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+    --exp-name "${WILD_EXP}" \
+    --method-version wild \
+    "${WILD_ARGS[@]}"
+fi
 
-echo "=== 3/4 v1.2 robust ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
-  --exp-name "${V12_EXP}" \
-  --method-version 1.2 \
-  "${V12_ARGS[@]}"
+if [[ "${SKIP_V12}" == "1" ]]; then
+  echo "=== 3/4 v1.2 robust [SKIPPED] ==="
+else
+  echo "=== 3/4 v1.2 robust ==="
+  python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+    --exp-name "${V12_EXP}" \
+    --method-version 1.2 \
+    "${V12_ARGS[@]}"
+fi
 
-echo "=== 4/4 Aggregate metrics + build annotated panel ==="
-python3 - <<'PY'
+if [[ "${SKIP_AGG}" == "1" ]]; then
+  echo "=== 4/4 Aggregate metrics + build annotated panel [SKIPPED] ==="
+else
+  echo "=== 4/4 Aggregate metrics + build annotated panel ==="
+  python3 - <<'PY'
 import csv
 import hashlib
 import json
@@ -549,5 +569,6 @@ if strict:
         )
     print("[fair] strict checks passed")
 PY
+fi
 
 echo "[*] Finished baseline-WILD-v1.2 panel workflow"

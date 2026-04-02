@@ -31,9 +31,10 @@ python3 - <<'PY'
 import torch
 print("[torch] cuda_available:", torch.cuda.is_available())
 print("[torch] device_count:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("[torch] current_device:", torch.cuda.current_device())
-    print("[torch] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
+if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+    raise SystemExit("[ERROR] CUDA is required for this workflow, but no GPU is visible.")
+print("[torch] current_device:", torch.cuda.current_device())
+print("[torch] device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
 PY
 
 # Create outputs dir if not exists
@@ -41,6 +42,8 @@ mkdir -p toy_outputs
 
 export CUDA_VISIBLE_DEVICES=0
 export FID_DETECTOR_PATH=/mnt/data/quanth/models/inception-2015-12-05.pkl
+export BASELINE_CKPT_DIR=toy_outputs/_baseline_cache_shared
+mkdir -p "${BASELINE_CKPT_DIR}"
 
 echo "=== 0/4: Generating MNIST Clean Reference Statistics ==="
 python3 toy/export_mnist_fid_ref.py
@@ -51,8 +54,8 @@ COMMON_ARGS=(
   --device=cuda
   --steps=2000
   --batch-size=128
-  --image-train-size=2000
-  --image-val-size=500
+  --mnist-train-percent=20
+  --mnist-val-percent=100
   --eval-samples=2000
   --compute-fid
   --fid-samples=2000
@@ -60,16 +63,32 @@ COMMON_ARGS=(
 )
 
 echo "=== 1/4: Running WILD baseline with EDM (CUDA) ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" --exp-name=wild_edm --method-version=wild --training-objective=edm
+python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+  --exp-name=wild_edm \
+  --method-version=wild \
+  --training-objective=edm \
+  --baseline-ckpt-path="${BASELINE_CKPT_DIR}/mnist_edm_seed0.pt"
 
 echo "=== 2/4: Running WILD baseline with Score Matching (CUDA) ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" --exp-name=wild_score --method-version=wild --training-objective=score
+python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+  --exp-name=wild_score \
+  --method-version=wild \
+  --training-objective=score \
+  --baseline-ckpt-path="${BASELINE_CKPT_DIR}/mnist_score_seed0.pt"
 
 echo "=== 3/4: Running Proposed v2 with EDM (CUDA) ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" --exp-name=v2_edm --method-version=v2 --training-objective=edm
+python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+  --exp-name=v2_edm \
+  --method-version=v2 \
+  --training-objective=edm \
+  --baseline-ckpt-path="${BASELINE_CKPT_DIR}/mnist_edm_seed0.pt"
 
 echo "=== 4/4: Running Proposed v2 with Score Matching (CUDA) ==="
-python3 toy/run_toy.py "${COMMON_ARGS[@]}" --exp-name=v2_score --method-version=v2 --training-objective=score
+python3 toy/run_toy.py "${COMMON_ARGS[@]}" \
+  --exp-name=v2_score \
+  --method-version=v2 \
+  --training-objective=score \
+  --baseline-ckpt-path="${BASELINE_CKPT_DIR}/mnist_score_seed0.pt"
 
 echo "=== Generating Comparison Plots ==="
 python3 toy/compare_robustness.py
