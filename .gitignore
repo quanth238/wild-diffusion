@@ -127,3 +127,18 @@ venv.bak/
 
 toy_outputs
 toy_outputs_smoke
+
+# Local datasets and experiment artifacts
+datasets/cifar-10-batches-py/
+datasets/cifar-10-python.tar.gz
+datasets/cifar10-32x32/
+datasets/cifar10-32x32-train20pct-seed0/
+datasets/fid-refs/
+datasets/mnist-32x32-test/
+datasets/mnist-32x32-test.zip
+datasets/mnist-32x32-train/
+datasets/mnist-32x32-train.zip
+datasets/mnist-32x32-train20pct-seed0/
+datasets/raw/
+toy-runs/
+training-runs/
