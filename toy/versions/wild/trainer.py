@@ -4,6 +4,7 @@ import torch
 
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
+from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import robust_schedule, sample_train_batch
 from ...utils import batch_scalar_like, has_nan_or_inf, scalarize
@@ -51,6 +52,7 @@ def _build_wild_adversarial_batch(
     x_clean: torch.Tensor,
     sigma_levels: torch.Tensor,
     cfg,
+    amp_dtype,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Approximate argmax_x' loss(x') - gamma*c(x',x) via K gradient-ascent steps."""
 
@@ -81,9 +83,10 @@ def _build_wild_adversarial_batch(
         eps = fixed_eps if fixed_eps is not None else torch.randn_like(x_clean)
         x_noisy = x_adv + batch_scalar_like(sigma, x_adv) * eps
 
-        attack_loss = compute_training_loss(cfg, denoiser, x_noisy, x_adv, sigma)
-        transport = _transport_cost(x_adv, x_clean)
-        inner_obj = inner_objective_attack_only(attack_loss) - gamma * transport
+        with autocast_context(x_clean.device, amp_dtype):
+            attack_loss = compute_training_loss(cfg, denoiser, x_noisy, x_adv, sigma)
+            transport = _transport_cost(x_adv, x_clean)
+            inner_obj = inner_objective_attack_only(attack_loss) - gamma * transport
         if has_nan_or_inf(inner_obj):
             raise RuntimeError("NaN/Inf detected in WILD inner objective.")
 
@@ -173,6 +176,7 @@ def train_trajectory_robust_wild(
     cache_batches = max(int(cfg.wild_cache_batches), 1)
     ratio_denom = max(float(cfg.wild_delta_ratio_denom), 1e-8)
     cumulative_batch_equiv_evals = 0.0
+    amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
     for step in range(1, cfg.steps + 1):
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
@@ -194,7 +198,13 @@ def train_trajectory_robust_wild(
                     sample_population_batch_fn=sample_population_batch_fn,
                 )
                 if control_updates_enabled and attack_weight > 0.0 and int(cfg.wild_inner_steps) > 0:
-                    x_adv_chunk, stats = _build_wild_adversarial_batch(denoiser, x_clean_chunk, sigma_levels, cfg)
+                    x_adv_chunk, stats = _build_wild_adversarial_batch(
+                        denoiser,
+                        x_clean_chunk,
+                        sigma_levels,
+                        cfg,
+                        amp_dtype,
+                    )
                     attack_construction_units += float(max(int(cfg.wild_inner_steps), 0))
                 else:
                     x_adv_chunk = x_clean_chunk.detach().clone()
@@ -230,9 +240,10 @@ def train_trajectory_robust_wild(
         x_noisy_adv = x_adv + batch_scalar_like(sigma, x_adv) * torch.randn_like(x_adv)
 
         optimizer_theta.zero_grad(set_to_none=True)
-        outer_loss_clean = compute_training_loss(cfg, denoiser, x_noisy_clean, x_clean, sigma)
-        outer_loss_attack = compute_training_loss(cfg, denoiser, x_noisy_adv, x_adv, sigma)
-        outer_loss = clean_weight * outer_loss_clean + attack_weight * outer_loss_attack
+        with autocast_context(sigma_levels.device, amp_dtype):
+            outer_loss_clean = compute_training_loss(cfg, denoiser, x_noisy_clean, x_clean, sigma)
+            outer_loss_attack = compute_training_loss(cfg, denoiser, x_noisy_adv, x_adv, sigma)
+            outer_loss = clean_weight * outer_loss_clean + attack_weight * outer_loss_attack
         if has_nan_or_inf(outer_loss):
             raise RuntimeError("NaN/Inf detected in WILD outer loss.")
 

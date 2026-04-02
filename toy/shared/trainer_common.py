@@ -4,6 +4,7 @@ from typing import Callable, Optional
 import torch
 
 from ..models import set_requires_grad
+from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
 from .objective import compute_training_loss, weighted_denoise_loss
 from .reverse import sample_reverse_paths
@@ -25,6 +26,7 @@ def train_baseline(
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     history = {"loss": [], "proxy_weighted_denoise_loss": []}
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
+    amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
     ema_model = None
     if cfg.use_ema_eval:
@@ -53,7 +55,8 @@ def train_baseline(
         x_noisy = x0 + batch_scalar_like(sigma, x0) * torch.randn_like(x0)
 
         optimizer.zero_grad(set_to_none=True)
-        loss = compute_training_loss(cfg, denoiser, x_noisy, x0, sigma)
+        with autocast_context(sigma_levels.device, amp_dtype):
+            loss = compute_training_loss(cfg, denoiser, x_noisy, x0, sigma)
         if has_nan_or_inf(loss):
             raise RuntimeError("NaN/Inf detected in baseline loss.")
         loss.backward()
@@ -67,7 +70,8 @@ def train_baseline(
             proxy_loss = loss
         else:
             with torch.no_grad():
-                proxy_loss = weighted_denoise_loss(denoiser, x_noisy, x0, sigma, cfg.sigma_data)
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    proxy_loss = weighted_denoise_loss(denoiser, x_noisy, x0, sigma, cfg.sigma_data)
         history["proxy_weighted_denoise_loss"].append(scalarize(proxy_loss))
 
         if step % cfg.log_every == 0:

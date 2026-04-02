@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from ...shared.objective import compute_training_loss
+from ...shared.runtime import autocast_context, resolve_amp_dtype
 
 
 @dataclass
@@ -150,6 +151,7 @@ def rollout_path_heuristic_attack(
             "total_budget must be set for projection_mode in "
             "('global_remaining', 'step_clip', 'step_exact')."
         )
+    amp_dtype = resolve_amp_dtype(x0.device, getattr(cfg, "amp_dtype", "auto"))
 
     x_ref = x0.detach()
     prev_adv = x0.detach()
@@ -182,10 +184,11 @@ def rollout_path_heuristic_attack(
         for _ in range(int(inner_steps)):
             control.requires_grad_(True)
             candidate = x_nominal_next + control
-            step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
-            displacement = candidate - reference_state
-            transport = 0.5 * displacement.reshape(batch_size, -1).pow(2).sum(dim=1).mean()
-            objective = step_loss - float(gamma) * transport
+            with autocast_context(x0.device, amp_dtype):
+                step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
+                displacement = candidate - reference_state
+                transport = 0.5 * displacement.reshape(batch_size, -1).pow(2).sum(dim=1).mean()
+                objective = step_loss - float(gamma) * transport
             grad = torch.autograd.grad(objective, control)[0]
             control = (control + float(step_size) * grad).detach()
 

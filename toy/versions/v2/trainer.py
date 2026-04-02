@@ -4,6 +4,7 @@ import torch
 
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
+from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import (
     pathwise_l2,
@@ -62,7 +63,14 @@ def train_trajectory_robust_constrained(
         "diag_delta_norm_ratio_max": [],
         "diag_path_delta_mean": [],
         "diag_terminal_delta_mean": [],
+        "batch_equiv_denoiser_evals_step": [],
+        "batch_equiv_denoiser_evals_attack_construction": [],
+        "batch_equiv_denoiser_evals_attack_eval": [],
+        "batch_equiv_denoiser_evals_clean_eval": [],
+        "batch_equiv_denoiser_evals_cumulative": [],
     }
+    cumulative_batch_equiv_evals = 0.0
+    amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
     for step in range(1, cfg.steps + 1):
         x0 = sample_train_batch(
@@ -85,6 +93,7 @@ def train_trajectory_robust_constrained(
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
         for group in optimizer_phi.param_groups:
             group["lr"] = float(cfg.lr_phi) * float(phi_lr_scale)
+        attack_construction_units = 0.0
 
         set_requires_grad(denoiser, False)
         set_requires_grad(control, True)
@@ -106,8 +115,9 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
-                inner_obj = inner_objective_attack_only(train_loss)
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
+                    inner_obj = inner_objective_attack_only(train_loss)
                 if has_nan_or_inf(inner_obj):
                     raise RuntimeError("NaN/Inf detected in inner objective.")
                 (-inner_obj).backward()
@@ -127,6 +137,7 @@ def train_trajectory_robust_constrained(
                 delta_ratio = delta_l2 / radius.clamp_min(1e-8)
                 last_delta_ratio_mean = scalarize(delta_ratio.mean())
                 last_delta_ratio_max = scalarize(delta_ratio.max())
+            attack_construction_units = float(max(int(cfg.inner_steps), 0))
 
         set_requires_grad(denoiser, True)
         set_requires_grad(control, False)
@@ -140,16 +151,23 @@ def train_trajectory_robust_constrained(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
         )
-        outer_loss_attack = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
+        with autocast_context(sigma_levels.device, amp_dtype):
+            outer_loss_attack = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
         outer_loss_clean = torch.zeros((), device=x0.device, dtype=x0.dtype)
         if clean_weight > 0.0:
             x_ref_target = roll.states_ref[torch.arange(x0.shape[0], device=x0.device), indices]
-            outer_loss_clean = compute_training_loss(cfg, denoiser, x_ref_target, x0, roll.sigma_target)
-        outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
+            with autocast_context(sigma_levels.device, amp_dtype):
+                outer_loss_clean = compute_training_loss(cfg, denoiser, x_ref_target, x0, roll.sigma_target)
+        with autocast_context(sigma_levels.device, amp_dtype):
+            outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
         if has_nan_or_inf(outer_loss):
             raise RuntimeError("NaN/Inf detected in outer loss.")
         outer_loss.backward()
         optimizer_theta.step()
+        attack_eval_units = 1.0
+        clean_eval_units = 1.0 if clean_weight > 0.0 else 0.0
+        step_batch_equiv_evals = attack_construction_units + attack_eval_units + clean_eval_units
+        cumulative_batch_equiv_evals += step_batch_equiv_evals
         set_requires_grad(control, True)
         if not control_updates_enabled:
             delta_l2 = pathwise_l2(roll.delta_path)
@@ -176,6 +194,11 @@ def train_trajectory_robust_constrained(
         history["sched_attack_weight"].append(float(attack_weight))
         history["sched_clean_weight"].append(float(clean_weight))
         history["sched_phi_lr_scale"].append(float(phi_lr_scale))
+        history["batch_equiv_denoiser_evals_step"].append(float(step_batch_equiv_evals))
+        history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
+        history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
+        history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
+        history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)
@@ -192,14 +215,15 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss_cur = compute_training_loss(
-                    cfg,
-                    denoiser,
-                    roll_cur_diag.x_target,
-                    x0,
-                    roll_cur_diag.sigma_target,
-                )
-                inner_obj_cur = inner_objective_attack_only(train_loss_cur)
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    train_loss_cur = compute_training_loss(
+                        cfg,
+                        denoiser,
+                        roll_cur_diag.x_target,
+                        x0,
+                        roll_cur_diag.sigma_target,
+                    )
+                    inner_obj_cur = inner_objective_attack_only(train_loss_cur)
 
                 roll_zero_diag = rollout_controlled_ve(
                     x0=x0,
@@ -210,14 +234,15 @@ def train_trajectory_robust_constrained(
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=kappa_by_step,
                 )
-                train_loss_zero = compute_training_loss(
-                    cfg,
-                    denoiser,
-                    roll_zero_diag.x_target,
-                    x0,
-                    roll_zero_diag.sigma_target,
-                )
-                inner_obj_zero = inner_objective_attack_only(train_loss_zero)
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    train_loss_zero = compute_training_loss(
+                        cfg,
+                        denoiser,
+                        roll_zero_diag.x_target,
+                        x0,
+                        roll_zero_diag.sigma_target,
+                    )
+                    inner_obj_zero = inner_objective_attack_only(train_loss_zero)
                 gap = inner_obj_cur - inner_obj_zero
                 gap_ratio = gap / (inner_obj_zero.abs() + 1e-8)
                 (

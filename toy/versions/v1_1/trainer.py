@@ -4,6 +4,7 @@ import torch
 
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
+from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import (
     pathwise_l2,
@@ -115,6 +116,7 @@ def train_trajectory_robust_constrained(
     projection_mode = str(cfg.v11_projection_mode).lower()
     path_batch_equiv_evals = _path_batch_equiv_denoiser_evals(sigma_levels)
     cumulative_batch_equiv_evals = 0.0
+    amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
     for step in range(1, cfg.steps + 1):
         x0 = sample_train_batch(
@@ -168,9 +170,10 @@ def train_trajectory_robust_constrained(
                 projection_mode=projection_mode,
             )
 
-        attack_loss_inner = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
-        transport_inner = _path_transport_cost(roll.states_ctrl, roll.states_ref)
-        inner_obj = inner_objective_attack_only(attack_loss_inner) - gamma * transport_inner
+        with autocast_context(sigma_levels.device, amp_dtype):
+            attack_loss_inner = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
+            transport_inner = _path_transport_cost(roll.states_ctrl, roll.states_ref)
+            inner_obj = inner_objective_attack_only(attack_loss_inner) - gamma * transport_inner
         if has_nan_or_inf(inner_obj):
             raise RuntimeError("NaN/Inf detected in v1.1 inner objective.")
 
@@ -189,12 +192,15 @@ def train_trajectory_robust_constrained(
 
         set_requires_grad(denoiser, True)
         optimizer_theta.zero_grad(set_to_none=True)
-        outer_loss_attack = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
+        with autocast_context(sigma_levels.device, amp_dtype):
+            outer_loss_attack = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
         outer_loss_clean = torch.zeros((), device=x0.device, dtype=x0.dtype)
         if clean_weight > 0.0:
-            outer_loss_clean = _path_average_training_loss(cfg, denoiser, roll.states_ref, x0, sigma_levels)
-        outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
-        transport_outer = _path_transport_cost(roll.states_ctrl, roll.states_ref)
+            with autocast_context(sigma_levels.device, amp_dtype):
+                outer_loss_clean = _path_average_training_loss(cfg, denoiser, roll.states_ref, x0, sigma_levels)
+        with autocast_context(sigma_levels.device, amp_dtype):
+            outer_loss = attack_weight * outer_loss_attack + clean_weight * outer_loss_clean
+            transport_outer = _path_transport_cost(roll.states_ctrl, roll.states_ref)
         if has_nan_or_inf(outer_loss):
             raise RuntimeError("NaN/Inf detected in v1.1 outer loss.")
         outer_loss.backward()
@@ -259,9 +265,10 @@ def train_trajectory_robust_constrained(
                     )
 
             with torch.no_grad():
-                attack_cur = _path_average_training_loss(cfg, denoiser, roll_cur_diag.states_ctrl, x0, sigma_levels)
-                transport_cur = _path_transport_cost(roll_cur_diag.states_ctrl, roll_cur_diag.states_ref)
-                inner_obj_cur = inner_objective_attack_only(attack_cur) - gamma * transport_cur
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    attack_cur = _path_average_training_loss(cfg, denoiser, roll_cur_diag.states_ctrl, x0, sigma_levels)
+                    transport_cur = _path_transport_cost(roll_cur_diag.states_ctrl, roll_cur_diag.states_ref)
+                    inner_obj_cur = inner_objective_attack_only(attack_cur) - gamma * transport_cur
 
                 roll_zero_diag = rollout_controlled_ve(
                     x0=x0,
@@ -274,8 +281,9 @@ def train_trajectory_robust_constrained(
                     total_budget=total_budget,
                     projection_mode=projection_mode,
                 )
-                attack_zero = _path_average_training_loss(cfg, denoiser, roll_zero_diag.states_ctrl, x0, sigma_levels)
-                inner_obj_zero = inner_objective_attack_only(attack_zero)
+                with autocast_context(sigma_levels.device, amp_dtype):
+                    attack_zero = _path_average_training_loss(cfg, denoiser, roll_zero_diag.states_ctrl, x0, sigma_levels)
+                    inner_obj_zero = inner_objective_attack_only(attack_zero)
                 gap = inner_obj_cur - inner_obj_zero
                 gap_ratio = gap / (inner_obj_zero.abs() + 1e-8)
                 (

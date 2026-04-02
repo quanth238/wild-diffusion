@@ -7,6 +7,9 @@ class ToyConfig:
     exp_name: str = "v11_active"
     seed: int = 0
     device: str = "auto"  # auto|cpu|cuda
+    allow_tf32: bool = True
+    cudnn_benchmark: bool = True
+    amp_dtype: str = "auto"  # auto|off|bfloat16|float16
     method_version: str = "v1.1"  # one of supported versions in toy/versions/registry.py
     dataset_kind: str = "toy_gmm"  # extension point: add image dataset backends later.
     model_kind: str = "auto"  # auto|toy_mlp|...

@@ -13,6 +13,12 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--method-version must be one of {SUPPORTED_METHOD_VERSIONS}, got {cfg.method_version}"
         )
+    if str(cfg.amp_dtype).lower() not in ("auto", "off", "bf16", "bfloat16", "fp16", "float16", "half"):
+        raise ValueError(
+            "--amp-dtype must be one of "
+            "('auto', 'off', 'bfloat16', 'float16'), got "
+            f"{cfg.amp_dtype}"
+        )
     if cfg.steps <= 0:
         raise ValueError(f"--steps must be > 0, got {cfg.steps}")
     if cfg.batch_size <= 0:
@@ -164,6 +170,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exp-name", type=str, default=ToyConfig.exp_name)
     parser.add_argument("--seed", type=int, default=ToyConfig.seed)
     parser.add_argument("--device", type=str, default=ToyConfig.device, choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--disable-tf32", action="store_true")
+    parser.add_argument("--disable-cudnn-benchmark", action="store_true")
+    parser.add_argument("--amp-dtype", type=str, default=ToyConfig.amp_dtype)
     parser.add_argument(
         "--method-version",
         type=str,
@@ -354,6 +363,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     skip_checks = bool(args_dict.pop("skip_checks"))
     disable_lognorm = bool(args_dict.pop("disable_log_normal_sigma_sampling"))
     disable_auto_lognorm = bool(args_dict.pop("disable_auto_log_normal_params"))
+    disable_tf32 = bool(args_dict.pop("disable_tf32"))
+    disable_cudnn_benchmark = bool(args_dict.pop("disable_cudnn_benchmark"))
     disable_baseline_ckpt = bool(args_dict.pop("disable_baseline_ckpt"))
     disable_baseline_ckpt_strict_meta = bool(args_dict.pop("disable_baseline_ckpt_strict_meta"))
     disable_baseline_gate = bool(args_dict.pop("disable_baseline_gate"))
@@ -377,6 +388,10 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_log_normal_sigma_sampling = False
     if disable_auto_lognorm:
         cfg.auto_log_normal_params = False
+    if disable_tf32:
+        cfg.allow_tf32 = False
+    if disable_cudnn_benchmark:
+        cfg.cudnn_benchmark = False
     if disable_baseline_gate:
         cfg.baseline_gate_enabled = False
     if disable_baseline_ckpt:

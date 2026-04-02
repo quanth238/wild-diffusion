@@ -14,6 +14,7 @@ from ..checks import run_preflight_checks
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
 from ..shared.sigma import build_sigma_levels, sample_target_indices
+from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
 from ..model_backends.provider import build_model_bundle
 from .utils import (
     compute_terminal_match_stats,
@@ -246,8 +247,20 @@ def _load_baseline_checkpoint(
     payload = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid baseline checkpoint format (expect dict): {ckpt_path}")
-    if "baseline_state_dict" not in payload:
-        raise RuntimeError(f"Missing key 'baseline_state_dict' in baseline checkpoint: {ckpt_path}")
+
+    # Support both native baseline checkpoints and the lighter checkpoint format
+    # emitted by the MNIST sweep scripts (`state_dict` / `history` only).
+    if "baseline_state_dict" in payload:
+        state_dict = payload["baseline_state_dict"]
+        history = payload.get("baseline_history", _empty_baseline_history())
+    elif "state_dict" in payload:
+        state_dict = payload["state_dict"]
+        history = payload.get("history", _empty_baseline_history())
+    else:
+        raise RuntimeError(
+            "Missing keys 'baseline_state_dict' and 'state_dict' in baseline checkpoint: "
+            f"{ckpt_path}"
+        )
 
     loaded_signature = payload.get("baseline_signature", {})
     if not isinstance(loaded_signature, dict):
@@ -267,10 +280,8 @@ def _load_baseline_checkpoint(
         if strict_meta:
             raise RuntimeError(msg)
         print(f"[warn] {msg}", flush=True)
-        return None
 
-    baseline_model.load_state_dict(payload["baseline_state_dict"], strict=True)
-    history = payload.get("baseline_history", _empty_baseline_history())
+    baseline_model.load_state_dict(state_dict, strict=True)
     if not isinstance(history, dict):
         history = _empty_baseline_history()
     history.setdefault("loss", [])
@@ -315,6 +326,7 @@ def _build_baseline_gate(
     dataset: DatasetBundle,
     method,
     rollout_kwargs: Dict,
+    amp_dtype,
 ) -> Dict:
     """Compute baseline acceptance gate metrics before robust phase.
 
@@ -331,32 +343,34 @@ def _build_baseline_gate(
 
     x_gate = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_gate = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    gate_roll = _rollout_for_eval(
-        cfg=cfg,
-        method=method,
-        x0=x_gate,
-        target_indices=idx_gate,
-        control=control,
-        sigma_levels=sigma_levels,
-        kappa_by_step=kappa_by_step,
-        rollout_kwargs=rollout_kwargs,
-        attack_net=baseline_eval,
-    )
-    gate_ref_paths = gate_roll.states_ref[:, : gate_terminal_step + 1]
-    gate_rev_det = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=gate_ref_paths[:, -1],
-        sigma_levels=sigma_levels_gate,
-        stochastic=False,
-    )
+    with autocast_context(x_gate.device, amp_dtype):
+        gate_roll = _rollout_for_eval(
+            cfg=cfg,
+            method=method,
+            x0=x_gate,
+            target_indices=idx_gate,
+            control=control,
+            sigma_levels=sigma_levels,
+            kappa_by_step=kappa_by_step,
+            rollout_kwargs=rollout_kwargs,
+            attack_net=baseline_eval,
+        )
+        gate_ref_paths = gate_roll.states_ref[:, : gate_terminal_step + 1]
+        gate_rev_det = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=gate_ref_paths[:, -1],
+            sigma_levels=sigma_levels_gate,
+            stochastic=False,
+        )
     gate_endpoint_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_rev_det[:, 0]))
     gate_endpoint_recovery_mse = float((gate_rev_det[:, 0] - x_gate).reshape(x_gate.shape[0], -1).pow(2).mean().item())
-    gate_gen_paths = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
-        sigma_levels=sigma_levels,
-        stochastic=True,
-    )
+    with autocast_context(x_gate.device, amp_dtype):
+        gate_gen_paths = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
+            sigma_levels=sigma_levels,
+            stochastic=True,
+        )
     gate_generated_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_gen_paths[:, 0]))
     baseline_gate = diagnostics.build_baseline_gate(
         cfg,
@@ -428,6 +442,12 @@ def run_experiment(cfg) -> dict:
     """
 
     device = pick_device(cfg.device)
+    configure_runtime(
+        device=device,
+        allow_tf32=bool(getattr(cfg, "allow_tf32", True)),
+        cudnn_benchmark=bool(getattr(cfg, "cudnn_benchmark", True)),
+    )
+    amp_dtype = resolve_amp_dtype(device, getattr(cfg, "amp_dtype", "auto"))
     set_seed(cfg.seed)
     run_t0 = time.perf_counter()
     run_wall_start = datetime.now(timezone.utc).isoformat()
@@ -461,6 +481,13 @@ def run_experiment(cfg) -> dict:
             "Please implement its rollout/train API under toy/versions/<version>/."
         )
     print(f"[info] device={device}", flush=True)
+    print(
+        "[info] runtime "
+        f"allow_tf32={bool(getattr(cfg, 'allow_tf32', True))} "
+        f"cudnn_benchmark={bool(getattr(cfg, 'cudnn_benchmark', True))} "
+        f"amp_dtype={format_amp_dtype(amp_dtype)}",
+        flush=True,
+    )
     print(f"[info] exp_dir={exp_dir}", flush=True)
     print(
         "[info] flow_mode="
@@ -578,9 +605,8 @@ def run_experiment(cfg) -> dict:
     baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
     t_phase = time.perf_counter()
-    baseline_gate = _run_with_scoped_seed(
-        gate_eval_seed,
-        lambda: _build_baseline_gate(
+    def _baseline_gate_eval():
+        return _build_baseline_gate(
             cfg=cfg,
             diagnostics=diagnostics,
             baseline_eval=baseline_eval,
@@ -590,7 +616,12 @@ def run_experiment(cfg) -> dict:
             dataset=dataset,
             method=method,
             rollout_kwargs=rollout_kwargs,
-        ),
+            amp_dtype=amp_dtype,
+        )
+
+    baseline_gate = _run_with_scoped_seed(
+        gate_eval_seed,
+        _baseline_gate_eval,
     )
     runtime_sec["baseline_gate_eval"] = float(time.perf_counter() - t_phase)
     baseline_gate["eval_seed"] = int(gate_eval_seed)
@@ -618,47 +649,49 @@ def run_experiment(cfg) -> dict:
     # Evaluate denoise curves on train-pool and held-out pools to expose overfitting under limited data.
     x_train_eval = dataset.sample_train_batch(cfg.debug_eval_batch)
     idx_train_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    train_roll = _rollout_for_eval(
-        cfg=cfg,
-        method=method,
-        x0=x_train_eval,
-        target_indices=idx_train_eval,
-        control=control,
-        sigma_levels=sigma_levels,
-        kappa_by_step=kappa_by_step,
-        rollout_kwargs=rollout_kwargs,
-        attack_net=robust,
-    )
-    denoise_error_curves_train = compute_denoise_error_curves(
-        baseline_model=baseline_eval,
-        robust_model=robust,
-        x0=x_train_eval,
-        states_ref=train_roll.states_ref,
-        states_ctrl=train_roll.states_ctrl,
-        sigma_levels=sigma_levels,
-    )
+    with autocast_context(device, amp_dtype):
+        train_roll = _rollout_for_eval(
+            cfg=cfg,
+            method=method,
+            x0=x_train_eval,
+            target_indices=idx_train_eval,
+            control=control,
+            sigma_levels=sigma_levels,
+            kappa_by_step=kappa_by_step,
+            rollout_kwargs=rollout_kwargs,
+            attack_net=robust,
+        )
+        denoise_error_curves_train = compute_denoise_error_curves(
+            baseline_model=baseline_eval,
+            robust_model=robust,
+            x0=x_train_eval,
+            states_ref=train_roll.states_ref,
+            states_ctrl=train_roll.states_ctrl,
+            sigma_levels=sigma_levels,
+        )
 
     x_val_eval = dataset.sample_val_batch(cfg.debug_eval_batch)
     idx_val_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
-    val_roll = _rollout_for_eval(
-        cfg=cfg,
-        method=method,
-        x0=x_val_eval,
-        target_indices=idx_val_eval,
-        control=control,
-        sigma_levels=sigma_levels,
-        kappa_by_step=kappa_by_step,
-        rollout_kwargs=rollout_kwargs,
-        attack_net=robust,
-    )
-    denoise_error_curves_val = compute_denoise_error_curves(
-        baseline_model=baseline_eval,
-        robust_model=robust,
-        x0=x_val_eval,
-        states_ref=val_roll.states_ref,
-        states_ctrl=val_roll.states_ctrl,
-        sigma_levels=sigma_levels,
-    )
+    with autocast_context(device, amp_dtype):
+        val_roll = _rollout_for_eval(
+            cfg=cfg,
+            method=method,
+            x0=x_val_eval,
+            target_indices=idx_val_eval,
+            control=control,
+            sigma_levels=sigma_levels,
+            kappa_by_step=kappa_by_step,
+            rollout_kwargs=rollout_kwargs,
+            attack_net=robust,
+        )
+        denoise_error_curves_val = compute_denoise_error_curves(
+            baseline_model=baseline_eval,
+            robust_model=robust,
+            x0=x_val_eval,
+            states_ref=val_roll.states_ref,
+            states_ctrl=val_roll.states_ctrl,
+            sigma_levels=sigma_levels,
+        )
     denoise_error_curves = denoise_error_curves_val
     x_demo = x_val_eval
     demo_roll = val_roll
@@ -678,33 +711,34 @@ def run_experiment(cfg) -> dict:
             dtype=ref_paths_plot.dtype,
         )
     # Deterministic reverse for pairwise-recovery diagnostics.
-    rev_baseline_from_ref = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=ref_paths_plot[:, -1],
-        sigma_levels=sigma_levels_plot,
-        stochastic=False,
-    )
-    rev_baseline_from_attack = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=ctrl_paths_plot[:, -1],
-        sigma_levels=sigma_levels_plot,
-        stochastic=False,
-    )
-    # Optional stochastic reverse for visualization of clustered generative behavior.
-    rev_baseline_from_ref_plot = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=ref_paths_plot[:, -1],
-        sigma_levels=sigma_levels_plot,
-        stochastic=cfg.plot_stochastic_backward,
-        noise_schedule=shared_reverse_noise,
-    )
-    rev_baseline_from_attack_plot = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=ctrl_paths_plot[:, -1],
-        sigma_levels=sigma_levels_plot,
-        stochastic=cfg.plot_stochastic_backward,
-        noise_schedule=shared_reverse_noise,
-    )
+    with autocast_context(device, amp_dtype):
+        rev_baseline_from_ref = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=ref_paths_plot[:, -1],
+            sigma_levels=sigma_levels_plot,
+            stochastic=False,
+        )
+        rev_baseline_from_attack = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=ctrl_paths_plot[:, -1],
+            sigma_levels=sigma_levels_plot,
+            stochastic=False,
+        )
+        # Optional stochastic reverse for visualization of clustered generative behavior.
+        rev_baseline_from_ref_plot = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=ref_paths_plot[:, -1],
+            sigma_levels=sigma_levels_plot,
+            stochastic=cfg.plot_stochastic_backward,
+            noise_schedule=shared_reverse_noise,
+        )
+        rev_baseline_from_attack_plot = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=ctrl_paths_plot[:, -1],
+            sigma_levels=sigma_levels_plot,
+            stochastic=cfg.plot_stochastic_backward,
+            noise_schedule=shared_reverse_noise,
+        )
     paired_reverse_delta_plot = compute_paired_reverse_delta_by_step(
         reverse_paths_ref=rev_baseline_from_ref_plot,
         reverse_paths_attack=rev_baseline_from_attack_plot,
@@ -739,18 +773,19 @@ def run_experiment(cfg) -> dict:
             f"tol={cfg.reverse_terminal_assert_tol:.3e}"
         )
 
-    recovery_ref_curve = compute_x0_recovery_vs_terminal_step(
-        denoiser=baseline_eval,
-        forward_paths=demo_roll.states_ref,
-        sigma_levels=sigma_levels,
-        reverse_fn=reverse_paths_from_terminal,
-    )
-    recovery_attack_curve = compute_x0_recovery_vs_terminal_step(
-        denoiser=baseline_eval,
-        forward_paths=demo_roll.states_ctrl,
-        sigma_levels=sigma_levels,
-        reverse_fn=reverse_paths_from_terminal,
-    )
+    with autocast_context(device, amp_dtype):
+        recovery_ref_curve = compute_x0_recovery_vs_terminal_step(
+            denoiser=baseline_eval,
+            forward_paths=demo_roll.states_ref,
+            sigma_levels=sigma_levels,
+            reverse_fn=reverse_paths_from_terminal,
+        )
+        recovery_attack_curve = compute_x0_recovery_vs_terminal_step(
+            denoiser=baseline_eval,
+            forward_paths=demo_roll.states_ctrl,
+            sigma_levels=sigma_levels,
+            reverse_fn=reverse_paths_from_terminal,
+        )
     bayes_terminal_mse = diagnostics.estimate_bayes_terminal_mse(
         dataset,
         cfg,
@@ -779,21 +814,23 @@ def run_experiment(cfg) -> dict:
         if shared_gen_terminal is not None
         else dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1])
     )
-    baseline_gen_paths = reverse_paths_from_terminal(
-        denoiser=baseline_eval,
-        x_terminal=baseline_terminal,
-        sigma_levels=sigma_levels,
-        stochastic=True,
-        noise_schedule=shared_gen_reverse_noise,
-    )
+    with autocast_context(device, amp_dtype):
+        baseline_gen_paths = reverse_paths_from_terminal(
+            denoiser=baseline_eval,
+            x_terminal=baseline_terminal,
+            sigma_levels=sigma_levels,
+            stochastic=True,
+            noise_schedule=shared_gen_reverse_noise,
+        )
     baseline_gen_np = tensor_to_numpy(baseline_gen_paths[:, 0])
-    robust_gen_paths = reverse_paths_from_terminal(
-        denoiser=robust,
-        x_terminal=robust_terminal,
-        sigma_levels=sigma_levels,
-        stochastic=True,
-        noise_schedule=shared_gen_reverse_noise,
-    )
+    with autocast_context(device, amp_dtype):
+        robust_gen_paths = reverse_paths_from_terminal(
+            denoiser=robust,
+            x_terminal=robust_terminal,
+            sigma_levels=sigma_levels,
+            stochastic=True,
+            noise_schedule=shared_gen_reverse_noise,
+        )
     robust_gen_np = tensor_to_numpy(robust_gen_paths[:, 0])
     runtime_sec["post_train_eval"] = float(time.perf_counter() - t_post_eval)
     val_pool_np = tensor_to_numpy(dataset.val_pool)
@@ -957,6 +994,10 @@ def run_experiment(cfg) -> dict:
             "robust_inner_obj": summarize_series(history_robust["inner_obj"]),
             "robust_inner_obj_curve": [float(v) for v in history_robust.get("inner_obj", [])],
             "robust_energy": summarize_series(history_robust.get("energy", [])),
+            "v11_path_transport_cost": summarize_series(
+                history_robust.get("energy", []) if str(cfg.method_version).lower() in ("v1.1", "1.1") else []
+            ),
+            "wild_sample_transport_cost": summarize_series(history_robust.get("wild_inner_transport_cost", [])),
             "robust_lambda_value": summarize_series(history_robust.get("lambda_value", [])),
             "robust_lambda_value_next": summarize_series(history_robust.get("lambda_value_next", [])),
             "robust_lambda_subgrad": summarize_series(history_robust.get("lambda_subgrad", [])),

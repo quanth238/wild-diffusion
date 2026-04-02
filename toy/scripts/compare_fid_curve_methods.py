@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Sweep robust training steps and plot FID-vs-iteration for multiple methods.
+"""Sweep continuation steps and plot FID-vs-iteration for multiple methods.
 
 This script compares:
 - baseline-only
+- clean continuation
 - wild
 - v1.1
 - v1.2
@@ -14,6 +15,9 @@ Protocol note:
   signature uses baseline_steps=S (metadata only), while preserving the same
   baseline weights. This keeps strict checkpoint metadata checks satisfied and
   ensures all methods at the same S start from the same baseline weights.
+- Legacy MNIST sweep checkpoints (`state_dict` / `history`) are accepted as
+  baseline sources and converted on the fly into alias checkpoints that the
+  comparison harness can load.
 """
 
 from __future__ import annotations
@@ -66,6 +70,8 @@ def _normalize_method(name: str) -> str:
     key = name.strip().lower().replace("_", "").replace("-", "")
     if key in ("baseline", "baselineonly", "base"):
         return "baseline"
+    if key in ("clean", "cleancont", "cleancontinuation", "continuation", "finetune", "cleanfinetune"):
+        return "clean"
     if key in ("wild",):
         return "wild"
     if key in ("11", "v11", "v1.1", "1.1"):
@@ -79,7 +85,7 @@ def _parse_methods(text: str) -> List[str]:
     methods = [_normalize_method(tok) for tok in text.split(",") if tok.strip()]
     if not methods:
         raise ValueError("Empty --methods.")
-    order = ["baseline", "wild", "1.1", "1.2"]
+    order = ["baseline", "clean", "wild", "1.1", "1.2"]
     seen = set()
     out: List[str] = []
     for m in methods:
@@ -112,6 +118,25 @@ def _run(cmd: List[str], *, cwd: Path, dry_run: bool) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def _empty_baseline_history() -> Dict[str, Any]:
+    return {"loss": [], "proxy_weighted_denoise_loss": [], "sigma_counts": []}
+
+
+def _baseline_ckpt_source_kind(source_ckpt: Path) -> str:
+    payload = torch.load(str(source_ckpt), map_location="cpu")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid checkpoint payload (expect dict): {source_ckpt}")
+    if "baseline_state_dict" in payload:
+        return "native"
+    if "state_dict" in payload:
+        return "legacy_state_dict"
+    raise RuntimeError(
+        "Unsupported checkpoint payload. Expected one of "
+        "('baseline_state_dict', 'state_dict') in "
+        f"{source_ckpt}"
+    )
+
+
 def _ensure_baseline_alias_ckpt(*, source_ckpt: Path, alias_ckpt: Path, step: int, dry_run: bool) -> None:
     alias_ckpt.parent.mkdir(parents=True, exist_ok=True)
     if dry_run:
@@ -121,29 +146,43 @@ def _ensure_baseline_alias_ckpt(*, source_ckpt: Path, alias_ckpt: Path, step: in
     payload = torch.load(str(source_ckpt), map_location="cpu")
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid checkpoint payload (expect dict): {source_ckpt}")
-    if "baseline_state_dict" not in payload:
-        raise RuntimeError(f"Missing 'baseline_state_dict' in: {source_ckpt}")
+    source_kind = _baseline_ckpt_source_kind(source_ckpt)
 
-    sig = payload.get("baseline_signature", {})
-    if not isinstance(sig, dict):
+    if source_kind == "native":
+        state_dict = payload["baseline_state_dict"]
+        history = payload.get("baseline_history", _empty_baseline_history())
+        sig = payload.get("baseline_signature", {})
+        if not isinstance(sig, dict):
+            sig = {}
+        sig = dict(sig)
+    else:
+        state_dict = payload["state_dict"]
+        history = payload.get("history", _empty_baseline_history())
         sig = {}
-    sig = dict(sig)
-    sig["baseline_steps"] = int(step)
 
-    payload = dict(payload)
-    payload["baseline_signature"] = sig
-    payload["alias_from_ckpt"] = str(source_ckpt)
-    payload["alias_for_baseline_steps"] = int(step)
-    payload["alias_saved_at"] = datetime.now(timezone.utc).isoformat()
+    sig["baseline_steps"] = int(step)
+    if source_kind != "native":
+        sig["legacy_source_format"] = str(payload.get("format", "legacy_state_dict"))
+
+    alias_payload = {
+        "format": "toy_baseline_ckpt_alias_v1",
+        "baseline_signature": sig,
+        "baseline_history": history if isinstance(history, dict) else _empty_baseline_history(),
+        "baseline_state_dict": state_dict,
+        "alias_from_ckpt": str(source_ckpt),
+        "alias_for_baseline_steps": int(step),
+        "alias_saved_at": datetime.now(timezone.utc).isoformat(),
+    }
 
     tmp = alias_ckpt.with_suffix(alias_ckpt.suffix + f".tmp.{datetime.now().timestamp()}")
-    torch.save(payload, str(tmp))
+    torch.save(alias_payload, str(tmp))
     tmp.replace(alias_ckpt)
 
 
 def _method_label(method: str) -> str:
     return {
         "baseline": "Baseline-only",
+        "clean": "Clean-cont.",
         "wild": "WILD",
         "1.1": "v1.1",
         "1.2": "v1.2",
@@ -153,6 +192,19 @@ def _method_label(method: str) -> str:
 def _method_cli_args(method: str, args: argparse.Namespace) -> List[str]:
     if method == "baseline":
         return ["--method-version", "v2", "--baseline-only"]
+    if method == "clean":
+        return [
+            "--method-version",
+            "v2",
+            "--inner-steps",
+            "0",
+            "--outer-attack-weight",
+            "0.0",
+            "--outer-clean-weight",
+            "1.0",
+            "--control-radius-kappa",
+            "0.0",
+        ]
     if method == "wild":
         extra = [
             "--method-version",
@@ -248,6 +300,8 @@ class RunRow:
     robust_images_seen_total: float
     effective_train_images_seen_total: float
     robust_batch_equiv_denoiser_evals_total: float
+    method_transport_cost_name: str
+    method_transport_cost_final: float
     fid_ref_policy_name: str
     fid_ref_resolved_path: str
 
@@ -271,6 +325,8 @@ class RunRow:
             "robust_images_seen_total": self.robust_images_seen_total,
             "effective_train_images_seen_total": self.effective_train_images_seen_total,
             "robust_batch_equiv_denoiser_evals_total": self.robust_batch_equiv_denoiser_evals_total,
+            "method_transport_cost_name": self.method_transport_cost_name,
+            "method_transport_cost_final": self.method_transport_cost_final,
             "fid_ref_policy_name": self.fid_ref_policy_name,
             "fid_ref_resolved_path": self.fid_ref_resolved_path,
         }
@@ -284,10 +340,22 @@ def _load_row(metrics_path: Path, method: str, step: int, exp_name: str) -> RunR
     flow = metrics.get("flow_debug", {})
     runtime = flow.get("runtime", {})
     gate = metrics.get("baseline_gate", {})
+    objective = metrics.get("objective_debug", {})
 
     baseline_fid = _safe_float(sq.get("baseline_fid"))
     robust_fid = _safe_float(sq.get("robust_fid"))
     fid_delta = robust_fid - baseline_fid if math.isfinite(robust_fid) and math.isfinite(baseline_fid) else float("nan")
+    if method == "wild":
+        transport_name = "wild_sample_transport_cost"
+        transport_payload = objective.get("wild_sample_transport_cost", objective.get("wild_inner_transport_cost", {}))
+        transport_final = _safe_float(transport_payload.get("final") if isinstance(transport_payload, dict) else None)
+    elif method == "1.1":
+        transport_name = "v11_path_transport_cost"
+        transport_payload = objective.get("v11_path_transport_cost", objective.get("robust_energy", {}))
+        transport_final = _safe_float(transport_payload.get("final") if isinstance(transport_payload, dict) else None)
+    else:
+        transport_name = ""
+        transport_final = float("nan")
 
     return RunRow(
         method=method,
@@ -308,13 +376,15 @@ def _load_row(metrics_path: Path, method: str, step: int, exp_name: str) -> RunR
         robust_images_seen_total=_safe_float(runtime.get("robust_images_seen_total")),
         effective_train_images_seen_total=_safe_float(runtime.get("effective_train_images_seen_total")),
         robust_batch_equiv_denoiser_evals_total=_safe_float(runtime.get("robust_batch_equiv_denoiser_evals_total")),
+        method_transport_cost_name=transport_name,
+        method_transport_cost_final=transport_final,
         fid_ref_policy_name=str(fid_ref.get("policy_name", "")),
         fid_ref_resolved_path=str(fid_ref.get("resolved_path", "")),
     )
 
 
 def _write_csv(path: Path, rows: Iterable[RunRow]) -> None:
-    rows_list = [r.to_dict() for r in rows]
+    rows_list = [r.to_dict() if hasattr(r, "to_dict") else dict(r) for r in rows]
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows_list:
         path.write_text("", encoding="utf-8")
@@ -397,8 +467,10 @@ def _budget_summary_rows(rows: List[RunRow], methods: List[str], budget_field: s
 
 def _plot_panel(rows: List[RunRow], methods: List[str], out_path: Path) -> None:
     grouped = _group_rows(rows)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
-    axes_flat = axes.flatten()
+    ncols = 2
+    nrows = max(1, math.ceil(len(methods) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, max(4.5 * nrows, 5.0)), constrained_layout=True)
+    axes_flat = axes.flatten().tolist() if hasattr(axes, "flatten") else [axes]
 
     for ax_idx, method in enumerate(methods):
         ax = axes_flat[ax_idx]
@@ -424,7 +496,7 @@ def _plot_panel(rows: List[RunRow], methods: List[str], out_path: Path) -> None:
             ax.set_title(_method_label(method))
         ax.legend(loc="best", fontsize=8)
 
-    for idx in range(len(methods), 4):
+    for idx in range(len(methods), len(axes_flat)):
         axes_flat[idx].axis("off")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,8 +506,10 @@ def _plot_panel(rows: List[RunRow], methods: List[str], out_path: Path) -> None:
 
 def _plot_budget_panel(rows: List[RunRow], methods: List[str], out_path: Path, budget_field: str) -> None:
     grouped = _group_rows(rows)
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9), constrained_layout=True)
-    axes_flat = axes.flatten()
+    ncols = 2
+    nrows = max(1, math.ceil(len(methods) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, max(4.5 * nrows, 5.0)), constrained_layout=True)
+    axes_flat = axes.flatten().tolist() if hasattr(axes, "flatten") else [axes]
     x_label = _budget_label(budget_field)
 
     for ax_idx, method in enumerate(methods):
@@ -464,7 +538,7 @@ def _plot_budget_panel(rows: List[RunRow], methods: List[str], out_path: Path, b
             ax.set_title(_method_label(method))
         ax.legend(loc="best", fontsize=8)
 
-    for idx in range(len(methods), 4):
+    for idx in range(len(methods), len(axes_flat)):
         axes_flat[idx].axis("off")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -501,7 +575,7 @@ def _fairness_checks(rows: List[RunRow], steps: List[int]) -> Dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="FID-vs-iteration sweep for baseline/wild/v1.1/v1.2.")
+    p = argparse.ArgumentParser(description="FID-vs-iteration sweep for baseline/clean/wild/v1.1/v1.2.")
     p.add_argument("--outdir", type=Path, default=Path("toy_outputs/fid_curve_methods"))
     p.add_argument("--prefix", type=str, default="mnist_20pct_fid_curve")
     p.add_argument("--seed", type=int, default=0)
@@ -607,6 +681,15 @@ def main() -> None:
         raise SystemExit("[ERROR] --require-cuda is set but torch.cuda.is_available() is False.")
     if not args.baseline_ckpt_source.is_file():
         raise SystemExit(f"[ERROR] baseline checkpoint not found: {args.baseline_ckpt_source}")
+    baseline_ckpt_source_kind = _baseline_ckpt_source_kind(args.baseline_ckpt_source.resolve())
+    disable_strict_meta = baseline_ckpt_source_kind != "native"
+    print(
+        "[info]"
+        f" baseline_ckpt_source={args.baseline_ckpt_source.resolve()}"
+        f" source_kind={baseline_ckpt_source_kind}"
+        f" disable_strict_meta={disable_strict_meta}",
+        flush=True,
+    )
 
     outdir: Path = args.outdir.resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -728,6 +811,8 @@ def main() -> None:
                     cmd.append("--auto-log-normal-params")
                 if args.use_ema_eval:
                     cmd.extend(["--use-ema-eval", "--ema-decay", str(args.ema_decay)])
+                if disable_strict_meta:
+                    cmd.append("--disable-baseline-ckpt-strict-meta")
                 cmd.extend(_method_cli_args(method, args))
                 _run(cmd, cwd=repo_root, dry_run=args.dry_run)
 
@@ -737,13 +822,20 @@ def main() -> None:
                 raise RuntimeError(f"Missing metrics file: {metrics_path}")
             row = _load_row(metrics_path, method, step, exp_name)
             rows.append(row)
+            transport_msg = ""
+            if row.method_transport_cost_name and math.isfinite(row.method_transport_cost_final):
+                transport_msg = (
+                    f" {row.method_transport_cost_name}="
+                    f"{_fmt(row.method_transport_cost_final, 6)}"
+                )
             print(
                 "[row]"
                 f" method={row.method_label} step={row.step}"
                 f" baseline_fid={_fmt(row.baseline_fid)} robust_fid={_fmt(row.robust_fid)}"
                 f" robust_images={_fmt(row.robust_images_seen_total, 1)}"
                 f" robust_be={_fmt(row.robust_batch_equiv_denoiser_evals_total, 1)}"
-                f" delta={_fmt(row.fid_delta)} runtime_total={_fmt(row.runtime_total_sec, 2)}s",
+                f" delta={_fmt(row.fid_delta)} runtime_total={_fmt(row.runtime_total_sec, 2)}s"
+                f"{transport_msg}",
                 flush=True,
             )
 
@@ -778,13 +870,17 @@ def main() -> None:
             "family": "fixed_baseline_finetune_curve",
             "description": (
                 "Each point trains robust method for S steps from the same baseline weights. "
-                "Per-step alias checkpoint adjusts baseline_steps metadata only."
+                "Per-step alias checkpoint adjusts baseline_steps metadata only. "
+                "Legacy sweep checkpoints are converted to baseline aliases and loaded "
+                "with strict signature validation disabled."
             ),
             "comparison_question": (
                 "Compare robust fine-tuning behavior from a shared pretrained baseline, "
                 "not from-scratch convergence."
             ),
             "baseline_ckpt_source": str(args.baseline_ckpt_source.resolve()),
+            "baseline_ckpt_source_kind": baseline_ckpt_source_kind,
+            "baseline_ckpt_strict_meta_disabled": bool(disable_strict_meta),
             "alias_ckpt_dir": str(alias_dir),
             "warmup_clean_steps": int(args.warmup_clean_steps),
             "warmup_ramp_steps": int(args.warmup_ramp_steps),
