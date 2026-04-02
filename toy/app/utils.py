@@ -115,4 +115,9 @@ def empty_robust_history() -> dict:
         "wild_inner_sigma_mean": [],
         "wild_refresh_step": [],
         "wild_cache_size": [],
+        "batch_equiv_denoiser_evals_step": [],
+        "batch_equiv_denoiser_evals_attack_construction": [],
+        "batch_equiv_denoiser_evals_attack_eval": [],
+        "batch_equiv_denoiser_evals_clean_eval": [],
+        "batch_equiv_denoiser_evals_cumulative": [],
     }

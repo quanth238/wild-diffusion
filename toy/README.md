@@ -1,15 +1,18 @@
 # Toy: Trajectory-Perturbed Robust Diffusion (Versioned: v1/v2/wild)
 
 This folder is a Torch-first toy implementation for the draft method in `pdfs/method.md`.
+Current default target is `v1.1`, with `wild` kept as the fixed WILD-paper baseline.
 Current runnable targets are:
 
-- `--method-version v2`: robust min-max training with trajectory control under a **hard per-step constraint**.
+- `--method-version v1.1`: path-heuristic robust surrogate with explicit global/step budget projection.
 - `--method-version v1`: soft regularization by **energy penalty only** (closeness disabled),
   with optional dual-lambda update for
   \(\rho\lambda + \sup_u[\mathcal L_{\mathrm{attack}}-\lambda \mathcal C_{\mathrm{energy}}]\).
 - `--method-version wild`: sample-level WDRO surrogate update (WILD style):
   interval refresh of adversarial samples from
   `argmax_x' [loss(x') - gamma * 0.5||x'-x||^2]`.
+- `--method-version v2` / `v2.1`: retained as alternative constrained baselines.
+- `--method-version v1.2`: CDRO-style single-sigma variant retained as an archived ablation.
 
 
 ## Structure
@@ -27,6 +30,7 @@ Current runnable targets are:
   - `shared/reverse.py`: reverse posterior + reverse trajectory samplers.
   - `shared/train_utils.py`, `shared/trainer_common.py`: shared trainer utilities + baseline trainer.
 - `versions/`: version-specific robust method implementations.
+  - `versions/v1_1/`: current primary candidate for toy-side testing.
   - `versions/v2/`: hard-constrained rollout + robust trainer (implemented).
   - `versions/v2_1/`: v2.1 non-Markovian reference rollout + hard-constrained trainer (implemented).
   - `versions/v1/`: energy-penalty rollout + robust trainer (implemented, closeness disabled).
@@ -56,7 +60,23 @@ Current runnable targets are:
 - `trainer.py`, `objective.py`, `checks.py`, and `reverse_paths_from_terminal()` are now shape-agnostic over trailing dimensions.
 - `sample_reverse_paths()` remains generic when a backend provides `sample_terminal_batch_fn`; without that callback it falls back to the legacy 2D Gaussian terminal sampler.
 
-## Objective Implemented (v2)
+## Primary Objective Implemented (v1.1)
+
+Inner maximization:
+
+- build a controlled path with local per-step ascent and explicit transport-budget projection.
+- default projection mode is `global_remaining`, with total budget `v11_total_budget_rho`.
+
+Outer minimization:
+
+- minimize weighted clean + attacked denoising loss
+  (`outer_loss = attack_weight * L_attack + clean_weight * L_clean`).
+- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.5`,
+  with `warmup_clean_steps=900` and `warmup_ramp_steps=600`.
+
+For fair comparison against `wild`, use the batch-equivalent denoiser-eval accounting stored in `metrics.json`.
+
+## Alternative Objective Implemented (v2)
 
 Inner maximization:
 
@@ -123,12 +143,13 @@ From repo root:
 ```bash
 cd Wild-Diffusion
 python toy/run_toy.py \
-  --method-version v2 \
-  --exp-name constrained_v2 \
+  --method-version v1.1 \
+  --exp-name v11_active \
   --steps 3000 \
   --batch-size 512 \
   --inner-steps 1 \
-  --control-radius-kappa 0.15
+  --control-radius-kappa 0.15 \
+  --v11-total-budget-rho 0.02
 
 # Gate behavior:
 # attack chỉ chạy khi baseline pass gate.

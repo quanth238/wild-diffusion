@@ -345,6 +345,9 @@ def main() -> int:
                         "wild_outer_loss_final": float(_safe_last(robust_curve)),
                         "recovery_ref_terminal": float(m["recovery_debug"]["baseline_x0_mse_from_ref_terminal"]),
                         "generated_global_std": float(sq["global_std"]),
+                        "robust_batch_equiv_denoiser_evals_total": float(
+                            od.get("robust_batch_equiv_denoiser_evals_cumulative", {}).get("final", 0.0) or 0.0
+                        ),
                         "robust_minus_baseline_denoise_mean": float(
                             _safe_mean(denoise["robust_on_forward_baseline"])
                             - _safe_mean(denoise["baseline_on_forward_baseline"])

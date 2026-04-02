@@ -303,6 +303,9 @@ def main() -> int:
                         "coverage_ratio": float(sq["coverage_ratio"]),
                         "avg_min_dist_to_mode": float(sq["avg_min_dist_to_mode"]),
                         "p90_min_dist_to_mode": float(sq["p90_min_dist_to_mode"]),
+                        "robust_batch_equiv_denoiser_evals_total": float(
+                            od.get("robust_batch_equiv_denoiser_evals_cumulative", {}).get("final", 0.0) or 0.0
+                        ),
                         "robust_minus_baseline_denoise_mean": float(
                             _safe_mean(denoise["robust_on_forward_baseline"])
                             - _safe_mean(denoise["baseline_on_forward_baseline"])

@@ -4,10 +4,10 @@ from dataclasses import dataclass
 @dataclass
 class ToyConfig:
     outdir: str = "toy_outputs"
-    exp_name: str = "constrained_v2"
+    exp_name: str = "v11_active"
     seed: int = 0
     device: str = "auto"  # auto|cpu|cuda
-    method_version: str = "v2"  # one of supported versions in toy/versions/registry.py
+    method_version: str = "v1.1"  # one of supported versions in toy/versions/registry.py
     dataset_kind: str = "toy_gmm"  # extension point: add image dataset backends later.
     model_kind: str = "auto"  # auto|toy_mlp|...
     diagnostics_kind: str = "auto"  # auto|toy_gmm|...

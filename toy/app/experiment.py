@@ -809,6 +809,10 @@ def run_experiment(cfg) -> dict:
     )
     diag_gap_ratio_summary = summarize_series(history_robust.get("diag_inner_obj_gap_ratio", []))
     diag_delta_ratio_summary = summarize_series(history_robust.get("diag_delta_norm_ratio_mean", []))
+    robust_batch_equiv_step_summary = summarize_series(history_robust.get("batch_equiv_denoiser_evals_step", []))
+    robust_batch_equiv_cumulative_summary = summarize_series(
+        history_robust.get("batch_equiv_denoiser_evals_cumulative", [])
+    )
     collapse_suspected = None
     if diag_gap_ratio_summary["mean_last"] is not None and diag_delta_ratio_summary["mean_last"] is not None:
         collapse_suspected = bool(
@@ -858,6 +862,14 @@ def run_experiment(cfg) -> dict:
             "baseline_ckpt_saved": bool(baseline_ckpt_saved),
             "baseline_ckpt_saved_at": baseline_ckpt_saved_at,
             "baseline_ckpt_signature_hash": baseline_signature_hash,
+            "compute_accounting": {
+                "unit_name": "batch_equiv_denoiser_evals",
+                "unit_definition": (
+                    "One denoiser forward over one training batch counts as 1 unit; "
+                    "a forward over B*T path states counts as T units."
+                ),
+                "diagnostics_included": False,
+            },
         },
         "dataset_debug": {
             "dataset_backend": dataset.name,
@@ -946,6 +958,23 @@ def run_experiment(cfg) -> dict:
             "wild_inner_sigma_mean": summarize_series(history_robust.get("wild_inner_sigma_mean", [])),
             "wild_refresh_steps": [int(v) for v in history_robust.get("wild_refresh_step", [])],
             "wild_cache_sizes": [int(v) for v in history_robust.get("wild_cache_size", [])],
+            "robust_batch_equiv_denoiser_evals_step": robust_batch_equiv_step_summary,
+            "robust_batch_equiv_denoiser_evals_attack_construction": summarize_series(
+                history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
+            ),
+            "robust_batch_equiv_denoiser_evals_attack_eval": summarize_series(
+                history_robust.get("batch_equiv_denoiser_evals_attack_eval", [])
+            ),
+            "robust_batch_equiv_denoiser_evals_clean_eval": summarize_series(
+                history_robust.get("batch_equiv_denoiser_evals_clean_eval", [])
+            ),
+            "robust_batch_equiv_denoiser_evals_cumulative": robust_batch_equiv_cumulative_summary,
+            "robust_batch_equiv_denoiser_evals_step_curve": [
+                float(v) for v in history_robust.get("batch_equiv_denoiser_evals_step", [])
+            ],
+            "robust_batch_equiv_denoiser_evals_cumulative_curve": [
+                float(v) for v in history_robust.get("batch_equiv_denoiser_evals_cumulative", [])
+            ],
             "collapse_gap_ratio_tol": float(cfg.collapse_gap_ratio_tol),
             "collapse_delta_ratio_tol": float(cfg.collapse_delta_ratio_tol),
             "collapse_suspected": collapse_suspected,
@@ -1226,6 +1255,13 @@ def run_experiment(cfg) -> dict:
     runtime_sec["robust_steps_per_sec"] = (
         float(cfg.steps) / float(runtime_sec["robust_phase"])
         if attack_training_executed and runtime_sec["robust_phase"] > 0
+        else None
+    )
+    robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
+    runtime_sec["robust_batch_equiv_denoiser_evals_total"] = robust_batch_equiv_total
+    runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (
+        robust_batch_equiv_total / float(runtime_sec["robust_phase"])
+        if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_batch_equiv_total > 0
         else None
     )
     runtime_sec["run_started_utc"] = run_wall_start

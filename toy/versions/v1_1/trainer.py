@@ -44,6 +44,12 @@ def _path_average_training_loss(
     return compute_training_loss(cfg, denoiser, x_noisy, x_clean, sigma)
 
 
+def _path_batch_equiv_denoiser_evals(sigma_levels: torch.Tensor) -> float:
+    """Count one denoiser eval over `B*T` path states as `T` batch-equivalent evals."""
+
+    return float(max(int(sigma_levels.numel()) - 1, 0))
+
+
 def train_trajectory_robust_constrained(
     denoiser,
     control,
@@ -90,6 +96,11 @@ def train_trajectory_robust_constrained(
         "diag_delta_norm_ratio_max": [],
         "diag_path_delta_mean": [],
         "diag_terminal_delta_mean": [],
+        "batch_equiv_denoiser_evals_step": [],
+        "batch_equiv_denoiser_evals_attack_construction": [],
+        "batch_equiv_denoiser_evals_attack_eval": [],
+        "batch_equiv_denoiser_evals_clean_eval": [],
+        "batch_equiv_denoiser_evals_cumulative": [],
     }
 
     # v1.1 path-heuristic does not learn a global control policy.
@@ -102,6 +113,8 @@ def train_trajectory_robust_constrained(
     gamma = float(cfg.v11_transport_gamma)
     total_budget = float(cfg.v11_total_budget_rho)
     projection_mode = str(cfg.v11_projection_mode).lower()
+    path_batch_equiv_evals = _path_batch_equiv_denoiser_evals(sigma_levels)
+    cumulative_batch_equiv_evals = 0.0
 
     for step in range(1, cfg.steps + 1):
         x0 = sample_train_batch(
@@ -123,6 +136,7 @@ def train_trajectory_robust_constrained(
 
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
         attack_enabled = bool(control_updates_enabled and attack_weight > 0.0 and cfg.inner_steps > 0)
+        attack_construction_units = 0.0
 
         set_requires_grad(denoiser, False)
         if attack_enabled:
@@ -140,6 +154,7 @@ def train_trajectory_robust_constrained(
                 control_radius_kappa=cfg.control_radius_kappa,
                 kappa_by_step=kappa_by_step,
             )
+            attack_construction_units = path_batch_equiv_evals * float(max(int(cfg.inner_steps), 0))
         else:
             roll = rollout_controlled_ve(
                 x0=x0,
@@ -184,6 +199,10 @@ def train_trajectory_robust_constrained(
             raise RuntimeError("NaN/Inf detected in v1.1 outer loss.")
         outer_loss.backward()
         optimizer_theta.step()
+        attack_eval_units = path_batch_equiv_evals * 2.0
+        clean_eval_units = path_batch_equiv_evals if clean_weight > 0.0 else 0.0
+        step_batch_equiv_evals = attack_construction_units + attack_eval_units + clean_eval_units
+        cumulative_batch_equiv_evals += step_batch_equiv_evals
 
         history["outer_loss"].append(scalarize(outer_loss))
         history["outer_loss_attack"].append(scalarize(outer_loss_attack))
@@ -197,6 +216,11 @@ def train_trajectory_robust_constrained(
         history["sched_attack_weight"].append(float(attack_weight))
         history["sched_clean_weight"].append(float(clean_weight))
         history["sched_phi_lr_scale"].append(float(phi_lr_scale))
+        history["batch_equiv_denoiser_evals_step"].append(float(step_batch_equiv_evals))
+        history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
+        history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
+        history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
+        history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)
@@ -294,6 +318,7 @@ def train_trajectory_robust_constrained(
                 f"attack={outer_loss_attack.item():.6f} clean={outer_loss_clean.item():.6f} "
                 f"inner_obj={last_inner_obj:.6f} transport={last_transport:.6f} "
                 f"delta_norm={last_delta_norm_mean:.6f} delta_ratio={last_delta_ratio_mean:.6f} "
+                f"be_evals={step_batch_equiv_evals:.1f} be_evals_cum={cumulative_batch_equiv_evals:.1f} "
                 f"w_attack={attack_weight:.3f} w_clean={clean_weight:.3f} phi_lr_scale={phi_lr_scale:.3f} "
                 f"step_size={step_size:.6f} gamma={gamma:.4f} budget={total_budget:.4f} mode={projection_mode}"
                 f"{diag_msg}",

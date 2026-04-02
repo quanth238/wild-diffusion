@@ -155,6 +155,11 @@ def train_trajectory_robust_wild(
         "wild_inner_sigma_mean": [],
         "wild_refresh_step": [],
         "wild_cache_size": [],
+        "batch_equiv_denoiser_evals_step": [],
+        "batch_equiv_denoiser_evals_attack_construction": [],
+        "batch_equiv_denoiser_evals_attack_eval": [],
+        "batch_equiv_denoiser_evals_clean_eval": [],
+        "batch_equiv_denoiser_evals_cumulative": [],
     }
 
     cache_clean = None
@@ -167,9 +172,11 @@ def train_trajectory_robust_wild(
     refresh_interval = max(int(cfg.wild_update_interval), 1)
     cache_batches = max(int(cfg.wild_cache_batches), 1)
     ratio_denom = max(float(cfg.wild_delta_ratio_denom), 1e-8)
+    cumulative_batch_equiv_evals = 0.0
 
     for step in range(1, cfg.steps + 1):
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
+        attack_construction_units = 0.0
 
         need_refresh = cache_clean is None or ((step - 1) % refresh_interval == 0)
         if need_refresh:
@@ -188,6 +195,7 @@ def train_trajectory_robust_wild(
                 )
                 if control_updates_enabled and attack_weight > 0.0 and int(cfg.wild_inner_steps) > 0:
                     x_adv_chunk, stats = _build_wild_adversarial_batch(denoiser, x_clean_chunk, sigma_levels, cfg)
+                    attack_construction_units += float(max(int(cfg.wild_inner_steps), 0))
                 else:
                     x_adv_chunk = x_clean_chunk.detach().clone()
                     stats = {
@@ -230,6 +238,10 @@ def train_trajectory_robust_wild(
 
         outer_loss.backward()
         optimizer_theta.step()
+        attack_eval_units = 1.0
+        clean_eval_units = 1.0
+        step_batch_equiv_evals = attack_construction_units + attack_eval_units + clean_eval_units
+        cumulative_batch_equiv_evals += step_batch_equiv_evals
 
         delta_l2 = (x_adv - x_clean).reshape(x_clean.shape[0], -1).pow(2).sum(dim=1).sqrt()
         delta_norm_mean = scalarize(delta_l2.mean())
@@ -256,6 +268,11 @@ def train_trajectory_robust_wild(
         history["wild_inner_attack_loss"].append(float(cache_attack_loss))
         history["wild_inner_transport_cost"].append(float(cache_transport))
         history["wild_inner_sigma_mean"].append(float(cache_sigma_mean))
+        history["batch_equiv_denoiser_evals_step"].append(float(step_batch_equiv_evals))
+        history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
+        history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
+        history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
+        history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
 
         if step % cfg.log_every == 0:
             print(
@@ -263,6 +280,7 @@ def train_trajectory_robust_wild(
                 f"attack={outer_loss_attack.item():.6f} clean={outer_loss_clean.item():.6f} "
                 f"inner_obj={cache_inner_obj:.6f} transport={cache_transport:.6f} "
                 f"delta_norm={delta_norm_mean:.6f} "
+                f"be_evals={step_batch_equiv_evals:.1f} be_evals_cum={cumulative_batch_equiv_evals:.1f} "
                 f"w_attack={attack_weight:.3f} w_clean={clean_weight:.3f}",
                 flush=True,
             )
