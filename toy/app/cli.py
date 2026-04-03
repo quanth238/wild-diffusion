@@ -25,6 +25,10 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--batch-size must be > 0, got {cfg.batch_size}")
     if cfg.baseline_ckpt_path and not isinstance(cfg.baseline_ckpt_path, str):
         raise ValueError("--baseline-ckpt-path must be a string path.")
+    if cfg.robust_resume_ckpt_path and not isinstance(cfg.robust_resume_ckpt_path, str):
+        raise ValueError("--robust-resume-ckpt-path must be a string path.")
+    if cfg.robust_save_ckpt_path and not isinstance(cfg.robust_save_ckpt_path, str):
+        raise ValueError("--robust-save-ckpt-path must be a string path.")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
     if cfg.training_objective not in ("edm", "score"):
@@ -229,6 +233,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-ckpt-path", type=str, default=ToyConfig.baseline_ckpt_path)
     parser.add_argument("--baseline-ckpt-force-retrain", action="store_true", default=ToyConfig.baseline_ckpt_force_retrain)
     parser.add_argument("--disable-baseline-ckpt-strict-meta", action="store_true")
+    parser.add_argument("--robust-resume-ckpt-path", type=str, default=ToyConfig.robust_resume_ckpt_path)
+    parser.add_argument("--robust-save-ckpt-path", type=str, default=ToyConfig.robust_save_ckpt_path)
 
     parser.add_argument("--hidden-dim", type=int, default=ToyConfig.hidden_dim)
     parser.add_argument("--lr-theta", type=float, default=ToyConfig.lr_theta)

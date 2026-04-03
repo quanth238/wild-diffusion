@@ -26,11 +26,28 @@ def train_trajectory_robust_constrained(
     train_pool: torch.Tensor = None,
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
+    start_step: int = 0,
+    history_state: Optional[dict] = None,
+    optimizer_theta_state: Optional[dict] = None,
+    optimizer_phi_state: Optional[dict] = None,
+    return_state: bool = False,
 ):
     """Bilevel robust training with hard per-step control constraint."""
 
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     optimizer_phi = torch.optim.Adam(control.parameters(), lr=cfg.lr_phi)
+    if optimizer_theta_state is not None:
+        optimizer_theta.load_state_dict(optimizer_theta_state)
+        for state in optimizer_theta.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device=sigma_levels.device)
+    if optimizer_phi_state is not None:
+        optimizer_phi.load_state_dict(optimizer_phi_state)
+        for state in optimizer_phi.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device=sigma_levels.device)
     kappa_by_step = build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -40,7 +57,7 @@ def train_trajectory_robust_constrained(
         high_multiplier=cfg.kappa_high_multiplier,
         preserve_l2_budget=cfg.kappa_preserve_l2_budget,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
-    history = {
+    history = history_state if history_state is not None else {
         "outer_loss": [],
         "outer_loss_attack": [],
         "outer_loss_clean": [],
@@ -69,10 +86,40 @@ def train_trajectory_robust_constrained(
         "batch_equiv_denoiser_evals_clean_eval": [],
         "batch_equiv_denoiser_evals_cumulative": [],
     }
-    cumulative_batch_equiv_evals = 0.0
+    for key in (
+        "outer_loss",
+        "outer_loss_attack",
+        "outer_loss_clean",
+        "inner_obj",
+        "delta_norm_mean",
+        "delta_norm_max",
+        "delta_norm_ratio_mean",
+        "delta_norm_ratio_max",
+        "sched_attack_weight",
+        "sched_clean_weight",
+        "sched_phi_lr_scale",
+        "diag_step",
+        "diag_inner_obj_current",
+        "diag_inner_obj_zero",
+        "diag_inner_obj_gap",
+        "diag_inner_obj_gap_ratio",
+        "diag_delta_norm_mean",
+        "diag_delta_norm_max",
+        "diag_delta_norm_ratio_mean",
+        "diag_delta_norm_ratio_max",
+        "diag_path_delta_mean",
+        "diag_terminal_delta_mean",
+        "batch_equiv_denoiser_evals_step",
+        "batch_equiv_denoiser_evals_attack_construction",
+        "batch_equiv_denoiser_evals_attack_eval",
+        "batch_equiv_denoiser_evals_clean_eval",
+        "batch_equiv_denoiser_evals_cumulative",
+    ):
+        history.setdefault(key, [])
+    cumulative_batch_equiv_evals = float(history["batch_equiv_denoiser_evals_cumulative"][-1]) if history["batch_equiv_denoiser_evals_cumulative"] else 0.0
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
-    for step in range(1, cfg.steps + 1):
+    for step in range(int(start_step) + 1, cfg.steps + 1):
         x0 = sample_train_batch(
             cfg,
             centers,
@@ -290,6 +337,12 @@ def train_trajectory_robust_constrained(
                 flush=True,
             )
 
+    if return_state:
+        return history, {
+            "completed_steps": int(cfg.steps),
+            "optimizer_theta_state": optimizer_theta.state_dict(),
+            "optimizer_phi_state": optimizer_phi.state_dict(),
+        }
     return history
 
 

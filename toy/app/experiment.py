@@ -244,7 +244,7 @@ def _load_baseline_checkpoint(
 ):
     """Load baseline checkpoint if available and signature is compatible."""
 
-    payload = torch.load(ckpt_path, map_location="cpu")
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid baseline checkpoint format (expect dict): {ckpt_path}")
 
@@ -310,6 +310,66 @@ def _save_baseline_checkpoint(
         "baseline_signature": signature,
         "baseline_history": baseline_history,
         "baseline_state_dict": baseline_eval.state_dict(),
+    }
+    tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, ckpt_path)
+
+
+def _load_robust_resume_checkpoint(*, ckpt_path: str, method_name: str) -> Dict[str, Any]:
+    """Load a robust continuation checkpoint for chained step sweeps."""
+
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid robust resume checkpoint format (expect dict): {ckpt_path}")
+    if "robust_state_dict" not in payload or "history_robust" not in payload or "trainer_state" not in payload:
+        raise RuntimeError(
+            "Missing one of ('robust_state_dict', 'history_robust', 'trainer_state') "
+            f"in robust resume checkpoint: {ckpt_path}"
+        )
+    saved_method = str(payload.get("method_name", "")).lower()
+    if saved_method and saved_method != str(method_name).lower():
+        raise RuntimeError(
+            f"Robust resume checkpoint method mismatch: current={method_name} saved={saved_method} ({ckpt_path})"
+        )
+    return payload
+
+
+def _save_robust_resume_checkpoint(
+    *,
+    ckpt_path: str,
+    cfg,
+    method,
+    robust,
+    control,
+    history_robust: Dict[str, Any],
+    trainer_state: Dict[str, Any],
+    rng_state: Dict[str, Any],
+    runtime_sec: Dict[str, Any],
+    run_wall_start: str,
+) -> None:
+    """Persist robust training state so later runs can continue from this point."""
+
+    ensure_dir(os.path.dirname(ckpt_path) or ".")
+    payload = {
+        "format": "toy_robust_resume_ckpt_v1",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "method_name": str(getattr(method, "NAME", cfg.method_version)).lower(),
+        "method_version": str(cfg.method_version),
+        "completed_steps": int(trainer_state.get("completed_steps", cfg.steps)),
+        "history_robust": history_robust,
+        "robust_state_dict": robust.state_dict(),
+        "control_state_dict": control.state_dict(),
+        "trainer_state": trainer_state,
+        "rng_state": rng_state,
+        "cumulative_runtime": {
+            "total": float(runtime_sec.get("total", 0.0)),
+            "total_without_fid": float(runtime_sec.get("total_without_fid", 0.0)),
+            "robust_phase": float(runtime_sec.get("robust_phase", 0.0)),
+            "fid_baseline": float(runtime_sec.get("fid_baseline", 0.0)),
+            "fid_robust": float(runtime_sec.get("fid_robust", 0.0)),
+            "run_started_utc": str(runtime_sec.get("run_started_utc", run_wall_start)),
+        },
     }
     tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     torch.save(payload, tmp_path)
@@ -393,6 +453,8 @@ def _run_robust_phase(
     dataset: DatasetBundle,
     baseline_gate: Dict,
     method,
+    robust_resume_payload: Optional[Dict[str, Any]] = None,
+    return_trainer_state: bool = False,
 ):
     """Execute or skip robust training depending on baseline-only mode and gate status."""
 
@@ -401,7 +463,7 @@ def _run_robust_phase(
         with torch.no_grad():
             for p in control.parameters():
                 p.zero_()
-        return False, empty_robust_history(), robust
+        return False, empty_robust_history(), robust, None
 
     if cfg.baseline_gate_enabled and not baseline_gate["passed"]:
         reason_lines = [
@@ -415,10 +477,34 @@ def _run_robust_phase(
         with torch.no_grad():
             for p in control.parameters():
                 p.zero_()
-        return False, empty_robust_history(), robust
+        return False, empty_robust_history(), robust, None
+
+    trainer_kwargs: Dict[str, Any] = {}
+    method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
+    if robust_resume_payload is not None:
+        trainer_state_in = robust_resume_payload.get("trainer_state", {})
+        completed_steps = int(
+            robust_resume_payload.get("completed_steps", trainer_state_in.get("completed_steps", 0))
+        )
+        history_init = robust_resume_payload.get("history_robust", empty_robust_history())
+        if completed_steps >= int(cfg.steps):
+            return True, history_init, robust, trainer_state_in
+        if method_name in ("v2", "wild", "v1.1", "1.1"):
+            trainer_kwargs["start_step"] = int(completed_steps)
+            trainer_kwargs["history_state"] = history_init
+            trainer_kwargs["return_state"] = bool(return_trainer_state)
+            if method_name == "v2":
+                trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
+                trainer_kwargs["optimizer_phi_state"] = trainer_state_in.get("optimizer_phi_state")
+            else:
+                trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
+        else:
+            raise RuntimeError(f"Robust resume is not implemented for method_version='{cfg.method_version}'.")
+    elif return_trainer_state and method_name in ("v2", "wild", "v1.1", "1.1"):
+        trainer_kwargs["return_state"] = True
 
     attack_training_executed = True
-    history_robust = method.train_trajectory_robust(
+    train_result = method.train_trajectory_robust(
         robust,
         control,
         centers,
@@ -427,8 +513,14 @@ def _run_robust_phase(
         train_pool=dataset.train_pool,
         sample_train_batch_fn=dataset.sample_train_batch,
         sample_population_batch_fn=dataset.sample_population_batch,
+        **trainer_kwargs,
     )
-    return attack_training_executed, history_robust, robust
+    if return_trainer_state and isinstance(train_result, tuple):
+        history_robust, trainer_state = train_result
+    else:
+        history_robust = train_result
+        trainer_state = None
+    return attack_training_executed, history_robust, robust, trainer_state
 
 
 def run_experiment(cfg) -> dict:
@@ -561,6 +653,12 @@ def run_experiment(cfg) -> dict:
     baseline_ckpt_loaded = False
     baseline_ckpt_saved = False
     baseline_ckpt_saved_at = None
+    robust_resume_payload = None
+    robust_resume_loaded = False
+    robust_resume_completed_steps = 0
+    robust_resume_runtime = {}
+    robust_resume_path = str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
+    robust_save_path = str(getattr(cfg, "robust_save_ckpt_path", "")).strip()
     t_baseline_phase = time.perf_counter()
 
     if baseline_ckpt_enabled and os.path.isfile(baseline_ckpt_path) and not baseline_ckpt_force_retrain:
@@ -604,31 +702,58 @@ def run_experiment(cfg) -> dict:
     runtime_sec["baseline_phase"] = float(time.perf_counter() - t_baseline_phase)
     baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
-    t_phase = time.perf_counter()
-    def _baseline_gate_eval():
-        return _build_baseline_gate(
-            cfg=cfg,
-            diagnostics=diagnostics,
-            baseline_eval=baseline_eval,
-            control=control,
-            sigma_levels=sigma_levels,
-            kappa_by_step=kappa_by_step,
-            dataset=dataset,
-            method=method,
-            rollout_kwargs=rollout_kwargs,
-            amp_dtype=amp_dtype,
+    if robust_resume_path:
+        robust_resume_payload = _load_robust_resume_checkpoint(
+            ckpt_path=robust_resume_path,
+            method_name=str(getattr(method, "NAME", cfg.method_version)).lower(),
         )
+        robust.load_state_dict(robust_resume_payload["robust_state_dict"], strict=True)
+        if "control_state_dict" in robust_resume_payload:
+            control.load_state_dict(robust_resume_payload["control_state_dict"], strict=True)
+        robust_resume_loaded = True
+        robust_resume_completed_steps = int(
+            robust_resume_payload.get(
+                "completed_steps",
+                robust_resume_payload.get("trainer_state", {}).get("completed_steps", 0),
+            )
+        )
+        robust_resume_runtime = robust_resume_payload.get("cumulative_runtime", {})
+        if robust_resume_payload.get("rng_state") is not None:
+            _restore_rng_state(robust_resume_payload["rng_state"])
+        baseline_gate = {
+            "passed": True,
+            "resumed_from_ckpt": True,
+            "resume_completed_steps": int(robust_resume_completed_steps),
+        }
+        baseline_gate["eval_seed"] = int(gate_eval_seed)
+        baseline_gate["eval_seed_scoped"] = False
+    else:
+        t_phase = time.perf_counter()
 
-    baseline_gate = _run_with_scoped_seed(
-        gate_eval_seed,
-        _baseline_gate_eval,
-    )
-    runtime_sec["baseline_gate_eval"] = float(time.perf_counter() - t_phase)
-    baseline_gate["eval_seed"] = int(gate_eval_seed)
-    baseline_gate["eval_seed_scoped"] = True
+        def _baseline_gate_eval():
+            return _build_baseline_gate(
+                cfg=cfg,
+                diagnostics=diagnostics,
+                baseline_eval=baseline_eval,
+                control=control,
+                sigma_levels=sigma_levels,
+                kappa_by_step=kappa_by_step,
+                dataset=dataset,
+                method=method,
+                rollout_kwargs=rollout_kwargs,
+                amp_dtype=amp_dtype,
+            )
+
+        baseline_gate = _run_with_scoped_seed(
+            gate_eval_seed,
+            _baseline_gate_eval,
+        )
+        runtime_sec["baseline_gate_eval"] = float(time.perf_counter() - t_phase)
+        baseline_gate["eval_seed"] = int(gate_eval_seed)
+        baseline_gate["eval_seed_scoped"] = True
 
     t_phase = time.perf_counter()
-    attack_training_executed, history_robust, robust = _run_robust_phase(
+    attack_training_executed, history_robust, robust, robust_trainer_state = _run_robust_phase(
         cfg=cfg,
         robust=robust,
         control=control,
@@ -637,10 +762,14 @@ def run_experiment(cfg) -> dict:
         dataset=dataset,
         baseline_gate=baseline_gate,
         method=method,
+        robust_resume_payload=robust_resume_payload,
+        return_trainer_state=bool(robust_save_path),
     )
     runtime_sec["robust_phase"] = float(time.perf_counter() - t_phase)
     if not attack_training_executed:
         robust = baseline_eval
+
+    resume_rng_state = _capture_rng_state()
 
     # Re-seed post-training diagnostics to keep v2/v2.1 comparisons reproducible.
     set_seed(metrics_eval_seed)
@@ -1359,16 +1488,59 @@ def run_experiment(cfg) -> dict:
         if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_batch_equiv_total > 0
         else None
     )
-    runtime_sec["run_started_utc"] = run_wall_start
+    runtime_sec["run_started_utc"] = str(robust_resume_runtime.get("run_started_utc", run_wall_start))
     runtime_sec["run_finished_utc"] = run_wall_end
     runtime_sec["attack_training_executed"] = bool(attack_training_executed)
+    if robust_resume_loaded:
+        runtime_sec["total"] = float(runtime_sec["total"]) + float(robust_resume_runtime.get("total", 0.0))
+        runtime_sec["total_without_fid"] = float(runtime_sec["total_without_fid"]) + float(
+            robust_resume_runtime.get("total_without_fid", 0.0)
+        )
+        runtime_sec["robust_phase"] = float(runtime_sec["robust_phase"]) + float(
+            robust_resume_runtime.get("robust_phase", 0.0)
+        )
+        runtime_sec["fid_baseline"] = float(runtime_sec["fid_baseline"]) + float(
+            robust_resume_runtime.get("fid_baseline", 0.0)
+        )
+        runtime_sec["fid_robust"] = float(runtime_sec["fid_robust"]) + float(
+            robust_resume_runtime.get("fid_robust", 0.0)
+        )
+        runtime_sec["robust_train_only"] = float(runtime_sec["robust_phase"])
+        runtime_sec["effective_train_total"] = float(runtime_sec["baseline_train"] + runtime_sec["robust_phase"])
+        runtime_sec["robust_steps_per_sec"] = (
+            float(cfg.steps) / float(runtime_sec["robust_phase"])
+            if attack_training_executed and runtime_sec["robust_phase"] > 0
+            else None
+        )
+        runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (
+            robust_batch_equiv_total / float(runtime_sec["robust_phase"])
+            if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_batch_equiv_total > 0
+            else None
+        )
 
     metrics["flow_debug"]["runtime"] = runtime_sec
-    metrics["flow_debug"]["runtime_total_sec"] = run_total_sec
+    metrics["flow_debug"]["runtime_total_sec"] = float(runtime_sec["total"])
+    metrics["flow_debug"]["robust_resume_loaded"] = bool(robust_resume_loaded)
+    metrics["flow_debug"]["robust_resume_ckpt_path"] = robust_resume_path or None
+    metrics["flow_debug"]["robust_resume_completed_steps"] = int(robust_resume_completed_steps)
 
     payload = {"config": vars(cfg), "metrics": as_jsonable_metrics(metrics)}
     with open(os.path.join(exp_dir, "metrics.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
+
+    if robust_save_path and robust_trainer_state is not None:
+        _save_robust_resume_checkpoint(
+            ckpt_path=robust_save_path,
+            cfg=cfg,
+            method=method,
+            robust=robust,
+            control=control,
+            history_robust=history_robust,
+            trainer_state=robust_trainer_state,
+            rng_state=resume_rng_state,
+            runtime_sec=runtime_sec,
+            run_wall_start=run_wall_start,
+        )
 
     print("[result] metrics summary", flush=True)
     print(f"  dataset_debug: {metrics['dataset_debug']}", flush=True)

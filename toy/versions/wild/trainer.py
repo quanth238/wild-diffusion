@@ -119,13 +119,23 @@ def train_trajectory_robust_wild(
     train_pool: torch.Tensor = None,
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
+    start_step: int = 0,
+    history_state: Optional[dict] = None,
+    optimizer_theta_state: Optional[dict] = None,
+    return_state: bool = False,
 ):
     """WILD-style robust training with interval-refreshed sample-level WDRO surrogates."""
 
     del control
 
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
-    history = {
+    if optimizer_theta_state is not None:
+        optimizer_theta.load_state_dict(optimizer_theta_state)
+        for state in optimizer_theta.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    state[key] = value.to(device=sigma_levels.device)
+    history = history_state if history_state is not None else {
         "outer_loss": [],
         "outer_loss_attack": [],
         "outer_loss_clean": [],
@@ -164,6 +174,46 @@ def train_trajectory_robust_wild(
         "batch_equiv_denoiser_evals_clean_eval": [],
         "batch_equiv_denoiser_evals_cumulative": [],
     }
+    for key in (
+        "outer_loss",
+        "outer_loss_attack",
+        "outer_loss_clean",
+        "inner_obj",
+        "energy",
+        "lambda_value",
+        "lambda_value_next",
+        "lambda_subgrad",
+        "dual_surrogate",
+        "delta_norm_mean",
+        "delta_norm_max",
+        "delta_norm_ratio_mean",
+        "delta_norm_ratio_max",
+        "sched_attack_weight",
+        "sched_clean_weight",
+        "sched_phi_lr_scale",
+        "diag_step",
+        "diag_inner_obj_current",
+        "diag_inner_obj_zero",
+        "diag_inner_obj_gap",
+        "diag_inner_obj_gap_ratio",
+        "diag_delta_norm_mean",
+        "diag_delta_norm_max",
+        "diag_delta_norm_ratio_mean",
+        "diag_delta_norm_ratio_max",
+        "diag_path_delta_mean",
+        "diag_terminal_delta_mean",
+        "wild_inner_attack_loss",
+        "wild_inner_transport_cost",
+        "wild_inner_sigma_mean",
+        "wild_refresh_step",
+        "wild_cache_size",
+        "batch_equiv_denoiser_evals_step",
+        "batch_equiv_denoiser_evals_attack_construction",
+        "batch_equiv_denoiser_evals_attack_eval",
+        "batch_equiv_denoiser_evals_clean_eval",
+        "batch_equiv_denoiser_evals_cumulative",
+    ):
+        history.setdefault(key, [])
 
     cache_clean = None
     cache_adv = None
@@ -175,10 +225,10 @@ def train_trajectory_robust_wild(
     refresh_interval = max(int(cfg.wild_update_interval), 1)
     cache_batches = max(int(cfg.wild_cache_batches), 1)
     ratio_denom = max(float(cfg.wild_delta_ratio_denom), 1e-8)
-    cumulative_batch_equiv_evals = 0.0
+    cumulative_batch_equiv_evals = float(history["batch_equiv_denoiser_evals_cumulative"][-1]) if history["batch_equiv_denoiser_evals_cumulative"] else 0.0
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
-    for step in range(1, cfg.steps + 1):
+    for step in range(int(start_step) + 1, cfg.steps + 1):
         clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
         attack_construction_units = 0.0
 
@@ -296,4 +346,9 @@ def train_trajectory_robust_wild(
                 flush=True,
             )
 
+    if return_state:
+        return history, {
+            "completed_steps": int(cfg.steps),
+            "optimizer_theta_state": optimizer_theta.state_dict(),
+        }
     return history

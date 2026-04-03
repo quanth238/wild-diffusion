@@ -237,6 +237,8 @@ def _method_cli_args(method: str, args: argparse.Namespace) -> List[str]:
         return [
             "--method-version",
             "1.1",
+            "--inner-steps",
+            str(args.v11_inner_steps),
             "--v11-step-size",
             str(args.v11_step_size),
             "--v11-transport-gamma",
@@ -629,6 +631,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory for per-step alias checkpoints. Defaults to <outdir>/_baseline_alias_ckpt.",
     )
+    p.add_argument(
+        "--resume-ckpt-dir",
+        type=Path,
+        default=None,
+        help="Directory for per-method robust continuation checkpoints. Defaults to <outdir>/_robust_resume_ckpt/<prefix>.",
+    )
 
     # WILD args.
     p.add_argument("--wild-update-interval", type=int, default=20)
@@ -643,6 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wild-delta-ratio-denom", type=float, default=1.0)
 
     # v1.1 args.
+    p.add_argument("--v11-inner-steps", type=int, default=1)
     p.add_argument("--v11-step-size", type=float, default=0.0005)
     p.add_argument("--v11-transport-gamma", type=float, default=2.0)
     p.add_argument("--v11-total-budget-rho", type=float, default=0.02)
@@ -695,6 +704,8 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     alias_dir = (args.alias_ckpt_dir or (outdir / "_baseline_alias_ckpt")).resolve()
     alias_dir.mkdir(parents=True, exist_ok=True)
+    resume_ckpt_root = (args.resume_ckpt_dir or (outdir / "_robust_resume_ckpt" / args.prefix)).resolve()
+    resume_ckpt_root.mkdir(parents=True, exist_ok=True)
     fid_ref_policy_name = default_mnist_fid_policy_name(
         split=str(args.fid_ref_split),
         image_size=int(args.image_size),
@@ -742,13 +753,28 @@ def main() -> None:
             dry_run=args.dry_run,
         )
 
-        for method in methods:
+    chain_resume_methods = {"clean", "wild", "1.1"}
+    for method in methods:
+        prior_resume_ckpt: Path | None = None
+        method_resume_dir = (resume_ckpt_root / method.replace(".", "_")).resolve()
+        method_resume_dir.mkdir(parents=True, exist_ok=True)
+
+        for step in steps:
+            alias_path = alias_dir / f"{args.baseline_ckpt_source.stem}_alias_st{step}.pt"
             exp_name = f"{args.prefix}_{method.replace('.', '_')}_st{step}_s{args.seed}"
             exp_dir = outdir / exp_name
             metrics_path = exp_dir / "metrics.json"
+            resume_ckpt_path = method_resume_dir / f"step{step}.pt"
 
-            if args.skip_existing and metrics_path.is_file():
+            can_chain_resume = method in chain_resume_methods
+            can_skip = bool(args.skip_existing and metrics_path.is_file())
+            if can_chain_resume:
+                can_skip = bool(can_skip and resume_ckpt_path.is_file())
+
+            if can_skip:
                 print(f"[skip-existing] {metrics_path}", flush=True)
+                if can_chain_resume:
+                    prior_resume_ckpt = resume_ckpt_path
             else:
                 cmd = [
                     sys.executable,
@@ -813,8 +839,14 @@ def main() -> None:
                     cmd.extend(["--use-ema-eval", "--ema-decay", str(args.ema_decay)])
                 if disable_strict_meta:
                     cmd.append("--disable-baseline-ckpt-strict-meta")
+                if can_chain_resume:
+                    cmd.extend(["--robust-save-ckpt-path", str(resume_ckpt_path)])
+                    if prior_resume_ckpt is not None:
+                        cmd.extend(["--robust-resume-ckpt-path", str(prior_resume_ckpt)])
                 cmd.extend(_method_cli_args(method, args))
                 _run(cmd, cwd=repo_root, dry_run=args.dry_run)
+                if can_chain_resume:
+                    prior_resume_ckpt = resume_ckpt_path
 
             if args.dry_run:
                 continue

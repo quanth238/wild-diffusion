@@ -51,6 +51,8 @@ class ToyConfig:
     baseline_ckpt_path: str = ""
     baseline_ckpt_force_retrain: bool = False
     baseline_ckpt_strict_meta: bool = True
+    robust_resume_ckpt_path: str = ""
+    robust_save_ckpt_path: str = ""
 
     # Model.
     hidden_dim: int = 128
