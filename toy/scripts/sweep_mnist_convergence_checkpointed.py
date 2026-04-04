@@ -583,6 +583,7 @@ class AggregateRow:
         return {
             "train_percent": self.train_percent,
             "step": self.step,
+            "row_aggregation": "median",
             "images_shown_m": self.images_shown_m,
             "train_subset_size_median": self.train_subset_size_median,
             "n_runs": self.n_runs,

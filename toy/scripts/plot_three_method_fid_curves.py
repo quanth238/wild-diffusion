@@ -115,6 +115,7 @@ def make_plot(
         ]
         if not points:
             continue
+        points.sort(key=lambda point: float(point[0]))
         plt.plot(
             [value for value, _ in points],
             [fid for _, fid in points],
@@ -152,6 +153,7 @@ def make_dual_plot(*, path: str, rows: List[Dict], train_percent_label: str) -> 
             ]
             if not points:
                 continue
+            points.sort(key=lambda point: float(point[0]))
             ax.plot(
                 [value for value, _ in points],
                 [fid for _, fid in points],
@@ -165,9 +167,16 @@ def make_dual_plot(*, path: str, rows: List[Dict], train_percent_label: str) -> 
         ax.grid(True, alpha=0.3)
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=3)
-    fig.suptitle(f"Simpsons-MNIST RGB {train_percent_label}: Three-Method Comparison")
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.965),
+            ncol=3,
+            frameon=False,
+        )
+    fig.suptitle(f"Simpsons-MNIST RGB {train_percent_label}: Three-Method Comparison", y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.86])
     fig.savefig(path, dpi=160)
     plt.close(fig)
 

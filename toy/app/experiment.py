@@ -14,9 +14,13 @@ import torch
 
 from ..checks import run_preflight_checks
 from ..compute_accounting import (
+    baseline_weighted_compute_units_for_steps,
+    cdro_robust_step_weighted_compute_units,
     ensure_denoiser_op_count_history,
     load_weighted_compute_calibration,
     read_denoiser_op_count_totals,
+    solve_warmup_steps_for_target_compute_fraction,
+    wdro_robust_step_weighted_compute_units,
     weighted_compute_units,
 )
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
@@ -501,6 +505,45 @@ def _estimate_wdro_warmup_compute_fraction(
     return warmup_units / total_units, float(wdro_robust_step_units)
 
 
+def _estimate_wdro_warmup_weighted_compute_fraction(
+    cfg,
+    train_pool_size: Optional[int],
+    calibration: Dict[str, Any],
+    warmup_fraction: Optional[float] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return WDRO-style warmup weighted-compute share and robust-step weighted cost."""
+
+    total_steps = int(cfg.steps)
+    if total_steps <= 0:
+        return 0.0, 0.0
+    if warmup_fraction is None:
+        warmup_fraction = float(getattr(cfg, "wdro_warmup_fraction", 0.0))
+    if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+        baseline_steps = int(cfg.baseline_steps_override)
+    else:
+        baseline_steps = int(total_steps * float(warmup_fraction))
+    baseline_steps = max(0, min(baseline_steps, total_steps))
+    robust_steps = max(total_steps - baseline_steps, 0)
+    baseline_weighted_units = baseline_weighted_compute_units_for_steps(
+        steps=int(baseline_steps),
+        calibration=calibration,
+    )
+    wdro_robust_step_weighted_units = wdro_robust_step_weighted_compute_units(
+        batch_size=int(getattr(cfg, "batch_size", 1)),
+        train_pool_size=train_pool_size,
+        refresh_epochs=float(getattr(cfg, "wdro_refresh_epochs", 1.0)),
+        adv_prob=float(getattr(cfg, "wdro_adv_prob", 0.0)),
+        attack_steps=int(getattr(cfg, "wdro_attack_steps", 0)),
+        calibration=calibration,
+    )
+    if baseline_weighted_units is None or wdro_robust_step_weighted_units is None:
+        return None, None
+    total_weighted_units = float(baseline_weighted_units) + float(robust_steps) * float(wdro_robust_step_weighted_units)
+    if total_weighted_units <= 0.0:
+        return 0.0, float(wdro_robust_step_weighted_units)
+    return float(baseline_weighted_units) / float(total_weighted_units), float(wdro_robust_step_weighted_units)
+
+
 def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     """Estimate CDRO robust-step compute in batch-equivalent denoiser evals."""
 
@@ -517,7 +560,12 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     return attack_construction_units + attack_eval_units + clean_eval_units
 
 
-def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] = None) -> Dict[str, Any]:
+def _resolve_phase_steps(
+    cfg,
+    method_name: str,
+    train_pool_size: Optional[int] = None,
+    weighted_calibration: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Resolve baseline/robust step budgets while preserving legacy behavior."""
 
     total_steps = int(cfg.steps)
@@ -529,6 +577,9 @@ def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] =
     wdro_warmup_compute_fraction = None
     wdro_robust_step_batch_equiv = None
     cdro_robust_step_batch_equiv = None
+    wdro_warmup_weighted_compute_fraction = None
+    wdro_robust_step_weighted_units = None
+    cdro_robust_step_weighted_units = None
 
     if str(method_name).lower() == "wdro":
         split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
@@ -538,13 +589,68 @@ def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] =
             baseline_steps = int(total_steps * float(cfg.wdro_warmup_fraction))
         baseline_steps = max(0, min(baseline_steps, total_steps))
         robust_steps = max(total_steps - baseline_steps, 0)
+        wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
+            cfg,
+            train_pool_size=train_pool_size,
+        )
+        if weighted_calibration is not None:
+            wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
+                _estimate_wdro_warmup_weighted_compute_fraction(
+                    cfg,
+                    train_pool_size=train_pool_size,
+                    calibration=weighted_calibration,
+                )
+            )
     elif str(method_name).lower() == "cdro":
         cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
         split_mode = "cdro_baseline_steps_override" if baseline_steps_override > 0 else "cdro_fixed_fraction_warmup"
         if baseline_steps_override > 0:
             baseline_steps = int(cfg.baseline_steps_override)
         else:
-            baseline_steps = int(total_steps * float(getattr(cfg, "cdro_warmup_fraction", 0.0)))
+            cdro_reference_warmup_fraction = float(getattr(cfg, "cdro_warmup_fraction", 0.0))
+            wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
+                cfg,
+                train_pool_size=train_pool_size,
+                warmup_fraction=cdro_reference_warmup_fraction,
+            )
+            if weighted_calibration is not None:
+                wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
+                    _estimate_wdro_warmup_weighted_compute_fraction(
+                        cfg,
+                        train_pool_size=train_pool_size,
+                        calibration=weighted_calibration,
+                        warmup_fraction=cdro_reference_warmup_fraction,
+                    )
+                )
+                cdro_robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
+                    n_steps_path=int(getattr(cfg, "n_steps_path", 0)),
+                    inner_steps=int(getattr(cfg, "inner_steps", 0)),
+                    outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
+                    outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
+                    calibration=weighted_calibration,
+                )
+                baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(
+                    steps=1,
+                    calibration=weighted_calibration,
+                )
+                if (
+                    wdro_warmup_weighted_compute_fraction is not None
+                    and cdro_robust_step_weighted_units is not None
+                    and baseline_step_weighted_units is not None
+                ):
+                    baseline_steps = solve_warmup_steps_for_target_compute_fraction(
+                        total_steps=int(total_steps),
+                        target_warmup_compute_fraction=float(wdro_warmup_weighted_compute_fraction),
+                        baseline_step_compute_units=float(baseline_step_weighted_units),
+                        robust_step_compute_units=float(cdro_robust_step_weighted_units),
+                    )
+                    split_mode = "cdro_weighted_compute_matched_warmup"
+                else:
+                    baseline_steps = int(total_steps * cdro_reference_warmup_fraction)
+                    split_mode = "cdro_fixed_fraction_warmup_unweighted_fallback"
+            else:
+                baseline_steps = int(total_steps * cdro_reference_warmup_fraction)
+                split_mode = "cdro_fixed_fraction_warmup_unweighted_fallback"
         baseline_steps = max(0, min(baseline_steps, total_steps))
         robust_steps = max(total_steps - baseline_steps, 0)
 
@@ -556,11 +662,22 @@ def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] =
         "wdro_warmup_compute_fraction": (
             None if wdro_warmup_compute_fraction is None else float(wdro_warmup_compute_fraction)
         ),
+        "wdro_warmup_weighted_compute_fraction": (
+            None
+            if wdro_warmup_weighted_compute_fraction is None
+            else float(wdro_warmup_weighted_compute_fraction)
+        ),
         "wdro_robust_step_batch_equiv": (
             None if wdro_robust_step_batch_equiv is None else float(wdro_robust_step_batch_equiv)
         ),
+        "wdro_robust_step_weighted_compute_units": (
+            None if wdro_robust_step_weighted_units is None else float(wdro_robust_step_weighted_units)
+        ),
         "cdro_robust_step_batch_equiv": (
             None if cdro_robust_step_batch_equiv is None else float(cdro_robust_step_batch_equiv)
+        ),
+        "cdro_robust_step_weighted_compute_units": (
+            None if cdro_robust_step_weighted_units is None else float(cdro_robust_step_weighted_units)
         ),
     }
 
@@ -1012,7 +1129,12 @@ def run_experiment(cfg) -> dict:
     diagnostics = build_diagnostics_bundle(cfg, dataset)
     centers = dataset.centers
     train_pool_size = int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None
-    phase_steps = _resolve_phase_steps(cfg, method_name, train_pool_size=train_pool_size)
+    phase_steps = _resolve_phase_steps(
+        cfg,
+        method_name,
+        train_pool_size=train_pool_size,
+        weighted_calibration=weighted_calibration,
+    )
     baseline_steps_for_phase = int(phase_steps["baseline_steps"])
     robust_steps_for_phase = int(phase_steps["robust_steps"])
     cfg_baseline = replace(cfg, steps=baseline_steps_for_phase)
@@ -1556,8 +1678,17 @@ def run_experiment(cfg) -> dict:
             "robust_phase_steps": int(robust_steps_for_phase),
             "robust_phase_steps_completed": int(actual_robust_steps_completed),
             "wdro_reference_warmup_compute_fraction": phase_steps.get("wdro_warmup_compute_fraction"),
+            "wdro_reference_warmup_weighted_compute_fraction": phase_steps.get(
+                "wdro_warmup_weighted_compute_fraction"
+            ),
             "wdro_reference_robust_step_batch_equiv": phase_steps.get("wdro_robust_step_batch_equiv"),
+            "wdro_reference_robust_step_weighted_compute_units": phase_steps.get(
+                "wdro_robust_step_weighted_compute_units"
+            ),
             "cdro_estimated_robust_step_batch_equiv": phase_steps.get("cdro_robust_step_batch_equiv"),
+            "cdro_estimated_robust_step_weighted_compute_units": phase_steps.get(
+                "cdro_robust_step_weighted_compute_units"
+            ),
             "model_backend": model_bundle.name,
             "diagnostics_backend": diagnostics.name,
             "training_objective": str(getattr(cfg, "training_objective", "edm")),
@@ -1585,7 +1716,7 @@ def run_experiment(cfg) -> dict:
             "eval_shared_terminal_noise": bool(cfg.eval_use_shared_terminal_noise),
             "eval_shared_reverse_noise": bool(cfg.eval_use_shared_reverse_noise),
             "baseline_ckpt_enabled": bool(baseline_ckpt_enabled),
-            "baseline_ckpt_path": str(baseline_ckpt_path),
+            "baseline_ckpt_path": str(baseline_ckpt_path) if baseline_ckpt_enabled else "",
             "baseline_ckpt_force_retrain": bool(baseline_ckpt_force_retrain),
             "baseline_ckpt_strict_meta": bool(baseline_ckpt_strict_meta),
             "baseline_ckpt_loaded": bool(baseline_ckpt_loaded),

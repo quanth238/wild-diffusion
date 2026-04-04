@@ -110,8 +110,9 @@ class ToyConfig:
     cdro_step_size: float = 0.02
     cdro_total_budget_rho: float = 0.02
     cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
-    # Reference warmup fraction used to match WDRO-style warmup compute when
-    # translating baseline EDM warmup steps for CDRO.
+    # Reference WDRO warmup step fraction. CDRO converts this into a target
+    # weighted-compute warmup share, then solves for the baseline warmup steps
+    # needed to match that share under CDRO's more expensive robust steps.
     cdro_warmup_fraction: float = 0.2
     # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
     v12_step_size: float = 0.02

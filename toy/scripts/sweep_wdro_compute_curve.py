@@ -91,6 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-list", type=str, default="")
     parser.add_argument("--max-total-steps", type=int, default=0)
     parser.add_argument("--baseline-aggregate", action="append", default=[])
+    parser.add_argument("--skip-baseline-overlay", action="store_true")
+    parser.add_argument("--disable-baseline-ckpt", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--weighted-compute-calibration-path", type=str, default="")
     parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
@@ -245,8 +247,6 @@ def run_point(
         args.fid_ref_path,
         "--method-version",
         "wdro",
-        "--baseline-steps-override",
-        str(warmup_steps),
         "--disable-baseline-gate",
         "--skip-checks",
         "--wdro-warmup-fraction",
@@ -269,6 +269,8 @@ def run_point(
         ])
     if use_resume and os.path.exists(resume_path):
         cmd.extend(["--robust-resume-ckpt-path", resume_path])
+    if bool(args.disable_baseline_ckpt):
+        cmd.append("--disable-baseline-ckpt")
     if str(args.weighted_compute_calibration_path).strip():
         cmd.extend(
             [
@@ -309,33 +311,37 @@ def load_baseline_rows(
         with open(path, "r", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 step = int(float(row["step"]))
-                train_elapsed_sec = float(row["train_elapsed_median_sec"])
+                train_wall_clock_sec = float(
+                    row.get("train_wall_clock_sec", row.get("train_wall_clock_median_sec", row["train_elapsed_median_sec"]))
+                )
+                weighted_units = row.get("weighted_compute_units_median")
+                if weighted_units not in (None, ""):
+                    weighted_units = float(weighted_units)
+                else:
+                    weighted_units = weighted_compute_units(
+                        n_fwd=0.0,
+                        n_fwd_inputgrad=0.0,
+                        n_fwd_parambackward=float(step),
+                        calibration=calibration,
+                    )
                 by_step[step] = {
                     "method": "baseline_edm",
                     "step": step,
                     "compute_budget_be": float(step),
                     "baseline_compute_be": float(step),
                     "robust_compute_be": 0.0,
-                    "weighted_compute_units": weighted_compute_units(
-                        n_fwd=0.0,
-                        n_fwd_inputgrad=0.0,
-                        n_fwd_parambackward=float(step),
-                        calibration=calibration,
-                    ),
-                    "baseline_weighted_compute_units": weighted_compute_units(
-                        n_fwd=0.0,
-                        n_fwd_inputgrad=0.0,
-                        n_fwd_parambackward=float(step),
-                        calibration=calibration,
-                    ),
+                    "weighted_compute_units": weighted_units,
+                    "baseline_weighted_compute_units": weighted_units,
                     "robust_weighted_compute_units": 0.0
                     if calibration.get("available", False)
                     else None,
                     "images_shown_m": float(row["images_shown_m"]),
                     "fid": float(row["fid_median"]),
-                    "train_wall_clock_sec": float(train_elapsed_sec),
-                    "train_elapsed_sec": float(train_elapsed_sec),
-                    "train_gpu_hours": float(train_elapsed_sec) * float(max(int(train_accelerator_count), 0)) / 3600.0,
+                    "train_wall_clock_sec": float(train_wall_clock_sec),
+                    "train_elapsed_sec": float(train_wall_clock_sec),
+                    "train_gpu_hours": float(train_wall_clock_sec)
+                    * float(max(int(train_accelerator_count), 0))
+                    / 3600.0,
                     "train_wall_clock_complete": True,
                     "source": path,
                 }
@@ -449,6 +455,9 @@ def extract_wdro_row(
         "wdro_final_dataset_size": (
             int(objective["wdro_dataset_sizes"][-1]) if objective.get("wdro_dataset_sizes") else 0
         ),
+        "baseline_ckpt_enabled": bool(flow.get("baseline_ckpt_enabled", False)),
+        "baseline_ckpt_loaded": bool(flow.get("baseline_ckpt_loaded", False)),
+        "robust_resume_loaded": bool(flow.get("robust_resume_loaded", False)),
         "phase_step_split_mode": str(flow.get("phase_step_split_mode", "")),
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
@@ -587,7 +596,7 @@ def main() -> None:
             flush=True,
         )
 
-    baseline_paths = args.baseline_aggregate or DEFAULT_BASELINE_AGGREGATES
+    baseline_paths = [] if bool(args.skip_baseline_overlay) else (args.baseline_aggregate or DEFAULT_BASELINE_AGGREGATES)
     baseline_rows = load_baseline_rows(
         baseline_paths,
         calibration=weighted_calibration,
@@ -648,6 +657,8 @@ def main() -> None:
             "curve_protocol": str(args.curve_protocol),
             "chosen_max_total_steps": int(max_total_steps),
             "warmup_steps_fixed": int(warmup_steps_fixed),
+            "baseline_checkpoint_reuse_enabled": bool(not args.disable_baseline_ckpt),
+            "baseline_overlay_included": bool(baseline_rows),
             "primary_metric": "train_wall_clock_sec",
             "secondary_metric": "weighted_compute_units",
             "legacy_metric": "batch_equiv_denoiser_evals",

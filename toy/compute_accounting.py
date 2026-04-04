@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Any, Dict, Optional
 
@@ -205,4 +206,116 @@ def cdro_robust_step_weighted_compute_units(
         n_fwd_inputgrad=float(path_steps * max(int(inner_steps), 0)) if attack_enabled else 0.0,
         n_fwd_parambackward=float(path_steps * active_outer_branches),
         calibration=calibration,
+    )
+
+
+def wdro_expected_attack_construction_units_per_step(
+    *,
+    batch_size: int,
+    train_pool_size: Optional[int],
+    refresh_epochs: float,
+    adv_prob: float,
+    attack_steps: int,
+) -> float:
+    """Expected WDRO input-gradient attack construction cost per optimizer step."""
+
+    attack_steps_value = max(int(attack_steps), 0)
+    adv_prob_value = max(0.0, min(float(adv_prob), 1.0))
+    refresh_epochs_value = max(float(refresh_epochs), 1e-8)
+    if attack_steps_value <= 0 or adv_prob_value <= 0.0:
+        return 0.0
+    if train_pool_size is None or int(train_pool_size) <= 0:
+        return adv_prob_value * float(attack_steps_value) / refresh_epochs_value
+
+    batch_size_value = max(int(batch_size), 1)
+    train_pool_size_value = max(int(train_pool_size), 1)
+    num_batches = max(int(math.ceil(float(train_pool_size_value) / float(batch_size_value))), 1)
+    refresh_interval_steps = max(
+        int(math.ceil(refresh_epochs_value * float(train_pool_size_value) / float(batch_size_value))),
+        1,
+    )
+    expected_attack_batches = adv_prob_value * float(num_batches)
+    expected_attack_units_per_refresh = expected_attack_batches * float(attack_steps_value)
+    return float(expected_attack_units_per_refresh / float(refresh_interval_steps))
+
+
+def wdro_robust_step_weighted_compute_units(
+    *,
+    batch_size: int,
+    train_pool_size: Optional[int],
+    refresh_epochs: float,
+    adv_prob: float,
+    attack_steps: int,
+    calibration: Dict[str, Any],
+) -> Optional[float]:
+    """Weighted compute for one WDRO robust optimizer step under expected refresh load."""
+
+    return weighted_compute_units(
+        n_fwd=0.0,
+        n_fwd_inputgrad=wdro_expected_attack_construction_units_per_step(
+            batch_size=int(batch_size),
+            train_pool_size=train_pool_size,
+            refresh_epochs=float(refresh_epochs),
+            adv_prob=float(adv_prob),
+            attack_steps=int(attack_steps),
+        ),
+        n_fwd_parambackward=1.0,
+        calibration=calibration,
+    )
+
+
+def solve_warmup_steps_for_target_compute_fraction(
+    *,
+    total_steps: int,
+    target_warmup_compute_fraction: float,
+    baseline_step_compute_units: float,
+    robust_step_compute_units: float,
+) -> int:
+    """Solve for warmup steps so baseline compute share matches a target fraction."""
+
+    total_steps_value = max(int(total_steps), 0)
+    if total_steps_value <= 0:
+        return 0
+
+    target_fraction = max(0.0, min(float(target_warmup_compute_fraction), 1.0))
+    if target_fraction <= 0.0:
+        return 0
+    if target_fraction >= 1.0:
+        return total_steps_value
+
+    baseline_units = max(float(baseline_step_compute_units), 0.0)
+    robust_units = max(float(robust_step_compute_units), 0.0)
+    if baseline_units <= 0.0:
+        return 0
+    if robust_units <= 0.0:
+        return total_steps_value
+
+    denom = baseline_units * (1.0 - target_fraction) + target_fraction * robust_units
+    if denom <= 0.0:
+        return 0
+    warmup_steps_float = target_fraction * float(total_steps_value) * robust_units / denom
+
+    def _fraction_for_steps(warmup_steps: int) -> float:
+        warmup_steps_value = max(0, min(int(warmup_steps), total_steps_value))
+        warmup_total = float(warmup_steps_value) * baseline_units
+        robust_total = float(total_steps_value - warmup_steps_value) * robust_units
+        total = warmup_total + robust_total
+        if total <= 0.0:
+            return 0.0
+        return float(warmup_total / total)
+
+    candidate_steps = {
+        0,
+        total_steps_value,
+        max(0, min(total_steps_value, int(math.floor(warmup_steps_float)))),
+        max(0, min(total_steps_value, int(math.ceil(warmup_steps_float)))),
+        max(0, min(total_steps_value, int(round(warmup_steps_float)))),
+    }
+    return min(
+        candidate_steps,
+        key=lambda warmup_steps: (
+            abs(_fraction_for_steps(warmup_steps) - target_fraction),
+            abs(float(warmup_steps) - warmup_steps_float),
+            int(warmup_steps),
+        ),
     )
