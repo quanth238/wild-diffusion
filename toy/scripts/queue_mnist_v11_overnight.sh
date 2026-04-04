@@ -12,10 +12,33 @@ fi
 
 WAIT_PID="${1:-}"
 LOGDIR="${REPO_ROOT}/toy_outputs/logs"
-OUTDIR="${REPO_ROOT}/toy_outputs/mnist_5pct_v11_overnight"
-BASELINE_CKPT="${REPO_ROOT}/toy_outputs/mnist_convergence_ckpt_5pct_long/mnist_baseline_curve_ckpt_5pct_long_5pct_s0/checkpoints/baseline_step00500.pt"
+MNIST_TRAIN_PERCENT="${MNIST_TRAIN_PERCENT:-5}"
+SEED="${SEED:-0}"
+BASELINE_STEP="${BASELINE_STEP:-500}"
+
+format_pct_label() {
+  local pct="$1"
+  "${PY}" - "${pct}" <<'PY'
+import sys
+
+pct = float(sys.argv[1])
+text = f"{pct:g}".replace(".", "p")
+print(f"{text}pct")
+PY
+}
+
+PCT_LABEL="$(format_pct_label "${MNIST_TRAIN_PERCENT}")"
+printf -v BASELINE_STEP_PAD "%05d" "${BASELINE_STEP}"
+OUTDIR="${OUTDIR:-${REPO_ROOT}/toy_outputs/mnist_${PCT_LABEL}_v11_overnight}"
+BASELINE_CKPT_DEFAULT="${REPO_ROOT}/toy_outputs/mnist_convergence_ckpt_${PCT_LABEL}_long/mnist_baseline_curve_ckpt_${PCT_LABEL}_long_${PCT_LABEL}_s${SEED}/checkpoints/baseline_step${BASELINE_STEP_PAD}.pt"
+BASELINE_CKPT="${BASELINE_CKPT:-${BASELINE_CKPT_DEFAULT}}"
 
 mkdir -p "${LOGDIR}" "${OUTDIR}"
+
+if [[ ! -f "${BASELINE_CKPT}" ]]; then
+  echo "[error] baseline checkpoint not found: ${BASELINE_CKPT}" >&2
+  exit 1
+fi
 
 if [[ -z "${FID_DETECTOR_PATH:-}" ]]; then
   DEFAULT_FID_DETECTOR="/root/.cache/dnnlib/downloads/18d9c1159d16cd4cc6adf7db0f2dd2a9_https___api.ngc.nvidia.com_v2_models_nvidia_research_stylegan3_versions_1_files_metrics_inception-2015-12-05.pkl"
@@ -77,11 +100,11 @@ run_v11_case() {
   "${PY}" toy/scripts/compare_fid_curve_methods.py \
     --methods 1.1 \
     --steps-list "${steps_list}" \
-    --seed 0 \
+    --seed "${SEED}" \
     --dataset-kind mnist \
     --image-channels 1 \
     --image-size 32 \
-    --mnist-train-percent 5 \
+    --mnist-train-percent "${MNIST_TRAIN_PERCENT}" \
     --mnist-val-percent 100 \
     --batch-size 256 \
     --hidden-dim 256 \
@@ -111,12 +134,12 @@ run_v11_case() {
 
 wait_for_pid "${WAIT_PID}"
 
-run_v11_case "mnist_5pct_v11_default_i1_n24_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 24
-run_v11_case "mnist_5pct_v11_stepclip_i1_n24_rho002_step5e4" 1 0.0005 0.02 step_clip 2.0 24
-run_v11_case "mnist_5pct_v11_inner2_i2_n24_rho002_step5e4_global" 2 0.0005 0.02 global_remaining 2.0 24
-run_v11_case "mnist_5pct_v11_rho005_i1_n24_step5e4_global" 1 0.0005 0.05 global_remaining 2.0 24
-run_v11_case "mnist_5pct_v11_stepsz1e3_i1_n24_rho002_global" 1 0.0010 0.02 global_remaining 2.0 24
-run_v11_case "mnist_5pct_v11_default_i1_n12_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 12
-run_v11_case "mnist_5pct_v11_default_i1_n32_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 32
+run_v11_case "mnist_${PCT_LABEL}_v11_default_i1_n24_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 24
+run_v11_case "mnist_${PCT_LABEL}_v11_stepclip_i1_n24_rho002_step5e4" 1 0.0005 0.02 step_clip 2.0 24
+run_v11_case "mnist_${PCT_LABEL}_v11_inner2_i2_n24_rho002_step5e4_global" 2 0.0005 0.02 global_remaining 2.0 24
+run_v11_case "mnist_${PCT_LABEL}_v11_rho005_i1_n24_step5e4_global" 1 0.0005 0.05 global_remaining 2.0 24
+run_v11_case "mnist_${PCT_LABEL}_v11_stepsz1e3_i1_n24_rho002_global" 1 0.0010 0.02 global_remaining 2.0 24
+run_v11_case "mnist_${PCT_LABEL}_v11_default_i1_n12_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 12
+run_v11_case "mnist_${PCT_LABEL}_v11_default_i1_n32_rho002_step5e4_global" 1 0.0005 0.02 global_remaining 2.0 32
 
 echo "[queue] overnight v1.1 sweep completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"

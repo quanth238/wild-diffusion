@@ -118,6 +118,11 @@ def _fmt(value: float, ndigits: int = 4) -> str:
     return f"{value:.{ndigits}f}"
 
 
+def _count_image_files(root: Path) -> int:
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
+    return sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+
+
 def _write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
     rows_list = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +210,135 @@ def _save_checkpoint(path: Path, *, model: torch.nn.Module, step: int, train_per
     os.replace(tmp_path, path)
 
 
+def _to_cpu_tree(obj: Any) -> Any:
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {key: _to_cpu_tree(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_tree(value) for value in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_cpu_tree(value) for value in obj)
+    return obj
+
+
+def _optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
+def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float, seed: int) -> Dict[str, Any]:
+    return {
+        "signature_version": 1,
+        "dataset_kind": str(cfg.dataset_kind),
+        "dataset_path": str(getattr(cfg, "dataset_path", "")),
+        "dataset_val_path": str(getattr(cfg, "dataset_val_path", "")),
+        "train_percent": float(train_percent),
+        "seed": int(seed),
+        "image_size": int(cfg.image_size),
+        "image_channels": int(cfg.image_channels),
+        "train_subset_size": int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None,
+        "val_subset_size": int(dataset.val_pool.shape[0]),
+        "batch_size": int(cfg.batch_size),
+        "hidden_dim": int(cfg.hidden_dim),
+        "lr_theta": float(cfg.lr_theta),
+        "training_objective": str(cfg.training_objective),
+        "n_steps_path": int(cfg.n_steps_path),
+        "sigma_min": float(cfg.sigma_min),
+        "sigma_max": float(cfg.sigma_max),
+        "use_log_normal_sigma_sampling": bool(cfg.use_log_normal_sigma_sampling),
+        "p_mean": float(cfg.p_mean),
+        "p_std": float(cfg.p_std),
+        "use_ema_eval": bool(cfg.use_ema_eval),
+        "ema_decay": float(cfg.ema_decay),
+    }
+
+
+def _save_run_state(
+    path: Path,
+    *,
+    signature: Dict[str, Any],
+    step: int,
+    planned_max_step: int,
+    checkpoint_steps: List[int],
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    grad_scaler,
+    ema_model: Optional[torch.nn.Module],
+    history: Dict[str, List[float]],
+    sigma_counts: torch.Tensor,
+    rows: List["RunRow"],
+    combo_train_elapsed_sec: float,
+    completed: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": "baseline_curve_run_state_v1",
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "signature": signature,
+        "step": int(step),
+        "planned_max_step": int(planned_max_step),
+        "checkpoint_steps": [int(v) for v in checkpoint_steps],
+        "model_state_dict": _to_cpu_tree(model.state_dict()),
+        "optimizer_state_dict": _to_cpu_tree(optimizer.state_dict()),
+        "grad_scaler_state_dict": None if grad_scaler is None else _to_cpu_tree(grad_scaler.state_dict()),
+        "ema_state_dict": None if ema_model is None else _to_cpu_tree(ema_model.state_dict()),
+        "history": {
+            "loss": [float(v) for v in history.get("loss", [])],
+            "proxy_weighted_denoise_loss": [float(v) for v in history.get("proxy_weighted_denoise_loss", [])],
+        },
+        "sigma_counts": [int(v) for v in sigma_counts.detach().cpu().tolist()],
+        "rows": [row.to_dict() for row in rows],
+        "combo_train_elapsed_sec": float(combo_train_elapsed_sec),
+        "rng_state": _capture_rng_state(),
+        "completed": bool(completed),
+    }
+    tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def _load_run_state(path: Path) -> Dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid run state payload at {path}")
+    if payload.get("format") != "baseline_curve_run_state_v1":
+        raise RuntimeError(f"Unsupported run state format at {path}: {payload.get('format')}")
+    return payload
+
+
+def _write_combo_rows_summary(
+    summary_path: Path,
+    *,
+    combo_name: str,
+    train_percent: float,
+    seed: int,
+    rows: List["RunRow"],
+    run_state_path: Path,
+    completed: bool,
+) -> None:
+    summary_path.write_text(
+        json.dumps(
+            {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "combo_name": combo_name,
+                "train_percent": float(train_percent),
+                "seed": int(seed),
+                "completed": bool(completed),
+                "run_state_path": str(run_state_path),
+                "rows": [row.to_dict() for row in rows],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def _find_detector_path() -> str:
     env_path = os.environ.get("FID_DETECTOR_PATH", "").strip()
     if env_path and os.path.isfile(env_path):
@@ -286,11 +420,31 @@ def _format_amp_dtype(amp_dtype: Optional[torch.dtype]) -> str:
     return str(amp_dtype)
 
 
-def _calculate_fid_from_stats(mu: np.ndarray, sigma: np.ndarray, mu_ref: np.ndarray, sigma_ref: np.ndarray) -> float:
-    m = np.square(mu - mu_ref).sum()
-    s, _ = scipy.linalg.sqrtm(np.dot(sigma, sigma_ref), disp=False)
-    fid = m + np.trace(sigma + sigma_ref - s * 2)
-    return float(np.real(fid))
+def _symmetrize_cov_torch(matrix: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+def _trace_sqrt_product_torch(sigma: torch.Tensor, sigma_ref: torch.Tensor) -> torch.Tensor:
+    sigma = _symmetrize_cov_torch(sigma)
+    sigma_ref = _symmetrize_cov_torch(sigma_ref)
+    evals, evecs = torch.linalg.eigh(sigma)
+    evals = evals.clamp_min(0.0)
+    sqrt_sigma = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.transpose(-1, -2)
+    middle = _symmetrize_cov_torch(sqrt_sigma @ sigma_ref @ sqrt_sigma)
+    middle_evals = torch.linalg.eigvalsh(middle).clamp_min(0.0)
+    return middle_evals.sqrt().sum()
+
+
+def _calculate_fid_from_stats_torch(
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+) -> float:
+    diff = mu - mu_ref
+    trace_sqrt = _trace_sqrt_product_torch(sigma, sigma_ref)
+    fid = diff.dot(diff) + torch.trace(sigma) + torch.trace(sigma_ref) - (2.0 * trace_sqrt)
+    return float(torch.real(fid).item())
 
 
 @torch.no_grad()
@@ -300,16 +454,16 @@ def _compute_fid_for_model(
     sigma_levels: torch.Tensor,
     dataset,
     detector_net,
-    mu_ref: np.ndarray,
-    sigma_ref: np.ndarray,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
     num_images: int,
     gen_batch: int,
     device: torch.device,
     amp_dtype: Optional[torch.dtype],
 ) -> float:
     feature_dim = 2048
-    mu = torch.zeros([feature_dim], dtype=torch.float64)
-    sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64)
+    mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
+    sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
     n_done = 0
 
     denoiser.eval()
@@ -328,7 +482,7 @@ def _compute_fid_for_model(
         images = ((images + 1.0) * 127.5).clamp(0.0, 255.0).to(torch.uint8)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
-        features = detector_net(images.to(device), return_features=True).to(torch.float64).cpu()
+        features = detector_net(images, return_features=True).to(torch.float64)
         mu += features.sum(0)
         sigma += features.T @ features
         n_done += cur
@@ -336,7 +490,7 @@ def _compute_fid_for_model(
     mu /= num_images
     sigma -= mu.ger(mu) * num_images
     sigma /= max(num_images - 1, 1)
-    return _calculate_fid_from_stats(mu.numpy(), sigma.numpy(), mu_ref, sigma_ref)
+    return _calculate_fid_from_stats_torch(mu, sigma, mu_ref, sigma_ref)
 
 
 @dataclass
@@ -506,7 +660,14 @@ def _extract_thresholds(
     return out
 
 
-def _plot_curves(*, rows: List[AggregateRow], thresholds: Dict[str, Dict[str, Any]], out_path: Path, title: str) -> None:
+def _plot_curves(
+    *,
+    rows: List[AggregateRow],
+    thresholds: Dict[str, Dict[str, Any]],
+    out_path: Path,
+    title: str,
+    dataset_label: str,
+) -> None:
     try:
         import matplotlib
 
@@ -530,20 +691,20 @@ def _plot_curves(*, rows: List[AggregateRow], thresholds: Dict[str, Dict[str, An
         x = [row.images_shown_m for row in sub]
         y_fid = [row.fid_median for row in sub]
         y_loss = [row.loss_mean_last_median for row in sub]
-        label = f"MNIST ({train_percent:g}%)"
+        label = f"{dataset_label} ({train_percent:g}%)"
         ax_fid.plot(x, y_fid, color=color, marker=marker, linewidth=2.0, markersize=6.0, label=label)
         ax_loss.plot(x, y_loss, color=color, marker=marker, linewidth=2.0, markersize=6.0, label=label)
         summary = thresholds.get(str(train_percent))
         if summary is not None and summary.get("threshold_images_shown_m") is not None:
             ax_fid.axvline(float(summary["threshold_images_shown_m"]), color=color, linestyle="--", alpha=0.18, linewidth=1.2)
 
-    ax_fid.set_title("MNIST Convergence (FID)")
+    ax_fid.set_title(f"{dataset_label} Convergence (FID)")
     ax_fid.set_xlabel("Number of images shown to model (M)")
     ax_fid.set_ylabel("FID")
     ax_fid.grid(alpha=0.25)
     ax_fid.legend(loc="best", fontsize=9)
 
-    ax_loss.set_title("MNIST Training Loss")
+    ax_loss.set_title(f"{dataset_label} Training Loss")
     ax_loss.set_xlabel("Number of images shown to model (M)")
     ax_loss.set_ylabel("Loss")
     ax_loss.grid(alpha=0.25)
@@ -562,15 +723,12 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.seed = int(seed)
     cfg.device = str(args.device)
     cfg.method_version = "v1.1"
-    cfg.dataset_kind = "mnist"
+    cfg.dataset_kind = str(args.dataset_kind)
     cfg.model_kind = "image_conv"
     cfg.image_size = int(args.image_size)
     cfg.image_channels = int(args.image_channels)
-    cfg.mnist_use_percent_split = True
-    cfg.mnist_train_percent = float(train_percent)
-    cfg.mnist_val_percent = float(args.mnist_val_percent)
     cfg.image_split_seed = int(seed + args.image_split_seed_offset)
-    cfg.steps = int(max(_parse_int_list(args.steps_list)))
+    cfg.steps = int(max(_parse_int_list(args.steps_list, allow_zero=True)))
     cfg.batch_size = int(args.batch_size)
     cfg.hidden_dim = int(args.hidden_dim)
     cfg.training_objective = str(args.training_objective)
@@ -584,6 +742,32 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.limited_data_enabled = True
     cfg.compute_fid = False
     cfg.run_checks = False
+    if cfg.dataset_kind == "mnist":
+        cfg.mnist_use_percent_split = True
+        cfg.mnist_train_percent = float(train_percent)
+        cfg.mnist_val_percent = float(args.mnist_val_percent)
+    elif cfg.dataset_kind == "image_folder":
+        dataset_path = str(getattr(args, "dataset_path", "")).strip()
+        if not dataset_path:
+            raise ValueError("--dataset-path is required when --dataset-kind=image_folder")
+        dataset_val_path = str(getattr(args, "dataset_val_path", "")).strip()
+        if not dataset_val_path:
+            raise ValueError("--dataset-val-path is required when --dataset-kind=image_folder")
+        source_train_size = _count_image_files(Path(dataset_path))
+        if source_train_size <= 0:
+            raise ValueError(f"No images found under --dataset-path={dataset_path}")
+        source_val_size = _count_image_files(Path(dataset_val_path))
+        if source_val_size <= 0:
+            raise ValueError(f"No images found under --dataset-val-path={dataset_val_path}")
+        resolved_train_size = max(1, int(round(float(train_percent) * float(source_train_size) / 100.0)))
+        resolved_train_size = min(resolved_train_size, int(source_train_size))
+        cfg.dataset_path = dataset_path
+        cfg.dataset_val_path = dataset_val_path
+        cfg.image_train_size = int(resolved_train_size)
+        cfg.image_val_size = int(source_val_size)
+        cfg.mnist_use_percent_split = False
+    else:
+        raise ValueError(f"Unsupported --dataset-kind={cfg.dataset_kind}")
     _apply_auto_log_normal_params(cfg)
     return cfg
 
@@ -595,8 +779,8 @@ def _run_combo(
     seed: int,
     checkpoint_steps: List[int],
     detector_net,
-    mu_ref: np.ndarray,
-    sigma_ref: np.ndarray,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
 ) -> List[RunRow]:
     cfg = _build_config(args, train_percent=train_percent, seed=seed)
     device = pick_device(cfg.device)
@@ -613,11 +797,13 @@ def _run_combo(
     combo_dir = Path(args.outdir) / combo_name
     ensure_dir(str(combo_dir))
     summary_path = combo_dir / "combo_rows.json"
+    run_state_path = combo_dir / "run_state.pt"
 
     if args.skip_existing and summary_path.is_file():
         rows_payload = json.loads(summary_path.read_text(encoding="utf-8"))
-        print(f"[skip-existing] {summary_path}", flush=True)
-        return [RunRow(**row) for row in rows_payload["rows"]]
+        if bool(rows_payload.get("completed", True)):
+            print(f"[skip-existing] {summary_path}", flush=True)
+            return [RunRow(**row) for row in rows_payload["rows"]]
 
     print(f"[combo] start pct={train_percent:g} seed={seed} max_step={cfg.steps}", flush=True)
     set_seed(cfg.seed)
@@ -640,10 +826,151 @@ def _run_combo(
 
     rows: List[RunRow] = []
     checkpoint_set = set(int(step) for step in checkpoint_steps)
+    run_state_signature = _build_run_state_signature(cfg=cfg, dataset=dataset, train_percent=train_percent, seed=seed)
+    start_step = 0
+    combo_train_elapsed_offset_sec = 0.0
+    if not bool(getattr(args, "disable_resume", False)) and run_state_path.is_file():
+        payload = _load_run_state(run_state_path)
+        saved_signature = payload.get("signature")
+        if saved_signature != run_state_signature:
+            raise RuntimeError(
+                "Run-state signature mismatch.\n"
+                f"run_state={run_state_path}\n"
+                f"current={json.dumps(run_state_signature, sort_keys=True)}\n"
+                f"saved={json.dumps(saved_signature, sort_keys=True)}"
+            )
+        start_step = int(payload.get("step", 0))
+        if start_step < 0 or start_step > int(cfg.steps):
+            raise RuntimeError(
+                f"Invalid saved step in run state: step={start_step} current_max={int(cfg.steps)} ({run_state_path})"
+            )
+        baseline.load_state_dict(payload["model_state_dict"])
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        _optimizer_state_to_device(optimizer, device)
+        scaler_state = payload.get("grad_scaler_state_dict")
+        if grad_scaler is not None and scaler_state is not None:
+            grad_scaler.load_state_dict(scaler_state)
+        ema_state = payload.get("ema_state_dict")
+        if ema_model is not None and ema_state is not None:
+            ema_model.load_state_dict(ema_state)
+        history = {
+            "loss": [float(v) for v in payload.get("history", {}).get("loss", [])],
+            "proxy_weighted_denoise_loss": [
+                float(v) for v in payload.get("history", {}).get("proxy_weighted_denoise_loss", [])
+            ],
+        }
+        sigma_counts = torch.tensor(
+            payload.get("sigma_counts", []),
+            dtype=torch.long,
+            device=sigma_levels.device,
+        )
+        rows = [RunRow(**row) for row in payload.get("rows", [])]
+        combo_train_elapsed_offset_sec = float(payload.get("combo_train_elapsed_sec", 0.0))
+        _restore_rng_state(payload["rng_state"])
+        print(
+            f"[resume] {run_state_path} step={start_step} rows={len(rows)}"
+            f" completed={bool(payload.get('completed', False))}",
+            flush=True,
+        )
+        if start_step >= int(cfg.steps):
+            _write_combo_rows_summary(
+                summary_path,
+                combo_name=combo_name,
+                train_percent=train_percent,
+                seed=seed,
+                rows=rows,
+                run_state_path=run_state_path,
+                completed=bool(payload.get("completed", False)),
+            )
+            return rows
+
     combo_train_t0 = time.perf_counter()
     eval_seed = int(cfg.seed + args.eval_seed_offset_metrics)
+    state_save_every = max(int(getattr(args, "state_save_every", 0)), 0)
 
-    for step in range(1, cfg.steps + 1):
+    def _emit_checkpoint_row(*, step: int, baseline_loss_final: float, baseline_loss_mean_last: float) -> None:
+        eval_model = ema_model if ema_model is not None else baseline
+        ckpt_path = combo_dir / "checkpoints" / f"baseline_step{step:05d}.pt"
+        history_snapshot = {
+            "loss": [float(v) for v in history["loss"]],
+            "proxy_weighted_denoise_loss": [float(v) for v in history["proxy_weighted_denoise_loss"]],
+            "sigma_counts": [int(v) for v in sigma_counts.detach().cpu().tolist()],
+        }
+        _save_checkpoint(
+            ckpt_path,
+            model=eval_model,
+            step=step,
+            train_percent=train_percent,
+            seed=seed,
+            history=history_snapshot,
+        )
+        train_elapsed = combo_train_elapsed_offset_sec + float(time.perf_counter() - combo_train_t0)
+
+        baseline_was_training = baseline.training
+        baseline.eval()
+        if ema_model is not None:
+            ema_model.eval()
+        t_fid = time.perf_counter()
+        fid_value = _run_with_scoped_seed(
+            eval_seed,
+            lambda: _compute_fid_for_model(
+                denoiser=eval_model,
+                sigma_levels=sigma_levels,
+                dataset=dataset,
+                detector_net=detector_net,
+                mu_ref=mu_ref,
+                sigma_ref=sigma_ref,
+                num_images=int(args.fid_samples),
+                gen_batch=int(args.gen_batch),
+                device=device,
+                amp_dtype=amp_dtype,
+            ),
+        )
+        fid_elapsed = float(time.perf_counter() - t_fid)
+        if baseline_was_training:
+            baseline.train()
+
+        row = RunRow(
+            train_percent=float(train_percent),
+            seed=int(seed),
+            step=int(step),
+            images_shown_m=float(step * cfg.batch_size) / 1_000_000.0,
+            exp_name=combo_name,
+            exp_dir=str(combo_dir),
+            checkpoint_path=str(ckpt_path),
+            train_subset_size=int(dataset.metadata.get("train_subset_size_resolved") or 0),
+            val_subset_size=int(dataset.metadata.get("val_subset_size_resolved") or 0),
+            baseline_fid=float(fid_value),
+            baseline_loss_final=float(baseline_loss_final),
+            baseline_loss_mean_last=float(baseline_loss_mean_last),
+            train_elapsed_sec=train_elapsed,
+            fid_elapsed_sec=fid_elapsed,
+        )
+        rows.append(row)
+        print(
+            "[row]"
+            f" pct={train_percent:g} seed={seed} step={step}"
+            f" mimg={_fmt(row.images_shown_m, 3)}"
+            f" fid={_fmt(row.baseline_fid, 3)}"
+            f" loss={_fmt(row.baseline_loss_final, 5)}"
+            f" train_elapsed={_fmt(row.train_elapsed_sec, 1)}s"
+            f" fid_elapsed={_fmt(row.fid_elapsed_sec, 1)}s",
+            flush=True,
+        )
+        _write_combo_rows_summary(
+            summary_path,
+            combo_name=combo_name,
+            train_percent=train_percent,
+            seed=seed,
+            rows=rows,
+            run_state_path=run_state_path,
+            completed=False,
+        )
+
+    if start_step == 0 and 0 in checkpoint_set and not any(int(row.step) == 0 for row in rows):
+        _emit_checkpoint_row(step=0, baseline_loss_final=float("nan"), baseline_loss_mean_last=float("nan"))
+
+    for step in range(start_step + 1, cfg.steps + 1):
         x0 = sample_train_batch(
             cfg,
             centers=dataset.centers,
@@ -688,90 +1015,47 @@ def _run_combo(
         if step % cfg.log_every == 0:
             print(f"[baseline] pct={train_percent:g} seed={seed} step={step:05d} loss={loss.item():.6f}", flush=True)
 
-        if step not in checkpoint_set:
-            continue
+        if step in checkpoint_set:
+            _emit_checkpoint_row(
+                step=step,
+                baseline_loss_final=float(history["loss"][-1]),
+                baseline_loss_mean_last=float(
+                    sum(history["loss"][-min(200, len(history["loss"])) :]) / min(200, len(history["loss"]))
+                ),
+            )
 
-        eval_model = ema_model if ema_model is not None else baseline
-        ckpt_path = combo_dir / "checkpoints" / f"baseline_step{step:05d}.pt"
-        history_snapshot = {
-            "loss": [float(v) for v in history["loss"]],
-            "proxy_weighted_denoise_loss": [float(v) for v in history["proxy_weighted_denoise_loss"]],
-            "sigma_counts": [int(v) for v in sigma_counts.detach().cpu().tolist()],
-        }
-        _save_checkpoint(
-            ckpt_path,
-            model=eval_model,
-            step=step,
-            train_percent=train_percent,
-            seed=seed,
-            history=history_snapshot,
+        should_save_state = (
+            step == int(cfg.steps)
+            or (state_save_every > 0 and step % state_save_every == 0)
+            or step in checkpoint_set
         )
-        train_elapsed = float(time.perf_counter() - combo_train_t0)
+        if should_save_state:
+            combo_train_elapsed_sec = combo_train_elapsed_offset_sec + float(time.perf_counter() - combo_train_t0)
+            _save_run_state(
+                run_state_path,
+                signature=run_state_signature,
+                step=step,
+                planned_max_step=int(cfg.steps),
+                checkpoint_steps=checkpoint_steps,
+                model=baseline,
+                optimizer=optimizer,
+                grad_scaler=grad_scaler,
+                ema_model=ema_model,
+                history=history,
+                sigma_counts=sigma_counts,
+                rows=rows,
+                combo_train_elapsed_sec=combo_train_elapsed_sec,
+                completed=(step == int(cfg.steps)),
+            )
 
-        baseline_was_training = baseline.training
-        baseline.eval()
-        if ema_model is not None:
-            ema_model.eval()
-        t_fid = time.perf_counter()
-        fid_value = _run_with_scoped_seed(
-            eval_seed,
-            lambda: _compute_fid_for_model(
-                denoiser=eval_model,
-                sigma_levels=sigma_levels,
-                dataset=dataset,
-                detector_net=detector_net,
-                mu_ref=mu_ref,
-                sigma_ref=sigma_ref,
-                num_images=int(args.fid_samples),
-                gen_batch=int(args.gen_batch),
-                device=device,
-                amp_dtype=amp_dtype,
-            ),
-        )
-        fid_elapsed = float(time.perf_counter() - t_fid)
-        if baseline_was_training:
-            baseline.train()
-
-        row = RunRow(
-            train_percent=float(train_percent),
-            seed=int(seed),
-            step=int(step),
-            images_shown_m=float(step * cfg.batch_size) / 1_000_000.0,
-            exp_name=combo_name,
-            exp_dir=str(combo_dir),
-            checkpoint_path=str(ckpt_path),
-            train_subset_size=int(dataset.metadata.get("train_subset_size_resolved") or 0),
-            val_subset_size=int(dataset.metadata.get("val_subset_size_resolved") or 0),
-            baseline_fid=float(fid_value),
-            baseline_loss_final=float(history["loss"][-1]),
-            baseline_loss_mean_last=float(sum(history["loss"][-min(200, len(history["loss"])) :]) / min(200, len(history["loss"]))),
-            train_elapsed_sec=train_elapsed,
-            fid_elapsed_sec=fid_elapsed,
-        )
-        rows.append(row)
-        print(
-            "[row]"
-            f" pct={train_percent:g} seed={seed} step={step}"
-            f" mimg={_fmt(row.images_shown_m, 3)}"
-            f" fid={_fmt(row.baseline_fid, 3)}"
-            f" loss={_fmt(row.baseline_loss_final, 5)}"
-            f" train_elapsed={_fmt(row.train_elapsed_sec, 1)}s"
-            f" fid_elapsed={_fmt(row.fid_elapsed_sec, 1)}s",
-            flush=True,
-        )
-
-    summary_path.write_text(
-        json.dumps(
-            {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "combo_name": combo_name,
-                "train_percent": float(train_percent),
-                "seed": int(seed),
-                "rows": [row.to_dict() for row in rows],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
+    _write_combo_rows_summary(
+        summary_path,
+        combo_name=combo_name,
+        train_percent=train_percent,
+        seed=seed,
+        rows=rows,
+        run_state_path=run_state_path,
+        completed=True,
     )
     return rows
 
@@ -779,7 +1063,7 @@ def _run_combo(
 def build_parser():
     import argparse
 
-    parser = argparse.ArgumentParser(description="Efficient checkpointed MNIST baseline-EDM convergence sweep.")
+    parser = argparse.ArgumentParser(description="Efficient checkpointed baseline-EDM convergence sweep.")
     parser.add_argument("--outdir", type=Path, default=Path("toy_outputs/mnist_convergence_checkpointed"))
     parser.add_argument("--prefix", type=str, default="mnist_baseline_curve_ckpt")
     parser.add_argument("--seeds", type=str, default="0,1,2")
@@ -787,10 +1071,15 @@ def build_parser():
     parser.add_argument("--steps-list", type=str, default="1000,2000,4000,8000,12000,16000,20000")
     parser.add_argument("--mimg-list", type=str, default="")
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--disable-resume", action="store_true")
+    parser.add_argument("--state-save-every", type=int, default=500)
     parser.add_argument("--skip-plot", action="store_true")
     parser.add_argument("--require-cuda", action="store_true")
 
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--dataset-kind", type=str, default="mnist", choices=["mnist", "image_folder"])
+    parser.add_argument("--dataset-path", type=str, default="")
+    parser.add_argument("--dataset-val-path", type=str, default="")
     parser.add_argument("--image-size", type=int, default=32)
     parser.add_argument("--image-channels", type=int, default=1)
     parser.add_argument("--mnist-val-percent", type=float, default=100.0)
@@ -808,6 +1097,7 @@ def build_parser():
     parser.add_argument("--eval-seed-offset-metrics", type=int, default=20000)
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--gen-batch", type=int, default=2048)
+    parser.add_argument("--fid-ref-path", type=Path, default=None)
     parser.add_argument("--fid-ref-split", type=str, default="test", choices=["train", "test"])
     parser.add_argument("--fid-ref-subset-percent", type=float, default=100.0)
     parser.add_argument(
@@ -840,7 +1130,7 @@ def main() -> None:
         )
         args.steps_list = ",".join(str(step) for step in checkpoint_steps)
     else:
-        checkpoint_steps = _parse_int_list(args.steps_list)
+        checkpoint_steps = _parse_int_list(args.steps_list, allow_zero=True)
     repo_root = _repo_root()
     outdir = args.outdir.resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -848,28 +1138,40 @@ def main() -> None:
     if args.require_cuda and not torch.cuda.is_available():
         raise SystemExit("[ERROR] --require-cuda is set but CUDA is unavailable.")
 
-    fid_ref_policy_name = default_mnist_fid_policy_name(
-        split=str(args.fid_ref_split),
-        image_size=int(args.image_size),
-        subset_percent=float(args.fid_ref_subset_percent),
-        subset_sampling=str(args.fid_ref_subset_sampling),
-        subset_seed=int(args.fid_ref_subset_seed),
-        max_images=int(args.fid_ref_max_images),
-    )
-    fid_ref_dir = (outdir / "_fid_refs").resolve()
-    ref_npz = fid_ref_dir / f"{fid_ref_policy_name}.npz"
-    fid_ref_meta = build_mnist_fid_reference(
-        split=str(args.fid_ref_split),
-        image_size=int(args.image_size),
-        subset_percent=float(args.fid_ref_subset_percent),
-        subset_sampling=str(args.fid_ref_subset_sampling),
-        subset_seed=int(args.fid_ref_subset_seed),
-        max_images=int(args.fid_ref_max_images),
-        dest=ref_npz,
-        images_dir=fid_ref_dir / f"{fid_ref_policy_name}_images",
-        policy_name=fid_ref_policy_name,
-        force=bool(args.force_ref_refresh),
-    )
+    if str(args.dataset_kind) == "mnist":
+        fid_ref_policy_name = default_mnist_fid_policy_name(
+            split=str(args.fid_ref_split),
+            image_size=int(args.image_size),
+            subset_percent=float(args.fid_ref_subset_percent),
+            subset_sampling=str(args.fid_ref_subset_sampling),
+            subset_seed=int(args.fid_ref_subset_seed),
+            max_images=int(args.fid_ref_max_images),
+        )
+        fid_ref_dir = (outdir / "_fid_refs").resolve()
+        ref_npz = fid_ref_dir / f"{fid_ref_policy_name}.npz"
+        fid_ref_meta = build_mnist_fid_reference(
+            split=str(args.fid_ref_split),
+            image_size=int(args.image_size),
+            subset_percent=float(args.fid_ref_subset_percent),
+            subset_sampling=str(args.fid_ref_subset_sampling),
+            subset_seed=int(args.fid_ref_subset_seed),
+            max_images=int(args.fid_ref_max_images),
+            dest=ref_npz,
+            images_dir=fid_ref_dir / f"{fid_ref_policy_name}_images",
+            policy_name=fid_ref_policy_name,
+            force=bool(args.force_ref_refresh),
+        )
+    else:
+        ref_npz = Path(args.fid_ref_path).resolve() if args.fid_ref_path else None
+        if ref_npz is None or not ref_npz.is_file():
+            raise SystemExit("[ERROR] --fid-ref-path is required and must exist for --dataset-kind=image_folder.")
+        fid_ref_meta = {
+            "source": "explicit_path",
+            "dataset_kind": "image_folder",
+            "dataset_path": str(Path(args.dataset_path).resolve()) if args.dataset_path else "",
+            "dataset_val_path": str(Path(args.dataset_val_path).resolve()) if args.dataset_val_path else "",
+            "fid_ref_path": str(ref_npz),
+        }
 
     device = pick_device(args.device)
     _configure_runtime(
@@ -891,7 +1193,9 @@ def main() -> None:
     if str(args.mimg_list).strip():
         print(f"[runtime] target_mimg={str(args.mimg_list).strip()} -> checkpoint_steps={checkpoint_steps}", flush=True)
     detector_net = _load_detector(device)
-    mu_ref, sigma_ref = _load_ref_stats(ref_npz)
+    mu_ref_np, sigma_ref_np = _load_ref_stats(ref_npz)
+    mu_ref = torch.as_tensor(mu_ref_np, dtype=torch.float64, device=device)
+    sigma_ref = torch.as_tensor(sigma_ref_np, dtype=torch.float64, device=device)
 
     all_rows: List[RunRow] = []
     for train_percent in train_percents:
@@ -932,7 +1236,8 @@ def main() -> None:
                 rows=aggregates,
                 thresholds=thresholds,
                 out_path=fig_path,
-                title=f"MNIST Baseline EDM Convergence | threshold={args.threshold_pct:.1f}% of best median FID",
+                title=f"{str(args.dataset_kind).replace('_', ' ').title()} Baseline EDM Convergence | threshold={args.threshold_pct:.1f}% of best median FID",
+                dataset_label=str(args.dataset_kind).replace("_", " ").title(),
             )
             plot_written = True
         except RuntimeError as exc:
@@ -942,9 +1247,12 @@ def main() -> None:
     summary = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "protocol": {
-            "name": "mnist_checkpointed_baseline_convergence",
+            "name": f"{str(args.dataset_kind)}_checkpointed_baseline_convergence",
             "family": "from_scratch_curve",
             "description": "Train baseline EDM once per subset+seed and evaluate intermediate checkpoints.",
+            "dataset_kind": str(args.dataset_kind),
+            "dataset_path": str(Path(args.dataset_path).resolve()) if args.dataset_path else None,
+            "dataset_val_path": str(Path(args.dataset_val_path).resolve()) if args.dataset_val_path else None,
             "seeds": seeds,
             "train_percents": train_percents,
             "steps_list": checkpoint_steps,

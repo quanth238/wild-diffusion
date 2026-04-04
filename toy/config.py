@@ -53,6 +53,7 @@ class ToyConfig:
     baseline_ckpt_strict_meta: bool = True
     robust_resume_ckpt_path: str = ""
     robust_save_ckpt_path: str = ""
+    baseline_steps_override: int = 0
 
     # Model.
     hidden_dim: int = 128
@@ -102,6 +103,13 @@ class ToyConfig:
     # - kappa_clip: fallback to v2-style local radius kappa_k * Delta_sigma_k.
     # - none: no projection.
     v11_projection_mode: str = "global_remaining"
+    # CDRO Route-A options (beta-space greedy attack with exact local caps).
+    cdro_step_size: float = 0.02
+    cdro_total_budget_rho: float = 0.02
+    cdro_time_horizon: float = 1.0
+    # Reference warmup fraction used to match WDRO-style warmup compute when
+    # translating baseline EDM warmup steps for CDRO.
+    cdro_warmup_fraction: float = 0.2
     # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
     v12_step_size: float = 0.02
     v12_lambda_init: float = 0.1
@@ -146,6 +154,15 @@ class ToyConfig:
     wild_sample_min: float = -1.0
     wild_sample_max: float = 1.0
     wild_delta_ratio_denom: float = 1.0
+    wdro_warmup_fraction: float = 0.2
+    wdro_refresh_epochs: float = 100.0
+    wdro_adv_prob: float = 0.3
+    wdro_attack_steps: int = 2
+    wdro_attack_step_size: float = 1e-3
+    wdro_gamma: float = 1.0
+    wdro_clamp_samples: bool = True
+    wdro_sample_min: float = -1.0
+    wdro_sample_max: float = 1.0
 
     # Baseline acceptance gate (must pass before attack training).
     baseline_gate_enabled: bool = True

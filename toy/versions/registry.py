@@ -1,7 +1,20 @@
 from types import ModuleType
 
 
-SUPPORTED_METHOD_VERSIONS = ("v1", "1.1", "v1.1", "1.2", "v1.2", "v2", "2.1", "v2.1", "wild")
+SUPPORTED_METHOD_VERSIONS = (
+    "clean",
+    "v1",
+    "1.1",
+    "v1.1",
+    "1.2",
+    "v1.2",
+    "v2",
+    "2.1",
+    "v2.1",
+    "wild",
+    "wdro",
+    "cdro",
+)
 
 
 def resolve_method_module(method_version: str) -> ModuleType:
@@ -9,6 +22,10 @@ def resolve_method_module(method_version: str) -> ModuleType:
 
     if method_version == "v2":
         from .v2 import method as module
+
+        return module
+    if method_version == "clean":
+        from .clean import method as module
 
         return module
     if method_version in ("2.1", "v2.1"):
@@ -29,6 +46,14 @@ def resolve_method_module(method_version: str) -> ModuleType:
         return module
     if method_version == "wild":
         from .wild import method as module
+
+        return module
+    if method_version == "wdro":
+        from .wdro import method as module
+
+        return module
+    if method_version == "cdro":
+        from .cdro import method as module
 
         return module
     raise ValueError(

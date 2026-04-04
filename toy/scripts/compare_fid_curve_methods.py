@@ -195,15 +195,11 @@ def _method_cli_args(method: str, args: argparse.Namespace) -> List[str]:
     if method == "clean":
         return [
             "--method-version",
-            "v2",
-            "--inner-steps",
-            "0",
+            "clean",
             "--outer-attack-weight",
             "0.0",
             "--outer-clean-weight",
             "1.0",
-            "--control-radius-kappa",
-            "0.0",
         ]
     if method == "wild":
         extra = [

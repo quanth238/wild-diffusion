@@ -142,3 +142,4 @@ datasets/mnist-32x32-train20pct-seed0/
 datasets/raw/
 toy-runs/
 training-runs/
+toy_data/

@@ -27,14 +27,26 @@ def evaluate_mode_coverage(samples: np.ndarray, centers: np.ndarray) -> Dict[str
     }
 
 
-def evaluate_nearest_reference_distance(samples: np.ndarray, reference: np.ndarray) -> Dict[str, float]:
-    """Distance from each sample to its nearest reference sample (memorization proxy)."""
+def evaluate_nearest_reference_distance(
+    samples: np.ndarray, reference: np.ndarray, *, chunk_size: int = 256
+) -> Dict[str, float]:
+    """Distance from each sample to its nearest reference sample (memorization proxy).
 
-    samples = samples.reshape(samples.shape[0], -1)
-    reference = reference.reshape(reference.shape[0], -1)
-    diff = samples[:, None, :] - reference[None, :, :]
-    dists = np.linalg.norm(diff, axis=-1)
-    min_dist = np.min(dists, axis=1)
+    Uses chunked matrix multiplication to avoid materializing a full
+    `(num_samples, num_reference, dim)` difference tensor.
+    """
+
+    samples = samples.reshape(samples.shape[0], -1).astype(np.float32, copy=False)
+    reference = reference.reshape(reference.shape[0], -1).astype(np.float32, copy=False)
+    ref_sq = np.sum(reference * reference, axis=1, keepdims=True).T
+    mins = []
+    for start in range(0, samples.shape[0], int(chunk_size)):
+        chunk = samples[start : start + int(chunk_size)]
+        chunk_sq = np.sum(chunk * chunk, axis=1, keepdims=True)
+        dist_sq = chunk_sq + ref_sq - 2.0 * (chunk @ reference.T)
+        np.maximum(dist_sq, 0.0, out=dist_sq)
+        mins.append(np.sqrt(np.min(dist_sq, axis=1)))
+    min_dist = np.concatenate(mins, axis=0)
     return {
         "avg_min_dist": float(min_dist.mean()),
         "p50_min_dist": float(np.quantile(min_dist, 0.50)),
@@ -256,11 +268,12 @@ def compute_control_constraint_stats_by_step(
     sigma_levels: torch.Tensor,
     control_radius_kappa: float,
     kappa_by_step: torch.Tensor = None,
+    radius_override: torch.Tensor = None,
     states_ref: torch.Tensor = None,
     states_ctrl: torch.Tensor = None,
     saturation_threshold: float = 0.98,
 ) -> Dict[str, list]:
-    """Summarize per-step control norms against hard radius kappa_k * Delta_sigma_k."""
+    """Summarize per-step control norms against declared per-step radius."""
 
     # delta_path: [B, N, D], step k corresponds to transition k->k+1.
     n_steps = int(sigma_levels.numel() - 1)
@@ -270,13 +283,24 @@ def compute_control_constraint_stats_by_step(
     sigma_k = sigma_levels[:-1]
     sigma_next = sigma_levels[1:]
     delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))  # [N]
-    if kappa_by_step is not None:
-        if kappa_by_step.numel() != n_steps:
-            raise ValueError(f"kappa_by_step must have {n_steps} elements, got {kappa_by_step.numel()}")
-        kappa_eff = kappa_by_step.to(device=delta_sigma.device, dtype=delta_sigma.dtype).reshape(n_steps)
+    if radius_override is not None:
+        if radius_override.numel() != n_steps:
+            raise ValueError(f"radius_override must have {n_steps} elements, got {radius_override.numel()}")
+        radius = radius_override.to(device=delta_sigma.device, dtype=delta_sigma.dtype).reshape(n_steps)
+        kappa_eff = radius / delta_sigma.clamp_min(1e-8)
     else:
-        kappa_eff = torch.full((n_steps,), float(control_radius_kappa), device=delta_sigma.device, dtype=delta_sigma.dtype)
-    radius = kappa_eff * delta_sigma  # [N]
+        if kappa_by_step is not None:
+            if kappa_by_step.numel() != n_steps:
+                raise ValueError(f"kappa_by_step must have {n_steps} elements, got {kappa_by_step.numel()}")
+            kappa_eff = kappa_by_step.to(device=delta_sigma.device, dtype=delta_sigma.dtype).reshape(n_steps)
+        else:
+            kappa_eff = torch.full(
+                (n_steps,),
+                float(control_radius_kappa),
+                device=delta_sigma.device,
+                dtype=delta_sigma.dtype,
+            )
+        radius = kappa_eff * delta_sigma  # [N]
 
     delta_l2 = delta_path.reshape(delta_path.shape[0], delta_path.shape[1], -1).pow(2).sum(dim=2).sqrt()
     ratio = delta_l2 / radius.view(1, n_steps).clamp_min(1e-8)

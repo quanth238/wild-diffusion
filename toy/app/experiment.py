@@ -1,9 +1,11 @@
 import json
+import math
 import os
 import random
 import hashlib
 import uuid
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -123,6 +125,11 @@ def _method_rollout_kwargs(cfg, method) -> Dict:
             "total_budget": float(cfg.v11_total_budget_rho),
             "projection_mode": str(cfg.v11_projection_mode).lower(),
         }
+    if method_name == "cdro":
+        return {
+            "total_budget": float(cfg.cdro_total_budget_rho),
+            "time_horizon": float(cfg.cdro_time_horizon),
+        }
     return {}
 
 
@@ -206,6 +213,121 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
         "p_std": float(cfg.p_std),
         "use_ema_eval": bool(cfg.use_ema_eval),
         "ema_decay": float(cfg.ema_decay),
+    }
+
+
+def _estimate_wdro_robust_step_batch_equiv(cfg, train_pool_size: Optional[int]) -> float:
+    """Estimate WDRO robust-step compute in batch-equivalent denoiser evals.
+
+    Uses the expected refresh/attack workload from the current config. When `train_pool_size`
+    is unavailable, fall back to the large-dataset approximation
+    `1 + adv_prob * attack_steps / refresh_epochs`.
+    """
+
+    attack_steps = max(int(getattr(cfg, "wdro_attack_steps", 0)), 0)
+    adv_prob = max(0.0, min(float(getattr(cfg, "wdro_adv_prob", 0.0)), 1.0))
+    refresh_epochs = max(float(getattr(cfg, "wdro_refresh_epochs", 1.0)), 1e-8)
+    if train_pool_size is None or int(train_pool_size) <= 0:
+        return 1.0 + adv_prob * float(attack_steps) / refresh_epochs
+
+    batch_size = max(int(getattr(cfg, "batch_size", 1)), 1)
+    num_batches = max(int(math.ceil(float(train_pool_size) / float(batch_size))), 1)
+    refresh_interval_steps = max(
+        int(math.ceil(refresh_epochs * float(train_pool_size) / float(batch_size))),
+        1,
+    )
+    expected_attack_batches = adv_prob * float(num_batches)
+    expected_attack_units_per_refresh = expected_attack_batches * float(attack_steps)
+    return 1.0 + expected_attack_units_per_refresh / float(refresh_interval_steps)
+
+
+def _estimate_wdro_warmup_compute_fraction(
+    cfg,
+    train_pool_size: Optional[int],
+    warmup_fraction: Optional[float] = None,
+) -> tuple[float, float]:
+    """Return WDRO-style warmup compute share and estimated robust-step compute."""
+
+    total_steps = int(cfg.steps)
+    if total_steps <= 0:
+        return 0.0, 1.0
+    if warmup_fraction is None:
+        warmup_fraction = float(getattr(cfg, "wdro_warmup_fraction", 0.0))
+    if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+        baseline_steps = int(cfg.baseline_steps_override)
+    else:
+        baseline_steps = int(total_steps * float(warmup_fraction))
+    baseline_steps = max(0, min(baseline_steps, total_steps))
+    robust_steps = max(total_steps - baseline_steps, 0)
+    wdro_robust_step_units = _estimate_wdro_robust_step_batch_equiv(cfg, train_pool_size)
+    warmup_units = float(baseline_steps)
+    robust_units = float(robust_steps) * float(wdro_robust_step_units)
+    total_units = warmup_units + robust_units
+    if total_units <= 0.0:
+        return 0.0, float(wdro_robust_step_units)
+    return warmup_units / total_units, float(wdro_robust_step_units)
+
+
+def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
+    """Estimate CDRO robust-step compute in batch-equivalent denoiser evals."""
+
+    path_steps = max(int(getattr(cfg, "n_steps_path", 0)), 0)
+    if path_steps <= 0:
+        return 0.0
+    attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(getattr(cfg, "inner_steps", 0)) > 0
+    clean_enabled = float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
+    if not attack_enabled:
+        return float(path_steps if clean_enabled else 0.0)
+    attack_construction_units = float(path_steps * max(int(getattr(cfg, "inner_steps", 0)), 0))
+    attack_eval_units = float(path_steps * 2)
+    clean_eval_units = float(path_steps if clean_enabled else 0)
+    return attack_construction_units + attack_eval_units + clean_eval_units
+
+
+def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] = None) -> Dict[str, Any]:
+    """Resolve baseline/robust step budgets while preserving legacy behavior."""
+
+    total_steps = int(cfg.steps)
+    baseline_steps = int(cfg.baseline_steps_override) if int(getattr(cfg, "baseline_steps_override", 0)) > 0 else total_steps
+    robust_steps = total_steps
+    split_mode = "legacy_equal_steps"
+
+    wdro_warmup_compute_fraction = None
+    wdro_robust_step_batch_equiv = None
+    cdro_robust_step_batch_equiv = None
+
+    if str(method_name).lower() == "wdro":
+        split_mode = "wdro_paper_style"
+        if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+            baseline_steps = int(cfg.baseline_steps_override)
+        else:
+            baseline_steps = int(total_steps * float(cfg.wdro_warmup_fraction))
+        baseline_steps = max(0, min(baseline_steps, total_steps))
+        robust_steps = max(total_steps - baseline_steps, 0)
+    elif str(method_name).lower() == "cdro":
+        split_mode = "cdro_fixed_fraction_warmup"
+        if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+            baseline_steps = int(cfg.baseline_steps_override)
+        else:
+            cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
+            baseline_steps = int(total_steps * float(getattr(cfg, "cdro_warmup_fraction", 0.0)))
+        baseline_steps = max(0, min(baseline_steps, total_steps))
+        robust_steps = max(total_steps - baseline_steps, 0)
+
+    return {
+        "total_steps": int(total_steps),
+        "baseline_steps": int(baseline_steps),
+        "robust_steps": int(robust_steps),
+        "split_mode": split_mode,
+        "wdro_warmup_compute_fraction": (
+            None if wdro_warmup_compute_fraction is None else float(wdro_warmup_compute_fraction)
+        ),
+        "wdro_robust_step_batch_equiv": (
+            None if wdro_robust_step_batch_equiv is None else float(wdro_robust_step_batch_equiv)
+        ),
+        "cdro_robust_step_batch_equiv": (
+            None if cdro_robust_step_batch_equiv is None else float(cdro_robust_step_batch_equiv)
+        ),
     }
 
 
@@ -351,6 +473,10 @@ def _save_robust_resume_checkpoint(
     """Persist robust training state so later runs can continue from this point."""
 
     ensure_dir(os.path.dirname(ckpt_path) or ".")
+    resume_robust_state_dict = trainer_state.get("resume_robust_state_dict")
+    if not isinstance(resume_robust_state_dict, dict):
+        resume_robust_state_dict = robust.state_dict()
+
     payload = {
         "format": "toy_robust_resume_ckpt_v1",
         "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -358,17 +484,25 @@ def _save_robust_resume_checkpoint(
         "method_version": str(cfg.method_version),
         "completed_steps": int(trainer_state.get("completed_steps", cfg.steps)),
         "history_robust": history_robust,
-        "robust_state_dict": robust.state_dict(),
+        "robust_state_dict": resume_robust_state_dict,
         "control_state_dict": control.state_dict(),
         "trainer_state": trainer_state,
         "rng_state": rng_state,
         "cumulative_runtime": {
+            "baseline_phase": float(runtime_sec.get("baseline_phase", 0.0)),
+            "baseline_train": float(runtime_sec.get("baseline_train", 0.0)),
             "total": float(runtime_sec.get("total", 0.0)),
             "total_without_fid": float(runtime_sec.get("total_without_fid", 0.0)),
             "robust_phase": float(runtime_sec.get("robust_phase", 0.0)),
             "fid_baseline": float(runtime_sec.get("fid_baseline", 0.0)),
             "fid_robust": float(runtime_sec.get("fid_robust", 0.0)),
             "run_started_utc": str(runtime_sec.get("run_started_utc", run_wall_start)),
+        },
+        "cumulative_accounting": {
+            "baseline_images_seen_total": int(runtime_sec.get("baseline_images_seen_total", 0)),
+            "baseline_batch_equiv_denoiser_evals_total": float(
+                runtime_sec.get("baseline_batch_equiv_denoiser_evals_total", 0.0)
+            ),
         },
     }
     tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
@@ -479,6 +613,12 @@ def _run_robust_phase(
                 p.zero_()
         return False, empty_robust_history(), robust, None
 
+    if int(cfg.steps) <= 0:
+        with torch.no_grad():
+            for p in control.parameters():
+                p.zero_()
+        return False, empty_robust_history(), robust, None
+
     trainer_kwargs: Dict[str, Any] = {}
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
     if robust_resume_payload is not None:
@@ -489,18 +629,21 @@ def _run_robust_phase(
         history_init = robust_resume_payload.get("history_robust", empty_robust_history())
         if completed_steps >= int(cfg.steps):
             return True, history_init, robust, trainer_state_in
-        if method_name in ("v2", "wild", "v1.1", "1.1"):
+        if method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
             trainer_kwargs["start_step"] = int(completed_steps)
             trainer_kwargs["history_state"] = history_init
             trainer_kwargs["return_state"] = bool(return_trainer_state)
             if method_name == "v2":
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["optimizer_phi_state"] = trainer_state_in.get("optimizer_phi_state")
+            elif method_name in ("clean", "wdro"):
+                trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
+                trainer_kwargs["ema_state_dict"] = trainer_state_in.get("ema_state_dict")
             else:
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
         else:
             raise RuntimeError(f"Robust resume is not implemented for method_version='{cfg.method_version}'.")
-    elif return_trainer_state and method_name in ("v2", "wild", "v1.1", "1.1"):
+    elif return_trainer_state and method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
         trainer_kwargs["return_state"] = True
 
     attack_training_executed = True
@@ -566,6 +709,7 @@ def run_experiment(cfg) -> dict:
         else ("robust_forced_no_gate" if not cfg.baseline_gate_enabled else "robust_with_gate")
     )
     method = resolve_method_module(cfg.method_version)
+    method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
     rollout_kwargs = _method_rollout_kwargs(cfg, method)
     if not getattr(method, "IMPLEMENTED", True):
         raise NotImplementedError(
@@ -601,6 +745,12 @@ def run_experiment(cfg) -> dict:
     dataset = build_dataset_bundle(cfg, device)
     diagnostics = build_diagnostics_bundle(cfg, dataset)
     centers = dataset.centers
+    train_pool_size = int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None
+    phase_steps = _resolve_phase_steps(cfg, method_name, train_pool_size=train_pool_size)
+    baseline_steps_for_phase = int(phase_steps["baseline_steps"])
+    robust_steps_for_phase = int(phase_steps["robust_steps"])
+    cfg_baseline = replace(cfg, steps=baseline_steps_for_phase)
+    cfg_robust = replace(cfg, steps=robust_steps_for_phase)
     if cfg.sigma_data <= 0:
         cfg.sigma_data = dataset.estimate_sigma_data()
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
@@ -616,6 +766,15 @@ def run_experiment(cfg) -> dict:
         high_multiplier=cfg.kappa_high_multiplier,
         preserve_l2_budget=cfg.kappa_preserve_l2_budget,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
+    constraint_radius_builder = getattr(method, "build_constraint_radii", None)
+    constraint_radius_by_step = None
+    constraint_radius_source = "kappa_delta_sigma"
+    if callable(constraint_radius_builder):
+        constraint_radius_by_step = constraint_radius_builder(cfg=cfg, sigma_levels=sigma_levels).to(
+            device=sigma_levels.device,
+            dtype=sigma_levels.dtype,
+        )
+        constraint_radius_source = "method_override"
 
     model_bundle = build_model_bundle(cfg, dataset, sigma_data=cfg.sigma_data, device=device)
     baseline = model_bundle.baseline
@@ -642,7 +801,7 @@ def run_experiment(cfg) -> dict:
             flush=True,
         )
 
-    baseline_signature = _build_baseline_signature(cfg, dataset, model_bundle, sigma_levels)
+    baseline_signature = _build_baseline_signature(cfg_baseline, dataset, model_bundle, sigma_levels)
     baseline_signature_hash = hashlib.sha1(
         json.dumps(baseline_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -657,6 +816,7 @@ def run_experiment(cfg) -> dict:
     robust_resume_loaded = False
     robust_resume_completed_steps = 0
     robust_resume_runtime = {}
+    robust_resume_accounting = {}
     robust_resume_path = str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
     robust_save_path = str(getattr(cfg, "robust_save_ckpt_path", "")).strip()
     t_baseline_phase = time.perf_counter()
@@ -678,27 +838,31 @@ def run_experiment(cfg) -> dict:
             print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
     if not baseline_ckpt_loaded:
         t_phase = time.perf_counter()
-        history_baseline, baseline_eval = train_baseline(
-            baseline,
-            centers,
-            sigma_levels,
-            cfg,
-            train_pool=dataset.train_pool,
-            sample_train_batch_fn=dataset.sample_train_batch,
-            sample_population_batch_fn=dataset.sample_population_batch,
-        )
-        runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
-        if baseline_ckpt_enabled:
-            t_phase = time.perf_counter()
-            _save_baseline_checkpoint(
-                ckpt_path=baseline_ckpt_path,
-                baseline_eval=baseline_eval,
-                baseline_history=history_baseline,
-                signature=baseline_signature,
+        if baseline_steps_for_phase > 0:
+            history_baseline, baseline_eval = train_baseline(
+                baseline,
+                centers,
+                sigma_levels,
+                cfg_baseline,
+                train_pool=dataset.train_pool,
+                sample_train_batch_fn=dataset.sample_train_batch,
+                sample_population_batch_fn=dataset.sample_population_batch,
             )
-            runtime_sec["baseline_ckpt_save"] += float(time.perf_counter() - t_phase)
-            baseline_ckpt_saved = True
-            print(f"[baseline] saved checkpoint: {baseline_ckpt_path}", flush=True)
+            runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
+            if baseline_ckpt_enabled:
+                t_phase = time.perf_counter()
+                _save_baseline_checkpoint(
+                    ckpt_path=baseline_ckpt_path,
+                    baseline_eval=baseline_eval,
+                    baseline_history=history_baseline,
+                    signature=baseline_signature,
+                )
+                runtime_sec["baseline_ckpt_save"] += float(time.perf_counter() - t_phase)
+                baseline_ckpt_saved = True
+                print(f"[baseline] saved checkpoint: {baseline_ckpt_path}", flush=True)
+        else:
+            history_baseline = _empty_baseline_history()
+            baseline_eval = baseline
     runtime_sec["baseline_phase"] = float(time.perf_counter() - t_baseline_phase)
     baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
@@ -718,6 +882,7 @@ def run_experiment(cfg) -> dict:
             )
         )
         robust_resume_runtime = robust_resume_payload.get("cumulative_runtime", {})
+        robust_resume_accounting = robust_resume_payload.get("cumulative_accounting", {})
         if robust_resume_payload.get("rng_state") is not None:
             _restore_rng_state(robust_resume_payload["rng_state"])
         baseline_gate = {
@@ -754,7 +919,7 @@ def run_experiment(cfg) -> dict:
 
     t_phase = time.perf_counter()
     attack_training_executed, history_robust, robust, robust_trainer_state = _run_robust_phase(
-        cfg=cfg,
+        cfg=cfg_robust,
         robust=robust,
         control=control,
         centers=centers,
@@ -973,6 +1138,7 @@ def run_experiment(cfg) -> dict:
         sigma_levels=sigma_levels,
         control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        radius_override=constraint_radius_by_step,
         states_ref=train_roll.states_ref,
         states_ctrl=train_roll.states_ctrl,
         saturation_threshold=cfg.constraint_saturation_threshold,
@@ -982,6 +1148,7 @@ def run_experiment(cfg) -> dict:
         sigma_levels=sigma_levels,
         control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        radius_override=constraint_radius_by_step,
         states_ref=val_roll.states_ref,
         states_ctrl=val_roll.states_ctrl,
         saturation_threshold=cfg.constraint_saturation_threshold,
@@ -998,9 +1165,30 @@ def run_experiment(cfg) -> dict:
             abs(diag_gap_ratio_summary["mean_last"]) <= float(cfg.collapse_gap_ratio_tol)
             and diag_delta_ratio_summary["mean_last"] <= float(cfg.collapse_delta_ratio_tol)
         )
-    baseline_images_seen_total = int(0 if baseline_ckpt_loaded else int(cfg.steps) * int(cfg.batch_size))
-    robust_images_seen_total = int(int(cfg.steps) * int(cfg.batch_size) if attack_training_executed else 0)
+    preserve_baseline_from_resume = bool(
+        robust_resume_loaded
+        and isinstance(robust_resume_accounting, dict)
+        and (
+            "baseline_images_seen_total" in robust_resume_accounting
+            or "baseline_batch_equiv_denoiser_evals_total" in robust_resume_accounting
+        )
+    )
+    baseline_phase_images_seen_total = int(baseline_steps_for_phase * int(cfg.batch_size))
+    baseline_phase_batch_equiv_total = float(baseline_steps_for_phase)
+    baseline_images_seen_total = int(
+        robust_resume_accounting.get("baseline_images_seen_total", 0)
+        if preserve_baseline_from_resume
+        else baseline_phase_images_seen_total
+    )
+    robust_images_seen_total = int(robust_steps_for_phase * int(cfg.batch_size) if attack_training_executed else 0)
     effective_train_images_seen_total = int(baseline_images_seen_total + robust_images_seen_total)
+    baseline_batch_equiv_total = float(
+        robust_resume_accounting.get("baseline_batch_equiv_denoiser_evals_total", 0.0)
+        if preserve_baseline_from_resume
+        else baseline_phase_batch_equiv_total
+    )
+    robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
+    effective_train_batch_equiv_total = float(baseline_batch_equiv_total + robust_batch_equiv_total)
 
     metrics = {
         "flow_debug": {
@@ -1017,8 +1205,19 @@ def run_experiment(cfg) -> dict:
             "v1_lambda_lr": float(cfg.v1_lambda_lr),
             "v1_lambda_max": float(cfg.v1_lambda_max),
             "lambda_energy_fixed": float(cfg.lambda_energy),
+            "cdro_step_size": float(getattr(cfg, "cdro_step_size", 0.0)),
+            "cdro_total_budget_rho": float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
+            "cdro_time_horizon": float(getattr(cfg, "cdro_time_horizon", 0.0)),
+            "cdro_warmup_fraction": float(getattr(cfg, "cdro_warmup_fraction", 0.0)),
             "method_version": cfg.method_version,
             "method_description": getattr(method, "DESCRIPTION", ""),
+            "phase_step_split_mode": str(phase_steps["split_mode"]),
+            "total_steps_requested": int(phase_steps["total_steps"]),
+            "baseline_phase_steps": int(baseline_steps_for_phase),
+            "robust_phase_steps": int(robust_steps_for_phase),
+            "wdro_reference_warmup_compute_fraction": phase_steps.get("wdro_warmup_compute_fraction"),
+            "wdro_reference_robust_step_batch_equiv": phase_steps.get("wdro_robust_step_batch_equiv"),
+            "cdro_estimated_robust_step_batch_equiv": phase_steps.get("cdro_robust_step_batch_equiv"),
             "model_backend": model_bundle.name,
             "diagnostics_backend": diagnostics.name,
             "training_objective": str(getattr(cfg, "training_objective", "edm")),
@@ -1032,6 +1231,15 @@ def run_experiment(cfg) -> dict:
             "wild_clamp_samples": bool(getattr(cfg, "wild_clamp_samples", False)),
             "wild_sample_min": float(getattr(cfg, "wild_sample_min", 0.0)),
             "wild_sample_max": float(getattr(cfg, "wild_sample_max", 0.0)),
+            "wdro_warmup_fraction": float(getattr(cfg, "wdro_warmup_fraction", 0.0)),
+            "wdro_refresh_epochs": float(getattr(cfg, "wdro_refresh_epochs", 0.0)),
+            "wdro_adv_prob": float(getattr(cfg, "wdro_adv_prob", 0.0)),
+            "wdro_attack_steps": int(getattr(cfg, "wdro_attack_steps", 0)),
+            "wdro_attack_step_size": float(getattr(cfg, "wdro_attack_step_size", 0.0)),
+            "wdro_gamma": float(getattr(cfg, "wdro_gamma", 0.0)),
+            "wdro_clamp_samples": bool(getattr(cfg, "wdro_clamp_samples", False)),
+            "wdro_sample_min": float(getattr(cfg, "wdro_sample_min", 0.0)),
+            "wdro_sample_max": float(getattr(cfg, "wdro_sample_max", 0.0)),
             "eval_seed_gate": int(gate_eval_seed),
             "eval_seed_metrics": int(metrics_eval_seed),
             "eval_shared_terminal_noise": bool(cfg.eval_use_shared_terminal_noise),
@@ -1051,6 +1259,9 @@ def run_experiment(cfg) -> dict:
                     "a forward over B*T path states counts as T units."
                 ),
                 "diagnostics_included": False,
+                "baseline_batch_equiv_denoiser_evals_total": baseline_batch_equiv_total,
+                "robust_batch_equiv_denoiser_evals_total": robust_batch_equiv_total,
+                "effective_train_batch_equiv_denoiser_evals_total": effective_train_batch_equiv_total,
             },
             "budget_accounting": {
                 "image_unit_name": "images_seen",
@@ -1126,6 +1337,9 @@ def run_experiment(cfg) -> dict:
             "v11_path_transport_cost": summarize_series(
                 history_robust.get("energy", []) if str(cfg.method_version).lower() in ("v1.1", "1.1") else []
             ),
+            "cdro_control_cost": summarize_series(
+                history_robust.get("energy", []) if str(cfg.method_version).lower() == "cdro" else []
+            ),
             "wild_sample_transport_cost": summarize_series(history_robust.get("wild_inner_transport_cost", [])),
             "robust_lambda_value": summarize_series(history_robust.get("lambda_value", [])),
             "robust_lambda_value_next": summarize_series(history_robust.get("lambda_value_next", [])),
@@ -1154,6 +1368,12 @@ def run_experiment(cfg) -> dict:
             "wild_inner_sigma_mean": summarize_series(history_robust.get("wild_inner_sigma_mean", [])),
             "wild_refresh_steps": [int(v) for v in history_robust.get("wild_refresh_step", [])],
             "wild_cache_sizes": [int(v) for v in history_robust.get("wild_cache_size", [])],
+            "wdro_refresh_steps": [int(v) for v in history_robust.get("wdro_refresh_step", [])],
+            "wdro_dataset_sizes": [int(v) for v in history_robust.get("wdro_dataset_size", [])],
+            "wdro_adv_examples": [int(v) for v in history_robust.get("wdro_adv_examples", [])],
+            "wdro_attack_batches": [int(v) for v in history_robust.get("wdro_attack_batches", [])],
+            "wdro_attack_loss": summarize_series(history_robust.get("wdro_attack_loss", [])),
+            "wdro_transport_cost": summarize_series(history_robust.get("wdro_transport_cost", [])),
             "robust_batch_equiv_denoiser_evals_step": robust_batch_equiv_step_summary,
             "robust_batch_equiv_denoiser_evals_attack_construction": summarize_series(
                 history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
@@ -1180,6 +1400,7 @@ def run_experiment(cfg) -> dict:
         "denoise_debug_heldout_pool": denoise_error_curves_val,
         "generalization_debug": denoise_gap,
         "constraint_debug": {
+            "constraint_radius_source": constraint_radius_source,
             "use_time_dependent_kappa": bool(cfg.use_time_dependent_kappa),
             "kappa_base": float(cfg.control_radius_kappa),
             "kappa_low_multiplier": float(cfg.kappa_low_multiplier),
@@ -1187,6 +1408,11 @@ def run_experiment(cfg) -> dict:
             "kappa_high_multiplier": float(cfg.kappa_high_multiplier),
             "kappa_preserve_l2_budget": bool(cfg.kappa_preserve_l2_budget),
             "kappa_by_step": [float(v.item()) for v in kappa_by_step.detach().cpu()],
+            "constraint_radius_by_step": (
+                None
+                if constraint_radius_by_step is None
+                else [float(v.item()) for v in constraint_radius_by_step.detach().cpu()]
+            ),
             "train_rollout_by_step": constraint_stats_train,
             "heldout_rollout_by_step": constraint_stats_val,
             "attack_gap_windows_train": attack_gap_windows_train,
@@ -1276,7 +1502,7 @@ def run_experiment(cfg) -> dict:
         "robust_generated_metrics"
     ]
 
-    if getattr(cfg, "compute_fid", False) and dataset.name in ("mnist", "image_basic"):
+    if getattr(cfg, "compute_fid", False) and dataset.name in ("mnist", "image_basic", "image_folder"):
         print("  [info] Computing FID via subprocess...", flush=True)
         import re
         import shutil
@@ -1469,20 +1695,21 @@ def run_experiment(cfg) -> dict:
     runtime_sec["total_without_fid"] = max(runtime_sec["total_without_fid"], 0.0)
     runtime_sec["effective_train_total"] = float(runtime_sec["baseline_train"] + runtime_sec["robust_phase"])
     runtime_sec["baseline_steps_per_sec"] = (
-        float(cfg.steps) / float(runtime_sec["baseline_train"])
-        if runtime_sec["baseline_train"] > 0
+        float(baseline_steps_for_phase) / float(runtime_sec["baseline_train"])
+        if runtime_sec["baseline_train"] > 0 and baseline_steps_for_phase > 0
         else None
     )
     runtime_sec["robust_steps_per_sec"] = (
-        float(cfg.steps) / float(runtime_sec["robust_phase"])
-        if attack_training_executed and runtime_sec["robust_phase"] > 0
+        float(robust_steps_for_phase) / float(runtime_sec["robust_phase"])
+        if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_steps_for_phase > 0
         else None
     )
     runtime_sec["baseline_images_seen_total"] = baseline_images_seen_total
     runtime_sec["robust_images_seen_total"] = robust_images_seen_total
     runtime_sec["effective_train_images_seen_total"] = effective_train_images_seen_total
-    robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
+    runtime_sec["baseline_batch_equiv_denoiser_evals_total"] = baseline_batch_equiv_total
     runtime_sec["robust_batch_equiv_denoiser_evals_total"] = robust_batch_equiv_total
+    runtime_sec["effective_train_batch_equiv_denoiser_evals_total"] = effective_train_batch_equiv_total
     runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (
         robust_batch_equiv_total / float(runtime_sec["robust_phase"])
         if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_batch_equiv_total > 0
@@ -1492,6 +1719,13 @@ def run_experiment(cfg) -> dict:
     runtime_sec["run_finished_utc"] = run_wall_end
     runtime_sec["attack_training_executed"] = bool(attack_training_executed)
     if robust_resume_loaded:
+        if method_name == "wdro":
+            runtime_sec["baseline_phase"] = float(runtime_sec["baseline_phase"]) + float(
+                robust_resume_runtime.get("baseline_phase", 0.0)
+            )
+            runtime_sec["baseline_train"] = float(runtime_sec["baseline_train"]) + float(
+                robust_resume_runtime.get("baseline_train", 0.0)
+            )
         runtime_sec["total"] = float(runtime_sec["total"]) + float(robust_resume_runtime.get("total", 0.0))
         runtime_sec["total_without_fid"] = float(runtime_sec["total_without_fid"]) + float(
             robust_resume_runtime.get("total_without_fid", 0.0)
@@ -1507,9 +1741,14 @@ def run_experiment(cfg) -> dict:
         )
         runtime_sec["robust_train_only"] = float(runtime_sec["robust_phase"])
         runtime_sec["effective_train_total"] = float(runtime_sec["baseline_train"] + runtime_sec["robust_phase"])
+        runtime_sec["baseline_steps_per_sec"] = (
+            float(baseline_steps_for_phase) / float(runtime_sec["baseline_train"])
+            if runtime_sec["baseline_train"] > 0 and baseline_steps_for_phase > 0
+            else None
+        )
         runtime_sec["robust_steps_per_sec"] = (
-            float(cfg.steps) / float(runtime_sec["robust_phase"])
-            if attack_training_executed and runtime_sec["robust_phase"] > 0
+            float(robust_steps_for_phase) / float(runtime_sec["robust_phase"])
+            if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_steps_for_phase > 0
             else None
         )
         runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (
@@ -1531,7 +1770,7 @@ def run_experiment(cfg) -> dict:
     if robust_save_path and robust_trainer_state is not None:
         _save_robust_resume_checkpoint(
             ckpt_path=robust_save_path,
-            cfg=cfg,
+            cfg=cfg_robust,
             method=method,
             robust=robust,
             control=control,

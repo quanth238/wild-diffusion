@@ -19,8 +19,8 @@ def _validate_config(cfg: ToyConfig) -> None:
             "('auto', 'off', 'bfloat16', 'float16'), got "
             f"{cfg.amp_dtype}"
         )
-    if cfg.steps <= 0:
-        raise ValueError(f"--steps must be > 0, got {cfg.steps}")
+    if cfg.steps < 0:
+        raise ValueError(f"--steps must be >= 0, got {cfg.steps}")
     if cfg.batch_size <= 0:
         raise ValueError(f"--batch-size must be > 0, got {cfg.batch_size}")
     if cfg.baseline_ckpt_path and not isinstance(cfg.baseline_ckpt_path, str):
@@ -29,6 +29,8 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError("--robust-resume-ckpt-path must be a string path.")
     if cfg.robust_save_ckpt_path and not isinstance(cfg.robust_save_ckpt_path, str):
         raise ValueError("--robust-save-ckpt-path must be a string path.")
+    if cfg.baseline_steps_override < 0:
+        raise ValueError(f"--baseline-steps-override must be >= 0, got {cfg.baseline_steps_override}")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
     if cfg.training_objective not in ("edm", "score"):
@@ -71,6 +73,14 @@ def _validate_config(cfg: ToyConfig) -> None:
             "('global_remaining', 'step_clip', 'step_exact', 'kappa_clip', 'none'), got "
             f"{cfg.v11_projection_mode}"
         )
+    if cfg.cdro_step_size <= 0:
+        raise ValueError(f"--cdro-step-size must be > 0, got {cfg.cdro_step_size}")
+    if cfg.cdro_total_budget_rho < 0:
+        raise ValueError(f"--cdro-total-budget-rho must be >= 0, got {cfg.cdro_total_budget_rho}")
+    if cfg.cdro_time_horizon <= 0:
+        raise ValueError(f"--cdro-time-horizon must be > 0, got {cfg.cdro_time_horizon}")
+    if not (0.0 <= cfg.cdro_warmup_fraction <= 1.0):
+        raise ValueError(f"--cdro-warmup-fraction must be in [0, 1], got {cfg.cdro_warmup_fraction}")
     if cfg.v12_step_size <= 0:
         raise ValueError(f"--v12-step-size must be > 0, got {cfg.v12_step_size}")
     if cfg.v12_lambda_init < 0:
@@ -124,6 +134,22 @@ def _validate_config(cfg: ToyConfig) -> None:
     if cfg.wild_sample_max <= cfg.wild_sample_min:
         raise ValueError(
             f"--wild-sample-max must be > --wild-sample-min, got {cfg.wild_sample_max} <= {cfg.wild_sample_min}"
+        )
+    if not (0.0 <= cfg.wdro_warmup_fraction < 1.0):
+        raise ValueError(f"--wdro-warmup-fraction must be in [0, 1), got {cfg.wdro_warmup_fraction}")
+    if cfg.wdro_refresh_epochs <= 0:
+        raise ValueError(f"--wdro-refresh-epochs must be > 0, got {cfg.wdro_refresh_epochs}")
+    if cfg.wdro_adv_prob < 0 or cfg.wdro_adv_prob > 1:
+        raise ValueError(f"--wdro-adv-prob must be in [0, 1], got {cfg.wdro_adv_prob}")
+    if cfg.wdro_attack_steps < 0:
+        raise ValueError(f"--wdro-attack-steps must be >= 0, got {cfg.wdro_attack_steps}")
+    if cfg.wdro_attack_step_size <= 0:
+        raise ValueError(f"--wdro-attack-step-size must be > 0, got {cfg.wdro_attack_step_size}")
+    if cfg.wdro_gamma < 0:
+        raise ValueError(f"--wdro-gamma must be >= 0, got {cfg.wdro_gamma}")
+    if cfg.wdro_sample_max <= cfg.wdro_sample_min:
+        raise ValueError(
+            f"--wdro-sample-max must be > --wdro-sample-min, got {cfg.wdro_sample_max} <= {cfg.wdro_sample_min}"
         )
     if cfg.dataset_kind == "image_folder":
         if not cfg.dataset_path:
@@ -235,6 +261,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-baseline-ckpt-strict-meta", action="store_true")
     parser.add_argument("--robust-resume-ckpt-path", type=str, default=ToyConfig.robust_resume_ckpt_path)
     parser.add_argument("--robust-save-ckpt-path", type=str, default=ToyConfig.robust_save_ckpt_path)
+    parser.add_argument("--baseline-steps-override", type=int, default=ToyConfig.baseline_steps_override)
 
     parser.add_argument("--hidden-dim", type=int, default=ToyConfig.hidden_dim)
     parser.add_argument("--lr-theta", type=float, default=ToyConfig.lr_theta)
@@ -283,6 +310,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ToyConfig.v11_projection_mode,
         choices=["global_remaining", "step_clip", "step_exact", "kappa_clip", "none"],
     )
+    parser.add_argument("--cdro-step-size", type=float, default=ToyConfig.cdro_step_size)
+    parser.add_argument("--cdro-total-budget-rho", type=float, default=ToyConfig.cdro_total_budget_rho)
+    parser.add_argument("--cdro-time-horizon", type=float, default=ToyConfig.cdro_time_horizon)
+    parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
     parser.add_argument("--v12-step-size", type=float, default=ToyConfig.v12_step_size)
     parser.add_argument("--v12-lambda-init", type=float, default=ToyConfig.v12_lambda_init)
     parser.add_argument("--v12-lambda-lr", type=float, default=ToyConfig.v12_lambda_lr)
@@ -320,6 +351,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wild-sample-min", type=float, default=ToyConfig.wild_sample_min)
     parser.add_argument("--wild-sample-max", type=float, default=ToyConfig.wild_sample_max)
     parser.add_argument("--wild-delta-ratio-denom", type=float, default=ToyConfig.wild_delta_ratio_denom)
+    parser.add_argument("--wdro-warmup-fraction", type=float, default=ToyConfig.wdro_warmup_fraction)
+    parser.add_argument("--wdro-refresh-epochs", type=float, default=ToyConfig.wdro_refresh_epochs)
+    parser.add_argument("--wdro-adv-prob", type=float, default=ToyConfig.wdro_adv_prob)
+    parser.add_argument("--wdro-attack-steps", type=int, default=ToyConfig.wdro_attack_steps)
+    parser.add_argument("--wdro-attack-step-size", type=float, default=ToyConfig.wdro_attack_step_size)
+    parser.add_argument("--wdro-gamma", type=float, default=ToyConfig.wdro_gamma)
+    parser.add_argument("--wdro-clamp-samples", action="store_true", default=ToyConfig.wdro_clamp_samples)
+    parser.add_argument("--wdro-sample-min", type=float, default=ToyConfig.wdro_sample_min)
+    parser.add_argument("--wdro-sample-max", type=float, default=ToyConfig.wdro_sample_max)
     parser.add_argument("--collapse-diag-every", type=int, default=ToyConfig.collapse_diag_every)
     parser.add_argument("--collapse-gap-ratio-tol", type=float, default=ToyConfig.collapse_gap_ratio_tol)
     parser.add_argument("--collapse-delta-ratio-tol", type=float, default=ToyConfig.collapse_delta_ratio_tol)

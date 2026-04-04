@@ -84,10 +84,15 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg, sample_batch_fn=No
     flat_dev = (roll.states_ctrl - roll.states_ref).reshape(roll.states_ref.shape[0], roll.states_ref.shape[1], -1)
     mean_dev = flat_dev.pow(2).sum(dim=2).sqrt().mean().item()
     delta_l2 = roll.delta_path.reshape(roll.delta_path.shape[0], roll.delta_path.shape[1], -1).pow(2).sum(dim=2).sqrt()
-    sigma_k = sigma_levels[:-1]
-    sigma_next = sigma_levels[1:]
-    delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
-    radius = (kappa_by_step * delta_sigma).view(1, -1).to(device=delta_l2.device, dtype=delta_l2.dtype)
+    radius_builder = getattr(method, "build_constraint_radii", None)
+    if callable(radius_builder):
+        radius = radius_builder(cfg=cfg, sigma_levels=sigma_levels).view(1, -1)
+        radius = radius.to(device=delta_l2.device, dtype=delta_l2.dtype)
+    else:
+        sigma_k = sigma_levels[:-1]
+        sigma_next = sigma_levels[1:]
+        delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+        radius = (kappa_by_step * delta_sigma).view(1, -1).to(device=delta_l2.device, dtype=delta_l2.dtype)
     delta_ratio = delta_l2 / radius.clamp_min(1e-8)
     return {
         "rollout_mean_path_deviation": float(mean_dev),

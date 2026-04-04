@@ -87,11 +87,31 @@ def calculate_inception_stats(
 
 #----------------------------------------------------------------------------
 
+def _symmetrize_cov_torch(matrix):
+    return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+def _trace_sqrt_product_torch(sigma, sigma_ref):
+    sigma = _symmetrize_cov_torch(sigma)
+    sigma_ref = _symmetrize_cov_torch(sigma_ref)
+    evals, evecs = torch.linalg.eigh(sigma)
+    evals = evals.clamp_min(0)
+    sqrt_sigma = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.transpose(-1, -2)
+    middle = _symmetrize_cov_torch(sqrt_sigma @ sigma_ref @ sqrt_sigma)
+    middle_evals = torch.linalg.eigvalsh(middle).clamp_min(0)
+    return middle_evals.sqrt().sum()
+
+
 def calculate_fid_from_inception_stats(mu, sigma, mu_ref, sigma_ref):
-    m = np.square(mu - mu_ref).sum()
-    s, _ = scipy.linalg.sqrtm(np.dot(sigma, sigma_ref), disp=False)
-    fid = m + np.trace(sigma + sigma_ref - s * 2)
-    return float(np.real(fid))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    mu = torch.as_tensor(mu, dtype=torch.float64, device=device)
+    sigma = torch.as_tensor(sigma, dtype=torch.float64, device=device)
+    mu_ref = torch.as_tensor(mu_ref, dtype=torch.float64, device=device)
+    sigma_ref = torch.as_tensor(sigma_ref, dtype=torch.float64, device=device)
+    diff = mu - mu_ref
+    trace_sqrt = _trace_sqrt_product_torch(sigma, sigma_ref)
+    fid = diff.dot(diff) + torch.trace(sigma) + torch.trace(sigma_ref) - (2.0 * trace_sqrt)
+    return float(torch.real(fid).item())
 
 #----------------------------------------------------------------------------
 

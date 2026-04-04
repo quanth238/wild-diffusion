@@ -320,7 +320,26 @@ def _sample_pool_to_device(pool: torch.Tensor, batch_size: int, device: torch.de
     """Randomly sample a CPU pool and move the batch to target device."""
 
     idx = torch.randint(0, pool.shape[0], (batch_size,), device=pool.device)
-    return pool[idx].to(device=device)
+    batch = pool[idx]
+    non_blocking = bool(device.type == "cuda" and batch.device.type == "cpu" and batch.is_pinned())
+    return batch.to(device=device, non_blocking=non_blocking)
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _resolve_image_pool_storage(
+    *,
+    pool_cpu: torch.Tensor,
+    device: torch.device,
+    gpu_cache_budget_bytes: int,
+) -> torch.Tensor:
+    if device.type != "cuda":
+        return pool_cpu
+    if _tensor_nbytes(pool_cpu) <= int(gpu_cache_budget_bytes):
+        return pool_cpu.to(device=device, non_blocking=True)
+    return pool_cpu.pin_memory()
 
 
 def _evaluate_image_samples(samples_np) -> Dict[str, float]:
@@ -394,18 +413,35 @@ def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
         val_labels_cpu = labels_cpu[val_idx].clone()
         population_pool_cpu = full_train_pool_cpu
 
+    gpu_cache_budget_mb = int(os.environ.get("TOY_IMAGE_FOLDER_GPU_CACHE_MAX_MB", "512"))
+    gpu_cache_budget_bytes = int(max(gpu_cache_budget_mb, 0)) * 1024 * 1024
+    train_pool_limited_sample = _resolve_image_pool_storage(
+        pool_cpu=train_pool_limited_cpu,
+        device=device,
+        gpu_cache_budget_bytes=gpu_cache_budget_bytes,
+    )
+    val_pool_sample = _resolve_image_pool_storage(
+        pool_cpu=val_pool_cpu,
+        device=device,
+        gpu_cache_budget_bytes=gpu_cache_budget_bytes,
+    )
+    population_pool_sample = _resolve_image_pool_storage(
+        pool_cpu=population_pool_cpu,
+        device=device,
+        gpu_cache_budget_bytes=gpu_cache_budget_bytes,
+    )
     data_shape = tuple(int(v) for v in population_pool_cpu.shape[1:])
 
     def sample_train(batch_size: int) -> torch.Tensor:
         if cfg.limited_data_enabled:
-            return _sample_pool_to_device(train_pool_limited_cpu, batch_size, device)
-        return _sample_pool_to_device(population_pool_cpu, batch_size, device)
+            return _sample_pool_to_device(train_pool_limited_sample, batch_size, device)
+        return _sample_pool_to_device(population_pool_sample, batch_size, device)
 
     def sample_val(batch_size: int) -> torch.Tensor:
-        return _sample_pool_to_device(val_pool_cpu, batch_size, device)
+        return _sample_pool_to_device(val_pool_sample, batch_size, device)
 
     def sample_population(batch_size: int) -> torch.Tensor:
-        return _sample_pool_to_device(population_pool_cpu, batch_size, device)
+        return _sample_pool_to_device(population_pool_sample, batch_size, device)
 
     def sample_terminal(batch_size: int, sigma: Union[float, torch.Tensor]) -> torch.Tensor:
         sigma_value = float(sigma.item()) if torch.is_tensor(sigma) else float(sigma)
@@ -434,9 +470,19 @@ def _build_image_folder_bundle(cfg, device: torch.device) -> DatasetBundle:
         metadata={
             "num_classes": int(num_classes),
             "class_names": classes,
+            "train_subset_size_resolved": int(train_pool_limited_cpu.shape[0]),
+            "val_subset_size_resolved": int(val_pool_cpu.shape[0]),
+            "train_subset_fraction_resolved": float(train_pool_limited_cpu.shape[0]) / float(images_cpu.shape[0]),
             "val_pool_labels": val_labels_cpu,
             "population_size": int(population_pool_cpu.shape[0]),
-            "enable_nearest_reference_distance": False,
+            "enable_nearest_reference_distance": True,
+            "sample_storage": {
+                "device": str(device),
+                "gpu_cache_budget_mb": int(gpu_cache_budget_mb),
+                "train_pool_device": str(train_pool_limited_sample.device),
+                "val_pool_device": str(val_pool_sample.device),
+                "population_pool_device": str(population_pool_sample.device),
+            },
             "train_root": train_root_resolved,
             "val_root": val_root_resolved,
             "train_val_disjoint_guarantee": bool(not cfg.dataset_val_path),
