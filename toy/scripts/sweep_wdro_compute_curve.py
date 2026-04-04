@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from toy.compute_accounting import load_weighted_compute_calibration, weighted_compute_units
+
+
 DEFAULT_TRAIN_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "train")
 DEFAULT_VAL_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "test")
 DEFAULT_FID_REF = os.path.join(
@@ -86,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-total-steps", type=int, default=0)
     parser.add_argument("--baseline-aggregate", action="append", default=[])
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--weighted-compute-calibration-path", type=str, default="")
+    parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
+    parser.add_argument("--weighted-parambackward-beta", type=float, default=0.0)
+    parser.add_argument("--train-accelerator-count", type=int, default=1)
     return parser.parse_args()
 
 
@@ -159,6 +169,14 @@ def maybe_set_fid_detector_env(env: Dict[str, str]) -> Dict[str, str]:
     if "FID_DETECTOR_PATH" not in env and os.path.isfile(DEFAULT_FID_DETECTOR):
         env["FID_DETECTOR_PATH"] = DEFAULT_FID_DETECTOR
     return env
+
+
+def resolve_weighted_calibration(args: argparse.Namespace) -> Dict:
+    return load_weighted_compute_calibration(
+        calibration_path=str(args.weighted_compute_calibration_path).strip(),
+        inputgrad_alpha=float(args.weighted_inputgrad_alpha),
+        parambackward_beta=float(args.weighted_parambackward_beta),
+    )
 
 
 def run_point(
@@ -251,6 +269,22 @@ def run_point(
         ])
     if use_resume and os.path.exists(resume_path):
         cmd.extend(["--robust-resume-ckpt-path", resume_path])
+    if str(args.weighted_compute_calibration_path).strip():
+        cmd.extend(
+            [
+                "--weighted-compute-calibration-path",
+                str(args.weighted_compute_calibration_path).strip(),
+            ]
+        )
+    if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
+        cmd.extend(
+            [
+                "--weighted-inputgrad-alpha",
+                str(args.weighted_inputgrad_alpha),
+                "--weighted-parambackward-beta",
+                str(args.weighted_parambackward_beta),
+            ]
+        )
     env = maybe_set_fid_detector_env(os.environ)
     with open(log_path, "w", encoding="utf-8") as handle:
         subprocess.run(cmd, cwd=ROOT_DIR, env=env, check=True, stdout=handle, stderr=subprocess.STDOUT)
@@ -262,7 +296,12 @@ def load_json(path: str) -> Dict:
         return json.load(handle)
 
 
-def load_baseline_rows(paths: List[str]) -> List[Dict]:
+def load_baseline_rows(
+    paths: List[str],
+    *,
+    calibration: Dict,
+    train_accelerator_count: int,
+) -> List[Dict]:
     by_step: Dict[int, Dict] = {}
     for path in paths:
         if not path or not os.path.isfile(path):
@@ -270,19 +309,45 @@ def load_baseline_rows(paths: List[str]) -> List[Dict]:
         with open(path, "r", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 step = int(float(row["step"]))
+                train_elapsed_sec = float(row["train_elapsed_median_sec"])
                 by_step[step] = {
                     "method": "baseline_edm",
                     "step": step,
                     "compute_budget_be": float(step),
+                    "baseline_compute_be": float(step),
+                    "robust_compute_be": 0.0,
+                    "weighted_compute_units": weighted_compute_units(
+                        n_fwd=0.0,
+                        n_fwd_inputgrad=0.0,
+                        n_fwd_parambackward=float(step),
+                        calibration=calibration,
+                    ),
+                    "baseline_weighted_compute_units": weighted_compute_units(
+                        n_fwd=0.0,
+                        n_fwd_inputgrad=0.0,
+                        n_fwd_parambackward=float(step),
+                        calibration=calibration,
+                    ),
+                    "robust_weighted_compute_units": 0.0
+                    if calibration.get("available", False)
+                    else None,
                     "images_shown_m": float(row["images_shown_m"]),
                     "fid": float(row["fid_median"]),
-                    "train_elapsed_sec": float(row["train_elapsed_median_sec"]),
+                    "train_wall_clock_sec": float(train_elapsed_sec),
+                    "train_elapsed_sec": float(train_elapsed_sec),
+                    "train_gpu_hours": float(train_elapsed_sec) * float(max(int(train_accelerator_count), 0)) / 3600.0,
+                    "train_wall_clock_complete": True,
                     "source": path,
                 }
     return [by_step[step] for step in sorted(by_step.keys())]
 
 
-def extract_wdro_row(metrics_path: str) -> Dict:
+def extract_wdro_row(
+    metrics_path: str,
+    *,
+    calibration: Dict,
+    train_accelerator_count: int,
+) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
     flow = metrics["flow_debug"]
@@ -304,6 +369,33 @@ def extract_wdro_row(metrics_path: str) -> Dict:
     else:
         total_compute_be_effective = float(total_compute_be_effective)
         baseline_compute_be_effective = float(max(total_compute_be_effective - robust_compute_be_raw, 0.0))
+    baseline_weighted_compute = compute_accounting.get("baseline_weighted_compute_units")
+    robust_weighted_compute = compute_accounting.get("robust_weighted_compute_units")
+    total_weighted_compute = compute_accounting.get("weighted_compute_units", runtime.get("weighted_compute_units"))
+    if total_weighted_compute is None and calibration.get("available", False):
+        baseline_weighted_compute = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=float(baseline_phase_steps),
+            calibration=calibration,
+        )
+        attack_inputgrad_units = max(float(robust_compute_be_raw) - float(robust_phase_steps), 0.0)
+        robust_weighted_compute = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(attack_inputgrad_units),
+            n_fwd_parambackward=float(robust_phase_steps),
+            calibration=calibration,
+        )
+        if baseline_weighted_compute is not None and robust_weighted_compute is not None:
+            total_weighted_compute = float(baseline_weighted_compute + robust_weighted_compute)
+    train_wall_clock_sec = compute_accounting.get("train_wall_clock_sec", runtime.get("train_wall_clock_sec"))
+    if train_wall_clock_sec is None:
+        train_wall_clock_sec = runtime.get("effective_train_total")
+    train_gpu_hours = compute_accounting.get("train_gpu_hours", runtime.get("train_gpu_hours"))
+    if train_gpu_hours is None and train_wall_clock_sec is not None:
+        train_gpu_hours = float(train_wall_clock_sec) * float(max(int(train_accelerator_count), 0)) / 3600.0
+    baseline_train_wall_clock_sec = runtime.get("baseline_train_wall_clock_sec_effective")
+    robust_train_wall_clock_sec = runtime.get("robust_phase")
     effective_images_seen_total = budget_accounting.get("effective_train_images_seen_total")
     if effective_images_seen_total is None:
         total_images_shown_m_effective = float(total_steps_requested * batch_size) / 1_000_000.0
@@ -326,6 +418,11 @@ def extract_wdro_row(metrics_path: str) -> Dict:
         "baseline_compute_be": float(baseline_compute_be_effective),
         "baseline_compute_be_raw": float(baseline_compute_be_raw),
         "robust_compute_be": float(robust_compute_be_raw),
+        "weighted_compute_units": None if total_weighted_compute is None else float(total_weighted_compute),
+        "baseline_weighted_compute_units": (
+            None if baseline_weighted_compute is None else float(baseline_weighted_compute)
+        ),
+        "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
         "images_shown_m_raw": float(
             budget_accounting.get("effective_train_images_seen_total", total_steps_requested * batch_size)
@@ -334,14 +431,27 @@ def extract_wdro_row(metrics_path: str) -> Dict:
         "baseline_fid_same_run": (
             float(sample_quality["baseline_fid"]) if sample_quality.get("baseline_fid") is not None else float("nan")
         ),
+        "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
+        "train_gpu_hours": None if train_gpu_hours is None else float(train_gpu_hours),
         "train_elapsed_sec": float(runtime["effective_train_total"]),
         "runtime_total_sec": float(runtime["total"]),
+        "baseline_train_wall_clock_sec_effective": (
+            None if baseline_train_wall_clock_sec is None else float(baseline_train_wall_clock_sec)
+        ),
+        "robust_train_wall_clock_sec_effective": (
+            None if robust_train_wall_clock_sec is None else float(robust_train_wall_clock_sec)
+        ),
+        "baseline_train_wall_clock_source": runtime.get("baseline_train_wall_clock_sec_effective_source"),
         "warmup_steps_fixed": int(flow["baseline_phase_steps"]),
         "robust_steps_target": int(flow["robust_phase_steps"]),
         "warmup_only": bool(warmup_only),
         "wdro_refreshes": len(objective.get("wdro_refresh_steps", [])),
         "wdro_final_dataset_size": (
             int(objective["wdro_dataset_sizes"][-1]) if objective.get("wdro_dataset_sizes") else 0
+        ),
+        "phase_step_split_mode": str(flow.get("phase_step_split_mode", "")),
+        "train_wall_clock_complete": bool(
+            compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
         "metrics_path": metrics_path,
     }
@@ -365,30 +475,44 @@ def make_plot(
     path: str,
     baseline_rows: List[Dict],
     wdro_rows: List[Dict],
-    target_be: float,
+    *,
     train_percent_label: str,
+    x_key: str,
+    x_label: str,
+    title_suffix: str,
+    target_x: float | None = None,
+    target_label: str | None = None,
 ) -> None:
     plt.figure(figsize=(8, 5))
-    if baseline_rows:
+    baseline_pairs = [(row[x_key], row["fid"]) for row in baseline_rows if row.get(x_key) is not None]
+    wdro_pairs = [(row[x_key], row["fid"]) for row in wdro_rows if row.get(x_key) is not None]
+    if baseline_pairs:
         plt.plot(
-            [row["compute_budget_be"] for row in baseline_rows],
-            [row["fid"] for row in baseline_rows],
+            [value for value, _ in baseline_pairs],
+            [fid for _, fid in baseline_pairs],
             marker="o",
             linewidth=2.0,
             label="Baseline EDM",
         )
-    if wdro_rows:
+    if wdro_pairs:
         plt.plot(
-            [row["compute_budget_be"] for row in wdro_rows],
-            [row["fid"] for row in wdro_rows],
+            [value for value, _ in wdro_pairs],
+            [fid for _, fid in wdro_pairs],
             marker="o",
             linewidth=2.0,
             label="WDRO",
         )
-    plt.axvline(float(target_be), color="gray", linestyle="--", linewidth=1.5, label="20 MIMG baseline compute")
-    plt.xlabel("Compute Budget (batch-equivalent denoiser evals)")
+    if target_x is not None:
+        plt.axvline(
+            float(target_x),
+            color="gray",
+            linestyle="--",
+            linewidth=1.5,
+            label=(target_label or "Target"),
+        )
+    plt.xlabel(x_label)
     plt.ylabel("FID")
-    plt.title(f"Simpsons-MNIST RGB {train_percent_label}: FID vs Compute Budget")
+    plt.title(f"Simpsons-MNIST RGB {train_percent_label}: FID vs {title_suffix}")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -401,6 +525,7 @@ def main() -> None:
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
     ensure_dir(logs_dir)
+    weighted_calibration = resolve_weighted_calibration(args)
 
     target_be = int(round(float(args.target_baseline_mimg) * 1_000_000.0 / float(args.batch_size)))
     max_total_steps = choose_total_steps_for_target_be(args)
@@ -414,6 +539,14 @@ def main() -> None:
         f"{args.target_baseline_mimg} target_compute_be={target_be} "
         f"chosen_max_total_steps={max_total_steps} warmup_steps_fixed={warmup_steps_fixed} "
         f"curve_protocol={args.curve_protocol}",
+        flush=True,
+    )
+    print(
+        "[wdro-curve] weighted_compute "
+        f"available={weighted_calibration['available']} "
+        f"source={weighted_calibration['source']} "
+        f"alpha={weighted_calibration['inputgrad_alpha']} "
+        f"beta={weighted_calibration['parambackward_beta']}",
         flush=True,
     )
     print(f"[wdro-curve] checkpoints={steps_list}", flush=True)
@@ -441,46 +574,97 @@ def main() -> None:
                 log_path=log_path,
                 use_resume=use_resume_chain,
             )
-        row = extract_wdro_row(metrics_path)
+        row = extract_wdro_row(
+            metrics_path,
+            calibration=weighted_calibration,
+            train_accelerator_count=int(args.train_accelerator_count),
+        )
         wdro_rows.append(row)
         print(
-            f"[wdro-curve] step={row['step']} compute_be={row['compute_budget_be']:.1f} "
+            f"[wdro-curve] step={row['step']} train_wall_clock_sec={row['train_wall_clock_sec']} "
+            f"weighted_compute_units={row['weighted_compute_units']} "
             f"fid={row['fid']:.4f} images_m={row['images_shown_m']:.4f}",
             flush=True,
         )
 
     baseline_paths = args.baseline_aggregate or DEFAULT_BASELINE_AGGREGATES
-    baseline_rows = load_baseline_rows(baseline_paths)
+    baseline_rows = load_baseline_rows(
+        baseline_paths,
+        calibration=weighted_calibration,
+        train_accelerator_count=int(args.train_accelerator_count),
+    )
     combined_rows = baseline_rows + wdro_rows
-    combined_rows.sort(key=lambda row: (row["method"], float(row["compute_budget_be"])))
+    combined_rows.sort(
+        key=lambda row: (
+            row["method"],
+            float(row["train_wall_clock_sec"]) if row.get("train_wall_clock_sec") is not None else float("inf"),
+            float(row["weighted_compute_units"]) if row.get("weighted_compute_units") is not None else float("inf"),
+            float(row["compute_budget_be"]),
+        )
+    )
 
     wdro_csv = os.path.join(args.outdir, f"{args.prefix}_wdro_curve.csv")
     combined_csv = os.path.join(args.outdir, f"{args.prefix}_compare_curve.csv")
     summary_json = os.path.join(args.outdir, f"{args.prefix}_compare_curve_summary.json")
-    plot_path = os.path.join(args.outdir, f"{args.prefix}_fid_vs_compute.png")
+    plot_wall_clock = os.path.join(args.outdir, f"{args.prefix}_fid_vs_train_wall_clock.png")
+    plot_weighted = os.path.join(args.outdir, f"{args.prefix}_fid_vs_weighted_compute.png")
+    plot_legacy = os.path.join(args.outdir, f"{args.prefix}_fid_vs_batch_equiv.png")
     write_csv(wdro_csv, wdro_rows)
     write_csv(combined_csv, combined_rows)
     make_plot(
-        plot_path,
+        plot_wall_clock,
         baseline_rows=baseline_rows,
         wdro_rows=wdro_rows,
-        target_be=float(target_be),
         train_percent_label=str(args.train_percent_label),
+        x_key="train_wall_clock_sec",
+        x_label="Train Wall-Clock (sec)",
+        title_suffix="Train Wall-Clock",
+    )
+    make_plot(
+        plot_weighted,
+        baseline_rows=baseline_rows,
+        wdro_rows=wdro_rows,
+        train_percent_label=str(args.train_percent_label),
+        x_key="weighted_compute_units",
+        x_label="Weighted Compute Units",
+        title_suffix="Weighted Compute",
+    )
+    make_plot(
+        plot_legacy,
+        baseline_rows=baseline_rows,
+        wdro_rows=wdro_rows,
+        train_percent_label=str(args.train_percent_label),
+        x_key="compute_budget_be",
+        x_label="Legacy Batch-Equivalent Denoiser Evals",
+        title_suffix="Legacy Batch-Equivalent Compute",
+        target_x=float(target_be),
+        target_label="20 MIMG baseline compute",
     )
 
     summary = {
-        "target_baseline_mimg": float(args.target_baseline_mimg),
-        "target_compute_be": int(target_be),
-        "curve_protocol": str(args.curve_protocol),
-        "chosen_max_total_steps": int(max_total_steps),
-        "warmup_steps_fixed": int(warmup_steps_fixed),
+        "protocol": {
+            "target_baseline_mimg": float(args.target_baseline_mimg),
+            "target_compute_be": int(target_be),
+            "curve_protocol": str(args.curve_protocol),
+            "chosen_max_total_steps": int(max_total_steps),
+            "warmup_steps_fixed": int(warmup_steps_fixed),
+            "primary_metric": "train_wall_clock_sec",
+            "secondary_metric": "weighted_compute_units",
+            "legacy_metric": "batch_equiv_denoiser_evals",
+            "weighted_compute_calibration": weighted_calibration,
+            "train_accelerator_count": int(args.train_accelerator_count),
+        },
         "steps_list": [int(v) for v in steps_list],
         "baseline_aggregate_paths": baseline_paths,
         "wdro_resume_path": resume_path,
         "wdro_rows": wdro_rows,
         "baseline_rows": baseline_rows,
         "train_percent_label": str(args.train_percent_label),
-        "plot_path": plot_path,
+        "plot_paths": {
+            "train_wall_clock_sec": plot_wall_clock,
+            "weighted_compute_units": plot_weighted,
+            "batch_equiv_denoiser_evals": plot_legacy,
+        },
         "combined_csv": combined_csv,
     }
     with open(summary_json, "w", encoding="utf-8") as handle:
@@ -488,7 +672,9 @@ def main() -> None:
     print(f"[wdro-curve] wrote {wdro_csv}", flush=True)
     print(f"[wdro-curve] wrote {combined_csv}", flush=True)
     print(f"[wdro-curve] wrote {summary_json}", flush=True)
-    print(f"[wdro-curve] wrote {plot_path}", flush=True)
+    print(f"[wdro-curve] wrote {plot_wall_clock}", flush=True)
+    print(f"[wdro-curve] wrote {plot_weighted}", flush=True)
+    print(f"[wdro-curve] wrote {plot_legacy}", flush=True)
 
 
 if __name__ == "__main__":

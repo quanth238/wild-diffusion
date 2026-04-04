@@ -5,6 +5,7 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 
 from ...app.utils import empty_robust_history
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss
 from ...shared.runtime import autocast_context, resolve_amp_dtype
@@ -141,6 +142,7 @@ def train_trajectory_robust_wdro(
     history = history_state if history_state is not None else empty_robust_history()
     for key in empty_robust_history():
         history.setdefault(key, [])
+    ensure_denoiser_op_count_history(history)
     for key in (
         "wdro_refresh_step",
         "wdro_dataset_size",
@@ -241,6 +243,12 @@ def train_trajectory_robust_wdro(
         history["batch_equiv_denoiser_evals_attack_eval"].append(0.0)
         history["batch_equiv_denoiser_evals_clean_eval"].append(1.0)
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(refresh_attack_construction_units),
+            n_fwd_parambackward=1.0,
+        )
 
         if step % int(cfg.log_every) == 0:
             print(

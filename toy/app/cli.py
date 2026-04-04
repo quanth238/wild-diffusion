@@ -29,6 +29,22 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError("--robust-resume-ckpt-path must be a string path.")
     if cfg.robust_save_ckpt_path and not isinstance(cfg.robust_save_ckpt_path, str):
         raise ValueError("--robust-save-ckpt-path must be a string path.")
+    if cfg.weighted_compute_calibration_path and not isinstance(cfg.weighted_compute_calibration_path, str):
+        raise ValueError("--weighted-compute-calibration-path must be a string path.")
+    if cfg.weighted_inputgrad_alpha < 0:
+        raise ValueError(f"--weighted-inputgrad-alpha must be >= 0, got {cfg.weighted_inputgrad_alpha}")
+    if cfg.weighted_parambackward_beta < 0:
+        raise ValueError(
+            f"--weighted-parambackward-beta must be >= 0, got {cfg.weighted_parambackward_beta}"
+        )
+    weighted_explicit = (cfg.weighted_inputgrad_alpha > 0.0) or (cfg.weighted_parambackward_beta > 0.0)
+    if weighted_explicit and not (
+        cfg.weighted_inputgrad_alpha > 0.0 and cfg.weighted_parambackward_beta > 0.0
+    ):
+        raise ValueError(
+            "Explicit weighted compute calibration requires both --weighted-inputgrad-alpha "
+            "and --weighted-parambackward-beta to be positive."
+        )
     if cfg.baseline_steps_override < 0:
         raise ValueError(f"--baseline-steps-override must be >= 0, got {cfg.baseline_steps_override}")
     if cfg.inner_steps < 0:
@@ -248,6 +264,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fid-samples", type=int, default=ToyConfig.fid_samples)
     parser.add_argument("--fid-ref-path", type=str, default=ToyConfig.fid_ref_path)
     parser.add_argument("--fid-ref-policy", type=str, default=ToyConfig.fid_ref_policy)
+    parser.add_argument(
+        "--weighted-compute-calibration-path",
+        type=str,
+        default=ToyConfig.weighted_compute_calibration_path,
+    )
+    parser.add_argument("--weighted-inputgrad-alpha", type=float, default=ToyConfig.weighted_inputgrad_alpha)
+    parser.add_argument(
+        "--weighted-parambackward-beta",
+        type=float,
+        default=ToyConfig.weighted_parambackward_beta,
+    )
     parser.add_argument("--eval-seed-offset-gate", type=int, default=ToyConfig.eval_seed_offset_gate)
     parser.add_argument("--eval-seed-offset-metrics", type=int, default=ToyConfig.eval_seed_offset_metrics)
     parser.add_argument("--disable-eval-shared-terminal-noise", action="store_true")

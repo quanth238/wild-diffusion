@@ -2,14 +2,27 @@
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
-from typing import Dict, List, Optional
+import sys
+from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+from toy.compute_accounting import (
+    baseline_weighted_compute_units_for_steps,
+    cdro_robust_step_weighted_compute_units,
+    load_weighted_compute_calibration,
+    weighted_compute_units,
+)
+
+
 DEFAULT_TRAIN_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "train")
 DEFAULT_VAL_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "test")
 DEFAULT_FID_REF = os.path.join(
@@ -78,6 +91,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-total-budget-rho", type=float, default=0.02)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
     parser.add_argument("--cdro-warmup-fraction", type=float, default=0.2)
+    parser.add_argument("--match-reference-csv", type=str, default="")
+    parser.add_argument("--match-reference-method", type=str, default="wdro")
+    parser.add_argument(
+        "--match-reference-metric",
+        type=str,
+        default="weighted_compute_units",
+        choices=["weighted_compute_units"],
+    )
+    parser.add_argument("--match-reference-steps-list", type=str, default="")
+    parser.add_argument(
+        "--reference-match-pilot-robust-steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, run a short CDRO pilot from each shared warmup checkpoint and use the observed "
+            "robust weighted-compute-per-step to refine the matched total steps before the main run."
+        ),
+    )
+    parser.add_argument("--weighted-compute-calibration-path", type=str, default="")
+    parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
+    parser.add_argument("--weighted-parambackward-beta", type=float, default=0.0)
+    parser.add_argument("--train-accelerator-count", type=int, default=1)
     return parser.parse_args()
 
 
@@ -88,6 +123,24 @@ def ensure_dir(path: str) -> None:
 def parse_steps_list(value: str) -> List[int]:
     steps = sorted({int(item.strip()) for item in value.split(",") if item.strip()})
     return [step for step in steps if step >= 0]
+
+
+def parse_optional_steps_list(value: str) -> Optional[set[int]]:
+    if not str(value).strip():
+        return None
+    return set(parse_steps_list(value))
+
+
+def safe_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def maybe_set_fid_detector_env(env: Dict[str, str]) -> Dict[str, str]:
@@ -102,6 +155,241 @@ def find_baseline_checkpoint(checkpoint_dir: str, step: int) -> Optional[str]:
         return None
     path = os.path.join(checkpoint_dir, f"baseline_step{int(step):05d}.pt")
     return path if os.path.isfile(path) else None
+
+
+def resolve_weighted_calibration(args: argparse.Namespace) -> Dict:
+    return load_weighted_compute_calibration(
+        calibration_path=str(args.weighted_compute_calibration_path).strip(),
+        inputgrad_alpha=float(args.weighted_inputgrad_alpha),
+        parambackward_beta=float(args.weighted_parambackward_beta),
+    )
+
+
+def load_reference_rows_for_matching(
+    *,
+    csv_path: str,
+    reference_method: str,
+    metric_name: str,
+    reference_steps_filter: Optional[set[int]],
+) -> List[Dict[str, Any]]:
+    if not os.path.isfile(csv_path):
+        raise FileNotFoundError(f"Reference curve CSV not found: {csv_path}")
+    rows: List[Dict[str, Any]] = []
+    with open(csv_path, "r", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("method", "")).strip().lower() != str(reference_method).strip().lower():
+                continue
+            step = int(float(row["step"]))
+            if reference_steps_filter is not None and step not in reference_steps_filter:
+                continue
+            warmup_steps_value = row.get("warmup_steps_fixed")
+            if warmup_steps_value in (None, ""):
+                raise RuntimeError(
+                    f"Reference row step={step} in {csv_path} is missing warmup_steps_fixed; "
+                    "use a method curve CSV that exports absolute warmup checkpoints."
+                )
+            target_metric_value = safe_float(row.get(metric_name))
+            if target_metric_value is None:
+                raise RuntimeError(
+                    f"Reference row step={step} in {csv_path} is missing {metric_name}; "
+                    "cannot derive a matched CDRO budget from it."
+                )
+            rows.append(
+                {
+                    "reference_method": str(reference_method).strip().lower(),
+                    "reference_step": int(step),
+                    "reference_metric_name": str(metric_name),
+                    "reference_metric_value": float(target_metric_value),
+                    "warmup_steps_fixed": int(float(warmup_steps_value)),
+                    "reference_row": row,
+                }
+            )
+    rows.sort(key=lambda row: row["reference_step"])
+    if not rows:
+        raise RuntimeError(
+            f"No reference rows found in {csv_path} for method='{reference_method}' "
+            f"and step filter={sorted(reference_steps_filter) if reference_steps_filter is not None else 'all'}."
+        )
+    return rows
+
+
+def match_weighted_budget_with_linear_robust_cost(
+    *,
+    warmup_steps: int,
+    target_weighted_compute_units: float,
+    baseline_weighted_units: float,
+    robust_step_weighted_units: float,
+    estimate_source: str,
+) -> Dict[str, Any]:
+    target_robust_budget = max(float(target_weighted_compute_units) - float(baseline_weighted_units), 0.0)
+    if float(robust_step_weighted_units) <= 0.0:
+        robust_steps = 0
+    else:
+        robust_steps_float = target_robust_budget / float(robust_step_weighted_units)
+        robust_steps_floor = max(int(robust_steps_float), 0)
+        candidate_steps = {0, robust_steps_floor, robust_steps_floor + 1}
+        robust_steps = min(
+            candidate_steps,
+            key=lambda candidate: abs(
+                float(baseline_weighted_units)
+                + float(candidate) * float(robust_step_weighted_units)
+                - float(target_weighted_compute_units)
+            ),
+        )
+    matched_total_weighted = float(
+        float(baseline_weighted_units) + float(robust_steps) * float(robust_step_weighted_units)
+    )
+    abs_error = abs(float(target_weighted_compute_units) - matched_total_weighted)
+    rel_error = abs_error / float(target_weighted_compute_units) if float(target_weighted_compute_units) > 0.0 else 0.0
+    return {
+        "warmup_steps_fixed": int(warmup_steps),
+        "robust_steps_target": int(robust_steps),
+        "target_total_steps": int(warmup_steps + robust_steps),
+        "matched_metric_name": "weighted_compute_units",
+        "matched_metric_target": float(target_weighted_compute_units),
+        "matched_metric_value_estimate": float(matched_total_weighted),
+        "matched_metric_abs_error_estimate": float(abs_error),
+        "matched_metric_rel_error_estimate": float(rel_error),
+        "baseline_weighted_compute_units_target": float(baseline_weighted_units),
+        "cdro_robust_step_weighted_compute_units": float(robust_step_weighted_units),
+        "cdro_robust_step_weighted_compute_units_estimate_source": str(estimate_source),
+    }
+
+
+def match_cdro_steps_to_reference_weighted_budget(
+    *,
+    warmup_steps: int,
+    target_weighted_compute_units: float,
+    args: argparse.Namespace,
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    baseline_weighted_units = baseline_weighted_compute_units_for_steps(
+        steps=int(warmup_steps),
+        calibration=calibration,
+    )
+    robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
+        n_steps_path=int(args.n_steps_path),
+        inner_steps=int(args.inner_steps),
+        outer_attack_weight=float(args.outer_attack_weight),
+        outer_clean_weight=float(args.outer_clean_weight),
+        calibration=calibration,
+    )
+    if baseline_weighted_units is None or robust_step_weighted_units is None:
+        raise RuntimeError("Weighted compute calibration is required for CDRO reference-budget matching.")
+    return match_weighted_budget_with_linear_robust_cost(
+        warmup_steps=int(warmup_steps),
+        target_weighted_compute_units=float(target_weighted_compute_units),
+        baseline_weighted_units=float(baseline_weighted_units),
+        robust_step_weighted_units=float(robust_step_weighted_units),
+        estimate_source="analytic_formula",
+    )
+
+
+def maybe_refine_reference_match_plan_entry_with_pilot(
+    *,
+    args: argparse.Namespace,
+    plan_entry: Dict[str, Any],
+    logs_dir: str,
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    pilot_robust_steps_limit = max(int(args.reference_match_pilot_robust_steps), 0)
+    if pilot_robust_steps_limit <= 0:
+        return plan_entry
+    if int(plan_entry.get("robust_steps_target", 0)) <= 0:
+        return plan_entry
+
+    warmup_steps = int(plan_entry["warmup_steps_fixed"])
+    pilot_robust_steps = max(1, min(pilot_robust_steps_limit, int(plan_entry["robust_steps_target"])))
+    baseline_ckpt_path = find_baseline_checkpoint(args.baseline_checkpoint_dir, warmup_steps)
+    reference_step = int(plan_entry["reference_step"])
+    pilot_exp_name = (
+        f"{args.prefix}_pilot_refst{reference_step}_warm{warmup_steps}_rob{pilot_robust_steps}_s{args.seed}"
+    )
+    pilot_metrics_path = os.path.join(args.outdir, pilot_exp_name, "metrics.json")
+    pilot_log_path = os.path.join(logs_dir, f"{pilot_exp_name}.log")
+    if args.skip_existing and os.path.isfile(pilot_metrics_path):
+        print(
+            f"[cdro-curve] reuse pilot metrics ref_step={reference_step} "
+            f"warmup_steps={warmup_steps} metrics={pilot_metrics_path}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[cdro-curve] pilot ref_step={reference_step} warmup_steps={warmup_steps} "
+            f"robust_steps={pilot_robust_steps} baseline_ckpt={baseline_ckpt_path or 'none'} "
+            f"log={pilot_log_path}",
+            flush=True,
+        )
+        run_point(
+            args=args,
+            target_total_steps=int(warmup_steps + pilot_robust_steps),
+            warmup_steps=warmup_steps,
+            exp_name=pilot_exp_name,
+            log_path=pilot_log_path,
+            baseline_ckpt_path=baseline_ckpt_path,
+        )
+
+    pilot_row = extract_cdro_row(
+        pilot_metrics_path,
+        baseline_ckpt_requested=baseline_ckpt_path,
+        calibration=calibration,
+        train_accelerator_count=int(args.train_accelerator_count),
+    )
+    pilot_robust_steps_observed = int(pilot_row["robust_steps_target"])
+    pilot_robust_weighted_compute_units = safe_float(pilot_row.get("robust_weighted_compute_units"))
+    if pilot_robust_steps_observed <= 0 or pilot_robust_weighted_compute_units is None:
+        raise RuntimeError(
+            "Pilot-based CDRO matching requires a completed robust phase with direct weighted-compute accounting. "
+            f"Got robust_steps={pilot_robust_steps_observed} and "
+            f"robust_weighted_compute_units={pilot_robust_weighted_compute_units} for {pilot_metrics_path}."
+        )
+    pilot_baseline_weighted_compute_units = safe_float(pilot_row.get("baseline_weighted_compute_units"))
+    if pilot_baseline_weighted_compute_units is None:
+        pilot_baseline_weighted_compute_units = float(plan_entry["baseline_weighted_compute_units_target"])
+    pilot_robust_weighted_per_step = (
+        float(pilot_robust_weighted_compute_units) / float(pilot_robust_steps_observed)
+    )
+    matched = match_weighted_budget_with_linear_robust_cost(
+        warmup_steps=int(warmup_steps),
+        target_weighted_compute_units=float(plan_entry["reference_metric_value"]),
+        baseline_weighted_units=float(pilot_baseline_weighted_compute_units),
+        robust_step_weighted_units=float(pilot_robust_weighted_per_step),
+        estimate_source="pilot_observed_robust_step",
+    )
+    robust_train_wall_clock_sec = safe_float(pilot_row.get("robust_train_wall_clock_sec_effective"))
+    refined_entry = dict(plan_entry)
+    refined_entry.update(matched)
+    refined_entry.update(
+        {
+            "pilot_enabled": True,
+            "pilot_exp_name": pilot_exp_name,
+            "pilot_metrics_path": pilot_metrics_path,
+            "pilot_log_path": pilot_log_path,
+            "pilot_target_total_steps": int(warmup_steps + pilot_robust_steps),
+            "pilot_robust_steps_requested": int(pilot_robust_steps),
+            "pilot_robust_steps_observed": int(pilot_robust_steps_observed),
+            "pilot_robust_weighted_compute_units": float(pilot_robust_weighted_compute_units),
+            "pilot_robust_weighted_compute_units_per_step": float(pilot_robust_weighted_per_step),
+            "pilot_baseline_weighted_compute_units": float(pilot_baseline_weighted_compute_units),
+            "pilot_baseline_ckpt_loaded": bool(pilot_row["baseline_ckpt_loaded"]),
+            "pilot_robust_train_wall_clock_sec": (
+                None if robust_train_wall_clock_sec is None else float(robust_train_wall_clock_sec)
+            ),
+            "pilot_robust_train_wall_clock_sec_per_step": (
+                None
+                if robust_train_wall_clock_sec is None
+                else float(robust_train_wall_clock_sec) / float(pilot_robust_steps_observed)
+            ),
+        }
+    )
+    print(
+        f"[cdro-curve] pilot_refined ref_step={reference_step} "
+        f"old_total_steps={plan_entry['target_total_steps']} "
+        f"new_total_steps={refined_entry['target_total_steps']} "
+        f"pilot_robust_weighted_per_step={pilot_robust_weighted_per_step:.6f}",
+        flush=True,
+    )
+    return refined_entry
 
 
 def run_point(
@@ -196,6 +484,22 @@ def run_point(
                 "--disable-baseline-ckpt-strict-meta",
             ]
         )
+    if str(args.weighted_compute_calibration_path).strip():
+        cmd.extend(
+            [
+                "--weighted-compute-calibration-path",
+                str(args.weighted_compute_calibration_path).strip(),
+            ]
+        )
+    if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
+        cmd.extend(
+            [
+                "--weighted-inputgrad-alpha",
+                str(args.weighted_inputgrad_alpha),
+                "--weighted-parambackward-beta",
+                str(args.weighted_parambackward_beta),
+            ]
+        )
     env = maybe_set_fid_detector_env(os.environ)
     with open(log_path, "w", encoding="utf-8") as handle:
         subprocess.run(cmd, cwd=ROOT_DIR, env=env, check=True, stdout=handle, stderr=subprocess.STDOUT)
@@ -207,7 +511,12 @@ def load_json(path: str) -> Dict:
         return json.load(handle)
 
 
-def load_baseline_rows(paths: List[str]) -> List[Dict]:
+def load_baseline_rows(
+    paths: List[str],
+    *,
+    calibration: Dict,
+    train_accelerator_count: int,
+) -> List[Dict]:
     by_step: Dict[int, Dict] = {}
     for path in paths:
         if not path or not os.path.isfile(path):
@@ -215,21 +524,49 @@ def load_baseline_rows(paths: List[str]) -> List[Dict]:
         with open(path, "r", encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 step = int(float(row["step"]))
+                train_elapsed_sec = float(row["train_elapsed_median_sec"])
                 by_step[step] = {
                     "method": "baseline_edm",
                     "step": step,
                     "compute_budget_be": float(step),
+                    "baseline_compute_be": float(step),
+                    "robust_compute_be": 0.0,
+                    "weighted_compute_units": weighted_compute_units(
+                        n_fwd=0.0,
+                        n_fwd_inputgrad=0.0,
+                        n_fwd_parambackward=float(step),
+                        calibration=calibration,
+                    ),
+                    "baseline_weighted_compute_units": weighted_compute_units(
+                        n_fwd=0.0,
+                        n_fwd_inputgrad=0.0,
+                        n_fwd_parambackward=float(step),
+                        calibration=calibration,
+                    ),
+                    "robust_weighted_compute_units": 0.0
+                    if calibration.get("available", False)
+                    else None,
                     "images_shown_m": float(row["images_shown_m"]),
                     "fid": float(row["fid_median"]),
-                    "train_elapsed_sec": float(row["train_elapsed_median_sec"]),
+                    "train_wall_clock_sec": float(train_elapsed_sec),
+                    "train_elapsed_sec": float(train_elapsed_sec),
+                    "train_gpu_hours": float(train_elapsed_sec) * float(max(int(train_accelerator_count), 0)) / 3600.0,
+                    "train_wall_clock_complete": True,
                     "source": path,
                 }
     return [by_step[step] for step in sorted(by_step.keys())]
 
 
-def extract_cdro_row(metrics_path: str, *, baseline_ckpt_requested: Optional[str]) -> Dict:
+def extract_cdro_row(
+    metrics_path: str,
+    *,
+    baseline_ckpt_requested: Optional[str],
+    calibration: Dict,
+    train_accelerator_count: int,
+) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
+    config = payload.get("config", {})
     flow = metrics["flow_debug"]
     runtime = flow["runtime"]
     sample_quality = metrics.get("sample_quality_debug", {})
@@ -246,6 +583,37 @@ def extract_cdro_row(metrics_path: str, *, baseline_ckpt_requested: Optional[str
             baseline_compute_be + robust_compute_be,
         )
     )
+    baseline_weighted_compute = compute_accounting.get("baseline_weighted_compute_units")
+    robust_weighted_compute = compute_accounting.get("robust_weighted_compute_units")
+    total_weighted_compute = compute_accounting.get("weighted_compute_units", runtime.get("weighted_compute_units"))
+    if total_weighted_compute is None and calibration.get("available", False):
+        path_steps = int(config.get("n_steps_path", 24))
+        attack_weight = float(flow.get("outer_attack_weight", config.get("outer_attack_weight", 0.0)))
+        clean_weight = float(flow.get("outer_clean_weight", config.get("outer_clean_weight", 0.0)))
+        inner_steps = int(flow.get("inner_steps", config.get("inner_steps", 0)))
+        attack_enabled = bool(attack_weight > 0.0 and inner_steps > 0)
+        baseline_weighted_compute = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=float(baseline_phase_steps),
+            calibration=calibration,
+        )
+        robust_weighted_compute = weighted_compute_units(
+            n_fwd=float(path_steps * robust_phase_steps) if attack_enabled else 0.0,
+            n_fwd_inputgrad=float(path_steps * inner_steps * robust_phase_steps) if attack_enabled else 0.0,
+            n_fwd_parambackward=float(path_steps * robust_phase_steps * int((attack_weight > 0.0) + (clean_weight > 0.0))),
+            calibration=calibration,
+        )
+        if baseline_weighted_compute is not None and robust_weighted_compute is not None:
+            total_weighted_compute = float(baseline_weighted_compute + robust_weighted_compute)
+    train_wall_clock_sec = compute_accounting.get("train_wall_clock_sec", runtime.get("train_wall_clock_sec"))
+    if train_wall_clock_sec is None:
+        train_wall_clock_sec = runtime.get("effective_train_total")
+    train_gpu_hours = compute_accounting.get("train_gpu_hours", runtime.get("train_gpu_hours"))
+    if train_gpu_hours is None and train_wall_clock_sec is not None:
+        train_gpu_hours = float(train_wall_clock_sec) * float(max(int(train_accelerator_count), 0)) / 3600.0
+    baseline_train_wall_clock_sec = runtime.get("baseline_train_wall_clock_sec_effective")
+    robust_train_wall_clock_sec = runtime.get("robust_phase")
     total_images_shown_m = float(
         budget_accounting.get(
             "effective_train_images_seen_total",
@@ -268,19 +636,36 @@ def extract_cdro_row(metrics_path: str, *, baseline_ckpt_requested: Optional[str
         "compute_budget_be": float(total_compute_be),
         "baseline_compute_be": float(baseline_compute_be),
         "robust_compute_be": float(robust_compute_be),
+        "weighted_compute_units": None if total_weighted_compute is None else float(total_weighted_compute),
+        "baseline_weighted_compute_units": (
+            None if baseline_weighted_compute is None else float(baseline_weighted_compute)
+        ),
+        "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m),
         "fid": float(fid_value),
         "baseline_fid_same_run": (
             float(sample_quality["baseline_fid"]) if sample_quality.get("baseline_fid") is not None else float("nan")
         ),
+        "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
+        "train_gpu_hours": None if train_gpu_hours is None else float(train_gpu_hours),
         "train_elapsed_sec": float(runtime["effective_train_total"]),
         "runtime_total_sec": float(runtime["total"]),
+        "baseline_train_wall_clock_sec_effective": (
+            None if baseline_train_wall_clock_sec is None else float(baseline_train_wall_clock_sec)
+        ),
+        "robust_train_wall_clock_sec_effective": (
+            None if robust_train_wall_clock_sec is None else float(robust_train_wall_clock_sec)
+        ),
+        "baseline_train_wall_clock_source": runtime.get("baseline_train_wall_clock_sec_effective_source"),
         "warmup_steps_fixed": int(baseline_phase_steps),
         "robust_steps_target": int(robust_phase_steps),
         "warmup_only": bool(warmup_only),
         "baseline_ckpt_requested": baseline_ckpt_requested,
         "baseline_ckpt_loaded": bool(flow["baseline_ckpt_loaded"]),
         "phase_step_split_mode": str(flow["phase_step_split_mode"]),
+        "train_wall_clock_complete": bool(
+            compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
+        ),
         "metrics_path": metrics_path,
     }
 
@@ -303,28 +688,34 @@ def make_plot(
     path: str,
     baseline_rows: List[Dict],
     cdro_rows: List[Dict],
+    *,
     train_percent_label: str,
+    x_key: str,
+    x_label: str,
+    title_suffix: str,
 ) -> None:
     plt.figure(figsize=(8, 5))
-    if baseline_rows:
+    baseline_pairs = [(row[x_key], row["fid"]) for row in baseline_rows if row.get(x_key) is not None]
+    cdro_pairs = [(row[x_key], row["fid"]) for row in cdro_rows if row.get(x_key) is not None]
+    if baseline_pairs:
         plt.plot(
-            [row["compute_budget_be"] for row in baseline_rows],
-            [row["fid"] for row in baseline_rows],
+            [value for value, _ in baseline_pairs],
+            [fid for _, fid in baseline_pairs],
             marker="o",
             linewidth=2.0,
             label="Baseline EDM",
         )
-    if cdro_rows:
+    if cdro_pairs:
         plt.plot(
-            [row["compute_budget_be"] for row in cdro_rows],
-            [row["fid"] for row in cdro_rows],
+            [value for value, _ in cdro_pairs],
+            [fid for _, fid in cdro_pairs],
             marker="o",
             linewidth=2.0,
             label="CDRO",
         )
-    plt.xlabel("Compute Budget (batch-equivalent denoiser evals)")
+    plt.xlabel(x_label)
     plt.ylabel("FID")
-    plt.title(f"Simpsons-MNIST RGB {train_percent_label}: FID vs Compute Budget")
+    plt.title(f"Simpsons-MNIST RGB {train_percent_label}: FID vs {title_suffix}")
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -332,30 +723,139 @@ def make_plot(
     plt.close()
 
 
+def build_run_plan(args: argparse.Namespace, calibration: Dict[str, Any]) -> Dict[str, Any]:
+    reference_csv = str(args.match_reference_csv).strip()
+    if not reference_csv:
+        steps_list = parse_steps_list(args.steps_list)
+        entries: List[Dict[str, Any]] = []
+        for target_total_steps in steps_list:
+            warmup_steps = int(target_total_steps * float(args.cdro_warmup_fraction))
+            entries.append(
+                {
+                    "exp_name": f"{args.prefix}_st{target_total_steps}_s{args.seed}",
+                    "target_total_steps": int(target_total_steps),
+                    "warmup_steps_fixed": int(warmup_steps),
+                    "robust_steps_target": int(max(target_total_steps - warmup_steps, 0)),
+                    "protocol_name": "independent_per_point_fixed_fraction_warmup",
+                    "protocol_detail": "fractional warmup derived from cdro_warmup_fraction",
+                }
+            )
+        return {
+            "mode": "fixed_fraction",
+            "entries": entries,
+            "steps_list": steps_list,
+            "summary_protocol": {
+                "name": "independent_per_point_fixed_fraction_warmup",
+                "baseline_warmup_fraction": float(args.cdro_warmup_fraction),
+            },
+        }
+
+    reference_steps_filter = parse_optional_steps_list(args.match_reference_steps_list)
+    reference_rows = load_reference_rows_for_matching(
+        csv_path=reference_csv,
+        reference_method=str(args.match_reference_method),
+        metric_name=str(args.match_reference_metric),
+        reference_steps_filter=reference_steps_filter,
+    )
+    entries = []
+    for reference in reference_rows:
+        matched = match_cdro_steps_to_reference_weighted_budget(
+            warmup_steps=int(reference["warmup_steps_fixed"]),
+            target_weighted_compute_units=float(reference["reference_metric_value"]),
+            args=args,
+            calibration=calibration,
+        )
+        reference_step = int(reference["reference_step"])
+        target_total_steps = int(matched["target_total_steps"])
+        entries.append(
+            {
+                "exp_name": f"{args.prefix}_refst{reference_step}_cdrost{target_total_steps}_s{args.seed}",
+                "protocol_name": "shared_warmup_reference_weighted_budget_match",
+                "protocol_detail": (
+                    f"shared baseline prefix from {reference['reference_method']} step={reference_step} "
+                    f"and matched {reference['reference_metric_name']}"
+                ),
+                **reference,
+                **matched,
+            }
+        )
+    return {
+        "mode": "reference_weighted_budget_match",
+        "entries": entries,
+        "steps_list": [int(entry["target_total_steps"]) for entry in entries],
+        "summary_protocol": {
+            "name": "shared_warmup_reference_weighted_budget_match",
+            "reference_curve_csv": os.path.abspath(reference_csv),
+            "reference_method": str(args.match_reference_method).strip().lower(),
+            "reference_metric": str(args.match_reference_metric),
+            "reference_match_pilot_robust_steps": int(max(args.reference_match_pilot_robust_steps, 0)),
+            "reference_steps_filter": (
+                None if reference_steps_filter is None else sorted(int(step) for step in reference_steps_filter)
+            ),
+        },
+    }
+
+
 def main() -> None:
     args = parse_args()
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
     ensure_dir(logs_dir)
-
-    steps_list = parse_steps_list(args.steps_list)
-    print(f"[cdro-curve] checkpoints={steps_list}", flush=True)
+    weighted_calibration = resolve_weighted_calibration(args)
+    print(
+        "[cdro-curve] weighted_compute "
+        f"available={weighted_calibration['available']} "
+        f"source={weighted_calibration['source']} "
+        f"alpha={weighted_calibration['inputgrad_alpha']} "
+        f"beta={weighted_calibration['parambackward_beta']}",
+        flush=True,
+    )
+    run_plan = build_run_plan(args, weighted_calibration)
+    print(
+        f"[cdro-curve] protocol={run_plan['summary_protocol']['name']} "
+        f"checkpoints={run_plan['steps_list']}",
+        flush=True,
+    )
+    if run_plan["mode"] == "reference_weighted_budget_match":
+        print(
+            "[cdro-curve] reference_match "
+            f"csv={run_plan['summary_protocol']['reference_curve_csv']} "
+            f"method={run_plan['summary_protocol']['reference_method']} "
+            f"metric={run_plan['summary_protocol']['reference_metric']}",
+            flush=True,
+        )
 
     cdro_rows: List[Dict] = []
-    for target_total_steps in steps_list:
-        warmup_steps = int(target_total_steps * float(args.cdro_warmup_fraction))
+    for raw_plan_entry in run_plan["entries"]:
+        plan_entry = dict(raw_plan_entry)
+        if run_plan["mode"] == "reference_weighted_budget_match":
+            plan_entry = maybe_refine_reference_match_plan_entry_with_pilot(
+                args=args,
+                plan_entry=plan_entry,
+                logs_dir=logs_dir,
+                calibration=weighted_calibration,
+            )
+        target_total_steps = int(plan_entry["target_total_steps"])
+        warmup_steps = int(plan_entry["warmup_steps_fixed"])
         baseline_ckpt_path = find_baseline_checkpoint(args.baseline_checkpoint_dir, warmup_steps)
-        exp_name = f"{args.prefix}_st{target_total_steps}_s{args.seed}"
+        exp_name = str(plan_entry["exp_name"])
         metrics_path = os.path.join(args.outdir, exp_name, "metrics.json")
         log_path = os.path.join(logs_dir, f"{exp_name}.log")
         if args.skip_existing and os.path.isfile(metrics_path):
             print(f"[cdro-curve] reuse existing metrics for step={target_total_steps}: {metrics_path}", flush=True)
         else:
-            print(
+            log_message = (
                 f"[cdro-curve] run step={target_total_steps} warmup_steps={warmup_steps} "
-                f"baseline_ckpt={baseline_ckpt_path or 'none'} log={log_path}",
-                flush=True,
+                f"baseline_ckpt={baseline_ckpt_path or 'none'} log={log_path}"
             )
+            if run_plan["mode"] == "reference_weighted_budget_match":
+                log_message += (
+                    f" ref_step={plan_entry['reference_step']}"
+                    f" target_weighted={plan_entry['matched_metric_target']:.4f}"
+                    f" est_weighted={plan_entry['matched_metric_value_estimate']:.4f}"
+                    f" est_abs_err={plan_entry['matched_metric_abs_error_estimate']:.4f}"
+                )
+            print(log_message, flush=True)
             run_point(
                 args=args,
                 target_total_steps=target_total_steps,
@@ -364,52 +864,175 @@ def main() -> None:
                 log_path=log_path,
                 baseline_ckpt_path=baseline_ckpt_path,
             )
-        row = extract_cdro_row(metrics_path, baseline_ckpt_requested=baseline_ckpt_path)
-        cdro_rows.append(row)
-        print(
-            f"[cdro-curve] step={row['step']} compute_be={row['compute_budget_be']:.1f} "
-            f"fid={row['fid']:.4f} warmup={row['warmup_steps_fixed']} "
-            f"baseline_ckpt_loaded={row['baseline_ckpt_loaded']}",
-            flush=True,
+        row = extract_cdro_row(
+            metrics_path,
+            baseline_ckpt_requested=baseline_ckpt_path,
+            calibration=weighted_calibration,
+            train_accelerator_count=int(args.train_accelerator_count),
         )
+        row.update(
+            {
+                "protocol_name": str(plan_entry["protocol_name"]),
+                "protocol_detail": str(plan_entry["protocol_detail"]),
+            }
+        )
+        if run_plan["mode"] == "reference_weighted_budget_match":
+            row.update(
+                {
+                    "reference_method": str(plan_entry["reference_method"]),
+                    "reference_step": int(plan_entry["reference_step"]),
+                    "reference_metric_name": str(plan_entry["reference_metric_name"]),
+                    "reference_metric_target": float(plan_entry["reference_metric_value"]),
+                    "reference_warmup_steps_fixed": int(plan_entry["warmup_steps_fixed"]),
+                    "reference_weighted_compute_units": float(plan_entry["reference_metric_value"]),
+                    "matched_metric_name": str(plan_entry["matched_metric_name"]),
+                    "matched_metric_target": float(plan_entry["matched_metric_target"]),
+                    "matched_metric_value_estimate": float(plan_entry["matched_metric_value_estimate"]),
+                    "matched_metric_abs_error_estimate": float(plan_entry["matched_metric_abs_error_estimate"]),
+                    "matched_metric_rel_error_estimate": float(plan_entry["matched_metric_rel_error_estimate"]),
+                    "baseline_weighted_compute_units_target": float(plan_entry["baseline_weighted_compute_units_target"]),
+                    "cdro_robust_step_weighted_compute_units": float(
+                        plan_entry["cdro_robust_step_weighted_compute_units"]
+                    ),
+                    "cdro_robust_step_weighted_compute_units_estimate_source": str(
+                        plan_entry.get("cdro_robust_step_weighted_compute_units_estimate_source", "analytic_formula")
+                    ),
+                }
+            )
+            if bool(plan_entry.get("pilot_enabled", False)):
+                row.update(
+                    {
+                        "pilot_exp_name": str(plan_entry["pilot_exp_name"]),
+                        "pilot_metrics_path": str(plan_entry["pilot_metrics_path"]),
+                        "pilot_log_path": str(plan_entry["pilot_log_path"]),
+                        "pilot_target_total_steps": int(plan_entry["pilot_target_total_steps"]),
+                        "pilot_robust_steps_requested": int(plan_entry["pilot_robust_steps_requested"]),
+                        "pilot_robust_steps_observed": int(plan_entry["pilot_robust_steps_observed"]),
+                        "pilot_robust_weighted_compute_units": float(
+                            plan_entry["pilot_robust_weighted_compute_units"]
+                        ),
+                        "pilot_robust_weighted_compute_units_per_step": float(
+                            plan_entry["pilot_robust_weighted_compute_units_per_step"]
+                        ),
+                        "pilot_baseline_weighted_compute_units": float(
+                            plan_entry["pilot_baseline_weighted_compute_units"]
+                        ),
+                        "pilot_baseline_ckpt_loaded": bool(plan_entry["pilot_baseline_ckpt_loaded"]),
+                        "pilot_robust_train_wall_clock_sec": plan_entry["pilot_robust_train_wall_clock_sec"],
+                        "pilot_robust_train_wall_clock_sec_per_step": plan_entry[
+                            "pilot_robust_train_wall_clock_sec_per_step"
+                        ],
+                    }
+                )
+        cdro_rows.append(row)
+        completion_message = (
+            f"[cdro-curve] step={row['step']} train_wall_clock_sec={row['train_wall_clock_sec']} "
+            f"weighted_compute_units={row['weighted_compute_units']} fid={row['fid']:.4f} "
+            f"warmup={row['warmup_steps_fixed']} baseline_ckpt_loaded={row['baseline_ckpt_loaded']}"
+        )
+        if run_plan["mode"] == "reference_weighted_budget_match":
+            actual_weighted = safe_float(row.get("weighted_compute_units"))
+            target_weighted = float(plan_entry["matched_metric_target"])
+            actual_abs_error = None if actual_weighted is None else abs(float(actual_weighted) - target_weighted)
+            completion_message += (
+                f" ref_step={plan_entry['reference_step']}"
+                f" target_weighted={target_weighted:.4f}"
+                f" actual_abs_err={actual_abs_error}"
+            )
+            row["matched_metric_value_actual"] = actual_weighted
+            row["matched_metric_abs_error_actual"] = actual_abs_error
+            row["matched_metric_rel_error_actual"] = (
+                None
+                if actual_abs_error is None or target_weighted <= 0.0
+                else float(actual_abs_error) / float(target_weighted)
+            )
+        print(completion_message, flush=True)
 
     baseline_paths = args.baseline_aggregate or [DEFAULT_BASELINE_AGGREGATE]
-    baseline_rows = load_baseline_rows(baseline_paths)
+    baseline_rows = load_baseline_rows(
+        baseline_paths,
+        calibration=weighted_calibration,
+        train_accelerator_count=int(args.train_accelerator_count),
+    )
     combined_rows = baseline_rows + cdro_rows
-    combined_rows.sort(key=lambda row: (row["method"], float(row["compute_budget_be"])))
+    combined_rows.sort(
+        key=lambda row: (
+            row["method"],
+            float(row["train_wall_clock_sec"]) if row.get("train_wall_clock_sec") is not None else float("inf"),
+            float(row["weighted_compute_units"]) if row.get("weighted_compute_units") is not None else float("inf"),
+            float(row["compute_budget_be"]),
+        )
+    )
 
     cdro_csv = os.path.join(args.outdir, f"{args.prefix}_cdro_curve.csv")
     combined_csv = os.path.join(args.outdir, f"{args.prefix}_compare_curve.csv")
     summary_json = os.path.join(args.outdir, f"{args.prefix}_compare_curve_summary.json")
-    plot_path = os.path.join(args.outdir, f"{args.prefix}_fid_vs_compute.png")
+    plot_wall_clock = os.path.join(args.outdir, f"{args.prefix}_fid_vs_train_wall_clock.png")
+    plot_weighted = os.path.join(args.outdir, f"{args.prefix}_fid_vs_weighted_compute.png")
+    plot_legacy = os.path.join(args.outdir, f"{args.prefix}_fid_vs_batch_equiv.png")
     write_csv(cdro_csv, cdro_rows)
     write_csv(combined_csv, combined_rows)
     make_plot(
-        plot_path,
+        plot_wall_clock,
         baseline_rows=baseline_rows,
         cdro_rows=cdro_rows,
         train_percent_label=str(args.train_percent_label),
+        x_key="train_wall_clock_sec",
+        x_label="Train Wall-Clock (sec)",
+        title_suffix="Train Wall-Clock",
+    )
+    make_plot(
+        plot_weighted,
+        baseline_rows=baseline_rows,
+        cdro_rows=cdro_rows,
+        train_percent_label=str(args.train_percent_label),
+        x_key="weighted_compute_units",
+        x_label="Weighted Compute Units",
+        title_suffix="Weighted Compute",
+    )
+    make_plot(
+        plot_legacy,
+        baseline_rows=baseline_rows,
+        cdro_rows=cdro_rows,
+        train_percent_label=str(args.train_percent_label),
+        x_key="compute_budget_be",
+        x_label="Legacy Batch-Equivalent Denoiser Evals",
+        title_suffix="Legacy Batch-Equivalent Compute",
     )
 
     summary = {
         "protocol": {
-            "name": "independent_per_point_fixed_fraction_warmup",
-            "compute_unit": "batch_equiv_denoiser_evals",
-            "compute_definition": (
-                "One denoiser forward over one training batch counts as 1 unit; "
-                "a forward over B*T path states counts as T units. Baseline warmup compute is counted "
-                "in the total budget even when an exact warmup checkpoint is reused."
+            **run_plan["summary_protocol"],
+            "primary_metric": "train_wall_clock_sec",
+            "secondary_metric": "weighted_compute_units",
+            "legacy_metric": "batch_equiv_denoiser_evals",
+            "primary_definition": (
+                "Effective training-only wall-clock on fixed hardware, including reused baseline warmup time "
+                "when the reference checkpoint has recoverable runtime metadata."
             ),
-            "baseline_warmup_fraction": float(args.cdro_warmup_fraction),
+            "secondary_definition": (
+                "Weighted-op budget 1*N_fwd + alpha*N_fwd_plus_inputgrad + beta*N_fwd_plus_parambackward, "
+                "with alpha/beta from the supplied calibration."
+            ),
+            "legacy_definition": (
+                "One denoiser forward over one training batch counts as 1 unit; "
+                "a forward over B*T path states counts as T units."
+            ),
             "diagnostics_included": False,
+            "train_accelerator_count": int(args.train_accelerator_count),
+            "weighted_compute_calibration": weighted_calibration,
         },
-        "steps_list": [int(v) for v in steps_list],
+        "steps_list": [int(v) for v in run_plan["steps_list"]],
         "baseline_aggregate_paths": baseline_paths,
         "baseline_checkpoint_dir": str(args.baseline_checkpoint_dir),
         "cdro_rows": cdro_rows,
         "baseline_rows": baseline_rows,
         "train_percent_label": str(args.train_percent_label),
-        "plot_path": plot_path,
+        "plot_paths": {
+            "train_wall_clock_sec": plot_wall_clock,
+            "weighted_compute_units": plot_weighted,
+            "batch_equiv_denoiser_evals": plot_legacy,
+        },
         "combined_csv": combined_csv,
     }
     with open(summary_json, "w", encoding="utf-8") as handle:
@@ -417,7 +1040,9 @@ def main() -> None:
     print(f"[cdro-curve] wrote {cdro_csv}", flush=True)
     print(f"[cdro-curve] wrote {combined_csv}", flush=True)
     print(f"[cdro-curve] wrote {summary_json}", flush=True)
-    print(f"[cdro-curve] wrote {plot_path}", flush=True)
+    print(f"[cdro-curve] wrote {plot_wall_clock}", flush=True)
+    print(f"[cdro-curve] wrote {plot_weighted}", flush=True)
+    print(f"[cdro-curve] wrote {plot_legacy}", flush=True)
 
 
 if __name__ == "__main__":

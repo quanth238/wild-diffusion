@@ -44,6 +44,9 @@ class ToyConfig:
     ema_decay: float = 0.995
     fid_ref_path: str = ""
     fid_ref_policy: str = "auto"
+    weighted_compute_calibration_path: str = ""
+    weighted_inputgrad_alpha: float = 0.0
+    weighted_parambackward_beta: float = 0.0
     # Baseline checkpoint cache for fair cross-version comparison:
     # - if enabled and checkpoint exists: load baseline (skip baseline retrain).
     # - else: train baseline once, then save it for reuse by later runs.
@@ -103,10 +106,10 @@ class ToyConfig:
     # - kappa_clip: fallback to v2-style local radius kappa_k * Delta_sigma_k.
     # - none: no projection.
     v11_projection_mode: str = "global_remaining"
-    # CDRO Route-A options (beta-space greedy attack with exact local caps).
+    # CDRO Route-A options (beta-space greedy attack with sigma-time local caps).
     cdro_step_size: float = 0.02
     cdro_total_budget_rho: float = 0.02
-    cdro_time_horizon: float = 1.0
+    cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
     # Reference warmup fraction used to match WDRO-style warmup compute when
     # translating baseline EDM warmup steps for CDRO.
     cdro_warmup_fraction: float = 0.2

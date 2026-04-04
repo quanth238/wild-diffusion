@@ -34,6 +34,7 @@ import torch
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from toy.compute_accounting import load_weighted_compute_calibration, weighted_compute_units
     from toy.config import ToyConfig
     from toy.data_backends.provider import build_dataset_bundle
     from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
@@ -45,6 +46,7 @@ if __package__ is None or __package__ == "":
     from toy.shared.train_utils import sample_train_batch
     from toy.utils import batch_scalar_like, ensure_dir, has_nan_or_inf, pick_device, scalarize, set_seed
 else:
+    from ..compute_accounting import load_weighted_compute_calibration, weighted_compute_units
     from ..config import ToyConfig
     from ..data_backends.provider import build_dataset_bundle
     from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
@@ -116,6 +118,14 @@ def _fmt(value: float, ndigits: int = 4) -> str:
     if not math.isfinite(value):
         return "nan"
     return f"{value:.{ndigits}f}"
+
+
+def _resolve_weighted_calibration(args) -> Dict[str, Any]:
+    return load_weighted_compute_calibration(
+        calibration_path=str(getattr(args, "weighted_compute_calibration_path", "")).strip(),
+        inputgrad_alpha=float(getattr(args, "weighted_inputgrad_alpha", 0.0)),
+        parambackward_beta=float(getattr(args, "weighted_parambackward_beta", 0.0)),
+    )
 
 
 def _count_image_files(root: Path) -> int:
@@ -194,7 +204,16 @@ def _apply_auto_log_normal_params(cfg: ToyConfig) -> None:
         cfg.p_std = max((log_max - log_min) / 6.0, 1e-3)
 
 
-def _save_checkpoint(path: Path, *, model: torch.nn.Module, step: int, train_percent: float, seed: int, history: Dict[str, Any]) -> None:
+def _save_checkpoint(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    step: int,
+    train_percent: float,
+    seed: int,
+    history: Dict[str, Any],
+    train_wall_clock_sec: Optional[float] = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format": "mnist_baseline_curve_ckpt_v1",
@@ -204,6 +223,10 @@ def _save_checkpoint(path: Path, *, model: torch.nn.Module, step: int, train_per
         "seed": int(seed),
         "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
         "history": history,
+        "baseline_runtime": {
+            "step": int(step),
+            "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
+        },
     }
     tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     torch.save(payload, tmp_path)
@@ -508,6 +531,10 @@ class RunRow:
     baseline_loss_final: float
     baseline_loss_mean_last: float
     train_elapsed_sec: float
+    train_wall_clock_sec: float
+    train_gpu_hours: float
+    weighted_compute_units: float
+    batch_equiv_denoiser_evals: float
     fid_elapsed_sec: float
 
     def to_dict(self) -> Dict[str, Any]:
@@ -525,6 +552,10 @@ class RunRow:
             "baseline_loss_final": self.baseline_loss_final,
             "baseline_loss_mean_last": self.baseline_loss_mean_last,
             "train_elapsed_sec": self.train_elapsed_sec,
+            "train_wall_clock_sec": self.train_wall_clock_sec,
+            "train_gpu_hours": self.train_gpu_hours,
+            "weighted_compute_units": self.weighted_compute_units,
+            "batch_equiv_denoiser_evals": self.batch_equiv_denoiser_evals,
             "fid_elapsed_sec": self.fid_elapsed_sec,
         }
 
@@ -542,6 +573,10 @@ class AggregateRow:
     loss_final_median: float
     loss_mean_last_median: float
     train_elapsed_median_sec: float
+    train_wall_clock_median_sec: float
+    train_gpu_hours_median: float
+    weighted_compute_units_median: float
+    batch_equiv_denoiser_evals_median: float
     fid_elapsed_median_sec: float
 
     def to_dict(self) -> Dict[str, Any]:
@@ -557,6 +592,10 @@ class AggregateRow:
             "loss_final_median": self.loss_final_median,
             "loss_mean_last_median": self.loss_mean_last_median,
             "train_elapsed_median_sec": self.train_elapsed_median_sec,
+            "train_wall_clock_median_sec": self.train_wall_clock_median_sec,
+            "train_gpu_hours_median": self.train_gpu_hours_median,
+            "weighted_compute_units_median": self.weighted_compute_units_median,
+            "batch_equiv_denoiser_evals_median": self.batch_equiv_denoiser_evals_median,
             "fid_elapsed_median_sec": self.fid_elapsed_median_sec,
         }
 
@@ -581,10 +620,40 @@ def _aggregate(rows: List[RunRow]) -> List[AggregateRow]:
                 loss_final_median=_median([row.baseline_loss_final for row in sub]),
                 loss_mean_last_median=_median([row.baseline_loss_mean_last for row in sub]),
                 train_elapsed_median_sec=_median([row.train_elapsed_sec for row in sub]),
+                train_wall_clock_median_sec=_median([row.train_wall_clock_sec for row in sub]),
+                train_gpu_hours_median=_median([row.train_gpu_hours for row in sub]),
+                weighted_compute_units_median=_median([row.weighted_compute_units for row in sub]),
+                batch_equiv_denoiser_evals_median=_median([row.batch_equiv_denoiser_evals for row in sub]),
                 fid_elapsed_median_sec=_median([row.fid_elapsed_sec for row in sub]),
             )
         )
     return out
+
+
+def _run_row_from_dict(
+    row: Dict[str, Any],
+    *,
+    weighted_calibration: Dict[str, Any],
+    train_accelerator_count: int,
+) -> RunRow:
+    payload = dict(row)
+    step = int(payload["step"])
+    train_elapsed = float(payload.get("train_elapsed_sec", float("nan")))
+    payload.setdefault("train_wall_clock_sec", train_elapsed)
+    payload.setdefault(
+        "train_gpu_hours",
+        float(train_elapsed) * float(max(int(train_accelerator_count), 0)) / 3600.0,
+    )
+    if "weighted_compute_units" not in payload:
+        weighted_units = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=float(step),
+            calibration=weighted_calibration,
+        )
+        payload["weighted_compute_units"] = float(weighted_units) if weighted_units is not None else float("nan")
+    payload.setdefault("batch_equiv_denoiser_evals", float(step))
+    return RunRow(**payload)
 
 
 def _extract_thresholds(
@@ -781,6 +850,7 @@ def _run_combo(
     detector_net,
     mu_ref: torch.Tensor,
     sigma_ref: torch.Tensor,
+    weighted_calibration: Dict[str, Any],
 ) -> List[RunRow]:
     cfg = _build_config(args, train_percent=train_percent, seed=seed)
     device = pick_device(cfg.device)
@@ -803,7 +873,14 @@ def _run_combo(
         rows_payload = json.loads(summary_path.read_text(encoding="utf-8"))
         if bool(rows_payload.get("completed", True)):
             print(f"[skip-existing] {summary_path}", flush=True)
-            return [RunRow(**row) for row in rows_payload["rows"]]
+            return [
+                _run_row_from_dict(
+                    row,
+                    weighted_calibration=weighted_calibration,
+                    train_accelerator_count=int(args.train_accelerator_count),
+                )
+                for row in rows_payload["rows"]
+            ]
 
     print(f"[combo] start pct={train_percent:g} seed={seed} max_step={cfg.steps}", flush=True)
     set_seed(cfg.seed)
@@ -864,7 +941,14 @@ def _run_combo(
             dtype=torch.long,
             device=sigma_levels.device,
         )
-        rows = [RunRow(**row) for row in payload.get("rows", [])]
+        rows = [
+            _run_row_from_dict(
+                row,
+                weighted_calibration=weighted_calibration,
+                train_accelerator_count=int(args.train_accelerator_count),
+            )
+            for row in payload.get("rows", [])
+        ]
         combo_train_elapsed_offset_sec = float(payload.get("combo_train_elapsed_sec", 0.0))
         _restore_rng_state(payload["rng_state"])
         print(
@@ -903,8 +987,16 @@ def _run_combo(
             train_percent=train_percent,
             seed=seed,
             history=history_snapshot,
+            train_wall_clock_sec=float(combo_train_elapsed_offset_sec + float(time.perf_counter() - combo_train_t0)),
         )
         train_elapsed = combo_train_elapsed_offset_sec + float(time.perf_counter() - combo_train_t0)
+        train_gpu_hours = float(train_elapsed) * float(max(int(args.train_accelerator_count), 0)) / 3600.0
+        weighted_units = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=float(step),
+            calibration=weighted_calibration,
+        )
 
         baseline_was_training = baseline.training
         baseline.eval()
@@ -944,6 +1036,10 @@ def _run_combo(
             baseline_loss_final=float(baseline_loss_final),
             baseline_loss_mean_last=float(baseline_loss_mean_last),
             train_elapsed_sec=train_elapsed,
+            train_wall_clock_sec=float(train_elapsed),
+            train_gpu_hours=float(train_gpu_hours),
+            weighted_compute_units=float(weighted_units) if weighted_units is not None else float("nan"),
+            batch_equiv_denoiser_evals=float(step),
             fid_elapsed_sec=fid_elapsed,
         )
         rows.append(row)
@@ -954,6 +1050,7 @@ def _run_combo(
             f" fid={_fmt(row.baseline_fid, 3)}"
             f" loss={_fmt(row.baseline_loss_final, 5)}"
             f" train_elapsed={_fmt(row.train_elapsed_sec, 1)}s"
+            f" weighted={_fmt(row.weighted_compute_units, 1)}"
             f" fid_elapsed={_fmt(row.fid_elapsed_sec, 1)}s",
             flush=True,
         )
@@ -1112,6 +1209,10 @@ def build_parser():
     parser.add_argument("--amp-dtype", type=str, default="auto", choices=["auto", "off", "bfloat16", "float16"])
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--disable-cudnn-benchmark", action="store_true")
+    parser.add_argument("--weighted-compute-calibration-path", type=str, default="")
+    parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
+    parser.add_argument("--weighted-parambackward-beta", type=float, default=0.0)
+    parser.add_argument("--train-accelerator-count", type=int, default=1)
 
     parser.add_argument("--threshold-pct", type=float, default=5.0)
     parser.add_argument("--overfit-pct", type=float, default=10.0)
@@ -1180,6 +1281,7 @@ def main() -> None:
         cudnn_benchmark=not bool(args.disable_cudnn_benchmark),
     )
     amp_dtype = _resolve_amp_dtype(device, args.amp_dtype)
+    weighted_calibration = _resolve_weighted_calibration(args)
     print(
         "[runtime]"
         f" device={device}"
@@ -1188,6 +1290,15 @@ def main() -> None:
         f" cudnn_benchmark={str(not bool(args.disable_cudnn_benchmark)).lower()}"
         f" batch_size={int(args.batch_size)}"
         f" gen_batch={int(args.gen_batch)}",
+        flush=True,
+    )
+    print(
+        "[runtime]"
+        f" weighted_compute_available={weighted_calibration['available']}"
+        f" source={weighted_calibration['source']}"
+        f" alpha={weighted_calibration['inputgrad_alpha']}"
+        f" beta={weighted_calibration['parambackward_beta']}"
+        f" train_accelerator_count={int(args.train_accelerator_count)}",
         flush=True,
     )
     if str(args.mimg_list).strip():
@@ -1208,6 +1319,7 @@ def main() -> None:
                 detector_net=detector_net,
                 mu_ref=mu_ref,
                 sigma_ref=sigma_ref,
+                weighted_calibration=weighted_calibration,
             )
             all_rows.extend(rows)
 
@@ -1250,6 +1362,9 @@ def main() -> None:
             "name": f"{str(args.dataset_kind)}_checkpointed_baseline_convergence",
             "family": "from_scratch_curve",
             "description": "Train baseline EDM once per subset+seed and evaluate intermediate checkpoints.",
+            "primary_metric": "train_wall_clock_sec",
+            "secondary_metric": "weighted_compute_units",
+            "legacy_metric": "batch_equiv_denoiser_evals",
             "dataset_kind": str(args.dataset_kind),
             "dataset_path": str(Path(args.dataset_path).resolve()) if args.dataset_path else None,
             "dataset_val_path": str(Path(args.dataset_val_path).resolve()) if args.dataset_val_path else None,
@@ -1270,6 +1385,8 @@ def main() -> None:
             "threshold_pct": float(args.threshold_pct),
             "overfit_pct": float(args.overfit_pct),
             "overfit_patience": int(args.overfit_patience),
+            "train_accelerator_count": int(args.train_accelerator_count),
+            "weighted_compute_calibration": weighted_calibration,
         },
         "thresholds": thresholds,
         "artifacts": {

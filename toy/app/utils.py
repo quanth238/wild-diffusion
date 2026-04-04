@@ -2,6 +2,11 @@ from typing import Dict, List
 
 import torch
 
+from ..compute_accounting import (
+    DENOISER_OP_COUNT_CUMULATIVE_KEYS,
+    DENOISER_OP_COUNT_STEP_KEYS,
+    DENOISER_OP_COUNTS_RECORDED_KEY,
+)
 from ..utils import per_sample_l2
 
 
@@ -77,7 +82,7 @@ def compute_terminal_match_stats(reverse_paths: torch.Tensor, forward_paths: tor
 def empty_robust_history() -> dict:
     """Shape-stable empty robust history used when robust phase is skipped."""
 
-    return {
+    history = {
         "outer_loss": [],
         "outer_loss_attack": [],
         "outer_loss_clean": [],
@@ -127,3 +132,7 @@ def empty_robust_history() -> dict:
         "batch_equiv_denoiser_evals_clean_eval": [],
         "batch_equiv_denoiser_evals_cumulative": [],
     }
+    history[DENOISER_OP_COUNTS_RECORDED_KEY] = False
+    for key in DENOISER_OP_COUNT_STEP_KEYS + DENOISER_OP_COUNT_CUMULATIVE_KEYS:
+        history[key] = []
+    return history

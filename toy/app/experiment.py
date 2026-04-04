@@ -13,6 +13,12 @@ import numpy as np
 import torch
 
 from ..checks import run_preflight_checks
+from ..compute_accounting import (
+    ensure_denoiser_op_count_history,
+    load_weighted_compute_calibration,
+    read_denoiser_op_count_totals,
+    weighted_compute_units,
+)
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
 from ..shared.sigma import build_sigma_levels, sample_target_indices
@@ -83,6 +89,231 @@ def _load_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
         return payload if isinstance(payload, dict) else None
     except Exception:
         return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    """Best-effort float conversion used for external artifact metadata."""
+
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_float_series(values) -> float:
+    """Stable float sum over metric histories that may contain mixed scalar types."""
+
+    return float(sum(float(v) for v in values))
+
+
+def _count_positive_weight(value: float) -> int:
+    """Return 1 when a loss branch is active and 0 otherwise."""
+
+    return 1 if float(value) > 0.0 else 0
+
+
+def _device_accounting_metadata(device: torch.device) -> Dict[str, Any]:
+    """Capture the fixed-hardware metadata needed for wall-clock and GPU-hour reporting."""
+
+    device_type = str(device.type)
+    accelerator_kind = "gpu" if device_type == "cuda" else device_type
+    accelerator_count = 1 if device_type in ("cuda", "mps", "cpu") else 0
+    accelerator_name = str(device)
+    if device_type == "cuda" and torch.cuda.is_available():
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        accelerator_name = str(torch.cuda.get_device_name(device_index))
+    return {
+        "train_accelerator_kind": accelerator_kind,
+        "train_accelerator_name": accelerator_name,
+        "train_accelerator_count": int(accelerator_count),
+        "train_gpu_count": int(1 if device_type == "cuda" else 0),
+    }
+
+
+def _resolve_baseline_reference_train_wall_clock_sec(
+    *,
+    ckpt_path: str,
+    planned_steps: int,
+) -> Dict[str, Any]:
+    """Recover baseline warmup train time from a reused checkpoint when possible."""
+
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        return {"train_wall_clock_sec": None, "source": "unavailable"}
+
+    try:
+        payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        runtime_block = payload.get("baseline_runtime")
+        if isinstance(runtime_block, dict):
+            runtime_value = _optional_float(
+                runtime_block.get("train_wall_clock_sec", runtime_block.get("baseline_train_wall_clock_sec"))
+            )
+            runtime_step = runtime_block.get("step")
+            if runtime_value is not None and (runtime_step is None or int(runtime_step) == int(planned_steps)):
+                return {
+                    "train_wall_clock_sec": float(runtime_value),
+                    "source": "baseline_checkpoint_payload",
+                }
+        direct_runtime = _optional_float(payload.get("train_elapsed_sec"))
+        direct_step = payload.get("step")
+        if direct_runtime is not None and (direct_step is None or int(direct_step) == int(planned_steps)):
+            return {
+                "train_wall_clock_sec": float(direct_runtime),
+                "source": "baseline_checkpoint_direct_field",
+            }
+
+    checkpoint_dir = os.path.dirname(os.path.abspath(ckpt_path))
+    exp_dir = os.path.dirname(checkpoint_dir)
+    run_state_path = os.path.join(exp_dir, "run_state.pt")
+    if os.path.isfile(run_state_path):
+        try:
+            run_state = torch.load(run_state_path, map_location="cpu", weights_only=False)
+        except Exception:
+            run_state = None
+        if isinstance(run_state, dict):
+            for row in run_state.get("rows", []):
+                if not isinstance(row, dict):
+                    continue
+                row_step = row.get("step")
+                if row_step is None or int(row_step) != int(planned_steps):
+                    continue
+                runtime_value = _optional_float(row.get("train_elapsed_sec"))
+                if runtime_value is not None:
+                    return {
+                        "train_wall_clock_sec": float(runtime_value),
+                        "source": "baseline_run_state_rows",
+                    }
+
+    return {"train_wall_clock_sec": None, "source": "unavailable"}
+
+
+def _compute_weighted_accounting(
+    *,
+    cfg,
+    method_name: str,
+    sigma_levels: torch.Tensor,
+    baseline_steps_total: int,
+    history_baseline: Optional[Dict[str, Any]],
+    robust_steps_total: int,
+    history_robust: Dict[str, Any],
+    attack_training_executed: bool,
+    calibration: Dict[str, Any],
+    preserved_baseline_counts: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build method-aware weighted-op counts and totals from training histories."""
+
+    path_steps = max(int(sigma_levels.numel()) - 1, 0)
+    robust_method_supported = True
+    baseline_n_fwd = 0.0
+    baseline_n_fwd_inputgrad = 0.0
+    baseline_n_fwd_parambackward = float(max(int(baseline_steps_total), 0))
+    baseline_count_source = "inferred_from_baseline_steps"
+    if preserved_baseline_counts is not None:
+        baseline_n_fwd = float(preserved_baseline_counts.get("n_fwd", baseline_n_fwd))
+        baseline_n_fwd_inputgrad = float(
+            preserved_baseline_counts.get("n_fwd_inputgrad", baseline_n_fwd_inputgrad)
+        )
+        baseline_n_fwd_parambackward = float(
+            preserved_baseline_counts.get("n_fwd_parambackward", baseline_n_fwd_parambackward)
+        )
+        baseline_count_source = "preserved_resume_counts"
+    else:
+        direct_baseline_counts = read_denoiser_op_count_totals(history_baseline)
+        if direct_baseline_counts is not None:
+            baseline_n_fwd = float(direct_baseline_counts["n_fwd"])
+            baseline_n_fwd_inputgrad = float(direct_baseline_counts["n_fwd_inputgrad"])
+            baseline_n_fwd_parambackward = float(direct_baseline_counts["n_fwd_parambackward"])
+            baseline_count_source = "history_direct"
+
+    robust_n_fwd = 0.0
+    robust_n_fwd_inputgrad = 0.0
+    robust_n_fwd_parambackward = 0.0
+    robust_count_source = "no_robust_phase"
+    if attack_training_executed and robust_steps_total > 0:
+        direct_robust_counts = read_denoiser_op_count_totals(history_robust)
+        if direct_robust_counts is not None:
+            robust_n_fwd = float(direct_robust_counts["n_fwd"])
+            robust_n_fwd_inputgrad = float(direct_robust_counts["n_fwd_inputgrad"])
+            robust_n_fwd_parambackward = float(direct_robust_counts["n_fwd_parambackward"])
+            robust_count_source = "history_direct"
+        elif method_name == "wdro":
+            robust_n_fwd_inputgrad = _sum_float_series(
+                history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
+            )
+            robust_n_fwd_parambackward = float(max(int(robust_steps_total), 0))
+            robust_count_source = "history_inferred_wdro"
+        elif method_name in ("cdro", "v1.1", "1.1"):
+            robust_n_fwd_inputgrad = _sum_float_series(
+                history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
+            )
+            attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
+            if method_name == "cdro":
+                robust_n_fwd = float(path_steps * robust_steps_total) if attack_enabled else 0.0
+            else:
+                robust_n_fwd = float(path_steps * robust_steps_total)
+            active_outer_branches = _count_positive_weight(float(cfg.outer_attack_weight)) + _count_positive_weight(
+                float(cfg.outer_clean_weight)
+            )
+            robust_n_fwd_parambackward = float(path_steps * robust_steps_total * active_outer_branches)
+            robust_count_source = "history_inferred_pathwise"
+        elif method_name == "clean":
+            robust_n_fwd_parambackward = float(max(int(robust_steps_total), 0))
+            robust_count_source = "history_inferred_clean"
+        else:
+            robust_method_supported = False
+            robust_count_source = "unsupported_method"
+
+    baseline_weighted_total = weighted_compute_units(
+        n_fwd=baseline_n_fwd,
+        n_fwd_inputgrad=baseline_n_fwd_inputgrad,
+        n_fwd_parambackward=baseline_n_fwd_parambackward,
+        calibration=calibration,
+    )
+    robust_weighted_total = None
+    if robust_method_supported:
+        robust_weighted_total = weighted_compute_units(
+            n_fwd=robust_n_fwd,
+            n_fwd_inputgrad=robust_n_fwd_inputgrad,
+            n_fwd_parambackward=robust_n_fwd_parambackward,
+            calibration=calibration,
+        )
+    effective_weighted_total = (
+        None
+        if baseline_weighted_total is None or robust_weighted_total is None
+        else float(baseline_weighted_total + robust_weighted_total)
+    )
+    return {
+        "baseline": {
+            "n_fwd": float(baseline_n_fwd),
+            "n_fwd_inputgrad": float(baseline_n_fwd_inputgrad),
+            "n_fwd_parambackward": float(baseline_n_fwd_parambackward),
+            "weighted_compute_units": None if baseline_weighted_total is None else float(baseline_weighted_total),
+            "supported": True,
+            "count_source": baseline_count_source,
+        },
+        "robust": {
+            "n_fwd": float(robust_n_fwd),
+            "n_fwd_inputgrad": float(robust_n_fwd_inputgrad),
+            "n_fwd_parambackward": float(robust_n_fwd_parambackward),
+            "weighted_compute_units": None if robust_weighted_total is None else float(robust_weighted_total),
+            "supported": bool(robust_method_supported),
+            "count_source": robust_count_source,
+        },
+        "effective": {
+            "n_fwd": float(baseline_n_fwd + robust_n_fwd),
+            "n_fwd_inputgrad": float(baseline_n_fwd_inputgrad + robust_n_fwd_inputgrad),
+            "n_fwd_parambackward": float(baseline_n_fwd_parambackward + robust_n_fwd_parambackward),
+            "weighted_compute_units": None if effective_weighted_total is None else float(effective_weighted_total),
+            "supported": bool(robust_method_supported),
+            "count_source": (
+                f"baseline={baseline_count_source};robust={robust_count_source}"
+            ),
+        },
+    }
 
 
 def _print_dataset_info(cfg, dataset: DatasetBundle) -> None:
@@ -173,7 +404,9 @@ def _rollout_for_eval(
 def _empty_baseline_history() -> Dict:
     """Baseline history schema used when loading checkpoints without curves."""
 
-    return {"loss": [], "proxy_weighted_denoise_loss": [], "sigma_counts": []}
+    history = {"loss": [], "proxy_weighted_denoise_loss": [], "sigma_counts": []}
+    ensure_denoiser_op_count_history(history)
+    return history
 
 
 def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_levels: torch.Tensor) -> Dict:
@@ -288,28 +521,29 @@ def _resolve_phase_steps(cfg, method_name: str, train_pool_size: Optional[int] =
     """Resolve baseline/robust step budgets while preserving legacy behavior."""
 
     total_steps = int(cfg.steps)
-    baseline_steps = int(cfg.baseline_steps_override) if int(getattr(cfg, "baseline_steps_override", 0)) > 0 else total_steps
+    baseline_steps_override = int(getattr(cfg, "baseline_steps_override", 0))
+    baseline_steps = int(cfg.baseline_steps_override) if baseline_steps_override > 0 else total_steps
     robust_steps = total_steps
-    split_mode = "legacy_equal_steps"
+    split_mode = "baseline_steps_override" if baseline_steps_override > 0 else "legacy_equal_steps"
 
     wdro_warmup_compute_fraction = None
     wdro_robust_step_batch_equiv = None
     cdro_robust_step_batch_equiv = None
 
     if str(method_name).lower() == "wdro":
-        split_mode = "wdro_paper_style"
-        if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+        split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
+        if baseline_steps_override > 0:
             baseline_steps = int(cfg.baseline_steps_override)
         else:
             baseline_steps = int(total_steps * float(cfg.wdro_warmup_fraction))
         baseline_steps = max(0, min(baseline_steps, total_steps))
         robust_steps = max(total_steps - baseline_steps, 0)
     elif str(method_name).lower() == "cdro":
-        split_mode = "cdro_fixed_fraction_warmup"
-        if int(getattr(cfg, "baseline_steps_override", 0)) > 0:
+        cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
+        split_mode = "cdro_baseline_steps_override" if baseline_steps_override > 0 else "cdro_fixed_fraction_warmup"
+        if baseline_steps_override > 0:
             baseline_steps = int(cfg.baseline_steps_override)
         else:
-            cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
             baseline_steps = int(total_steps * float(getattr(cfg, "cdro_warmup_fraction", 0.0)))
         baseline_steps = max(0, min(baseline_steps, total_steps))
         robust_steps = max(total_steps - baseline_steps, 0)
@@ -409,10 +643,12 @@ def _load_baseline_checkpoint(
     history.setdefault("loss", [])
     history.setdefault("proxy_weighted_denoise_loss", [])
     history.setdefault("sigma_counts", [])
+    ensure_denoiser_op_count_history(history)
     return {
         "history": history,
         "saved_at": payload.get("saved_at"),
         "signature": loaded_signature,
+        "runtime": payload.get("baseline_runtime"),
     }
 
 
@@ -422,6 +658,7 @@ def _save_baseline_checkpoint(
     baseline_eval,
     baseline_history: Dict,
     signature: Dict,
+    baseline_runtime: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist baseline eval model + history + signature for later fair reuse."""
 
@@ -432,6 +669,7 @@ def _save_baseline_checkpoint(
         "baseline_signature": signature,
         "baseline_history": baseline_history,
         "baseline_state_dict": baseline_eval.state_dict(),
+        "baseline_runtime": baseline_runtime,
     }
     tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     torch.save(payload, tmp_path)
@@ -503,6 +741,13 @@ def _save_robust_resume_checkpoint(
             "baseline_batch_equiv_denoiser_evals_total": float(
                 runtime_sec.get("baseline_batch_equiv_denoiser_evals_total", 0.0)
             ),
+            "baseline_train_wall_clock_sec_effective": runtime_sec.get("baseline_train_wall_clock_sec_effective"),
+            "baseline_weighted_counts": {
+                "n_fwd": float(runtime_sec.get("baseline_weighted_n_fwd", 0.0)),
+                "n_fwd_inputgrad": float(runtime_sec.get("baseline_weighted_n_fwd_inputgrad", 0.0)),
+                "n_fwd_parambackward": float(runtime_sec.get("baseline_weighted_n_fwd_parambackward", 0.0)),
+            },
+            "baseline_weighted_compute_units": runtime_sec.get("baseline_weighted_compute_units"),
         },
     }
     tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
@@ -699,6 +944,12 @@ def run_experiment(cfg) -> dict:
         "fid_robust": 0.0,
         "plotting_and_persist": 0.0,
     }
+    accelerator_meta = _device_accounting_metadata(device)
+    weighted_calibration = load_weighted_compute_calibration(
+        calibration_path=str(getattr(cfg, "weighted_compute_calibration_path", "")).strip(),
+        inputgrad_alpha=float(getattr(cfg, "weighted_inputgrad_alpha", 0.0)),
+        parambackward_beta=float(getattr(cfg, "weighted_parambackward_beta", 0.0)),
+    )
 
     ensure_dir(cfg.outdir)
     exp_dir = os.path.join(cfg.outdir, cfg.exp_name)
@@ -718,10 +969,25 @@ def run_experiment(cfg) -> dict:
         )
     print(f"[info] device={device}", flush=True)
     print(
+        "[info] train_hardware "
+        f"accelerator_kind={accelerator_meta['train_accelerator_kind']} "
+        f"accelerator_name={accelerator_meta['train_accelerator_name']} "
+        f"accelerator_count={accelerator_meta['train_accelerator_count']}",
+        flush=True,
+    )
+    print(
         "[info] runtime "
         f"allow_tf32={bool(getattr(cfg, 'allow_tf32', True))} "
         f"cudnn_benchmark={bool(getattr(cfg, 'cudnn_benchmark', True))} "
         f"amp_dtype={format_amp_dtype(amp_dtype)}",
+        flush=True,
+    )
+    print(
+        "[info] weighted_compute "
+        f"available={weighted_calibration['available']} "
+        f"source={weighted_calibration['source']} "
+        f"alpha={weighted_calibration['inputgrad_alpha']} "
+        f"beta={weighted_calibration['parambackward_beta']}",
         flush=True,
     )
     print(f"[info] exp_dir={exp_dir}", flush=True)
@@ -812,6 +1078,8 @@ def run_experiment(cfg) -> dict:
     baseline_ckpt_loaded = False
     baseline_ckpt_saved = False
     baseline_ckpt_saved_at = None
+    baseline_runtime_from_ckpt = None
+    baseline_reference_runtime = {"train_wall_clock_sec": None, "source": "unavailable"}
     robust_resume_payload = None
     robust_resume_loaded = False
     robust_resume_completed_steps = 0
@@ -835,6 +1103,7 @@ def run_experiment(cfg) -> dict:
             baseline_eval = baseline
             baseline_ckpt_loaded = True
             baseline_ckpt_saved_at = load_info.get("saved_at")
+            baseline_runtime_from_ckpt = load_info.get("runtime")
             print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
     if not baseline_ckpt_loaded:
         t_phase = time.perf_counter()
@@ -856,6 +1125,10 @@ def run_experiment(cfg) -> dict:
                     baseline_eval=baseline_eval,
                     baseline_history=history_baseline,
                     signature=baseline_signature,
+                    baseline_runtime={
+                        "step": int(baseline_steps_for_phase),
+                        "train_wall_clock_sec": float(runtime_sec["baseline_train"]),
+                    },
                 )
                 runtime_sec["baseline_ckpt_save"] += float(time.perf_counter() - t_phase)
                 baseline_ckpt_saved = True
@@ -1165,12 +1438,36 @@ def run_experiment(cfg) -> dict:
             abs(diag_gap_ratio_summary["mean_last"]) <= float(cfg.collapse_gap_ratio_tol)
             and diag_delta_ratio_summary["mean_last"] <= float(cfg.collapse_delta_ratio_tol)
         )
+    if baseline_ckpt_loaded and baseline_steps_for_phase > 0:
+        baseline_runtime_value = None
+        if isinstance(baseline_runtime_from_ckpt, dict):
+            baseline_runtime_value = _optional_float(
+                baseline_runtime_from_ckpt.get(
+                    "train_wall_clock_sec",
+                    baseline_runtime_from_ckpt.get("baseline_train_wall_clock_sec"),
+                )
+            )
+        if baseline_runtime_value is not None:
+            baseline_reference_runtime = {
+                "train_wall_clock_sec": float(baseline_runtime_value),
+                "source": "baseline_checkpoint_payload",
+            }
+        else:
+            baseline_reference_runtime = _resolve_baseline_reference_train_wall_clock_sec(
+                ckpt_path=baseline_ckpt_path,
+                planned_steps=baseline_steps_for_phase,
+            )
+    actual_robust_steps_completed = (
+        int(len(history_robust.get("outer_loss", []))) if attack_training_executed else 0
+    )
     preserve_baseline_from_resume = bool(
         robust_resume_loaded
         and isinstance(robust_resume_accounting, dict)
         and (
             "baseline_images_seen_total" in robust_resume_accounting
             or "baseline_batch_equiv_denoiser_evals_total" in robust_resume_accounting
+            or "baseline_train_wall_clock_sec_effective" in robust_resume_accounting
+            or "baseline_weighted_counts" in robust_resume_accounting
         )
     )
     baseline_phase_images_seen_total = int(baseline_steps_for_phase * int(cfg.batch_size))
@@ -1180,7 +1477,7 @@ def run_experiment(cfg) -> dict:
         if preserve_baseline_from_resume
         else baseline_phase_images_seen_total
     )
-    robust_images_seen_total = int(robust_steps_for_phase * int(cfg.batch_size) if attack_training_executed else 0)
+    robust_images_seen_total = int(actual_robust_steps_completed * int(cfg.batch_size) if attack_training_executed else 0)
     effective_train_images_seen_total = int(baseline_images_seen_total + robust_images_seen_total)
     baseline_batch_equiv_total = float(
         robust_resume_accounting.get("baseline_batch_equiv_denoiser_evals_total", 0.0)
@@ -1189,6 +1486,48 @@ def run_experiment(cfg) -> dict:
     )
     robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
     effective_train_batch_equiv_total = float(baseline_batch_equiv_total + robust_batch_equiv_total)
+    baseline_train_wall_clock_sec_effective = (
+        _optional_float(robust_resume_accounting.get("baseline_train_wall_clock_sec_effective"))
+        if preserve_baseline_from_resume
+        else None
+    )
+    baseline_train_wall_clock_source = "robust_resume_accounting"
+    if baseline_train_wall_clock_sec_effective is None:
+        if baseline_steps_for_phase <= 0:
+            baseline_train_wall_clock_sec_effective = 0.0
+            baseline_train_wall_clock_source = "zero_steps"
+        elif runtime_sec["baseline_train"] > 0.0:
+            baseline_train_wall_clock_sec_effective = float(runtime_sec["baseline_train"])
+            baseline_train_wall_clock_source = "executed_in_run"
+        elif baseline_reference_runtime["train_wall_clock_sec"] is not None:
+            baseline_train_wall_clock_sec_effective = float(baseline_reference_runtime["train_wall_clock_sec"])
+            baseline_train_wall_clock_source = str(baseline_reference_runtime["source"])
+        else:
+            baseline_train_wall_clock_source = "missing_reused_baseline_reference_runtime"
+    preserved_baseline_weighted_counts = None
+    if preserve_baseline_from_resume:
+        candidate_counts = robust_resume_accounting.get("baseline_weighted_counts")
+        if isinstance(candidate_counts, dict):
+            preserved_baseline_weighted_counts = candidate_counts
+    weighted_accounting = _compute_weighted_accounting(
+        cfg=cfg,
+        method_name=method_name,
+        sigma_levels=sigma_levels,
+        baseline_steps_total=baseline_steps_for_phase,
+        history_baseline=history_baseline,
+        robust_steps_total=actual_robust_steps_completed,
+        history_robust=history_robust,
+        attack_training_executed=attack_training_executed,
+        calibration=weighted_calibration,
+        preserved_baseline_counts=preserved_baseline_weighted_counts,
+    )
+    runtime_sec["baseline_weighted_n_fwd"] = float(weighted_accounting["baseline"]["n_fwd"])
+    runtime_sec["baseline_weighted_n_fwd_inputgrad"] = float(weighted_accounting["baseline"]["n_fwd_inputgrad"])
+    runtime_sec["baseline_weighted_n_fwd_parambackward"] = float(
+        weighted_accounting["baseline"]["n_fwd_parambackward"]
+    )
+    runtime_sec["baseline_weighted_compute_units"] = weighted_accounting["baseline"]["weighted_compute_units"]
+    runtime_sec["baseline_train_wall_clock_sec_effective"] = baseline_train_wall_clock_sec_effective
 
     metrics = {
         "flow_debug": {
@@ -1215,6 +1554,7 @@ def run_experiment(cfg) -> dict:
             "total_steps_requested": int(phase_steps["total_steps"]),
             "baseline_phase_steps": int(baseline_steps_for_phase),
             "robust_phase_steps": int(robust_steps_for_phase),
+            "robust_phase_steps_completed": int(actual_robust_steps_completed),
             "wdro_reference_warmup_compute_fraction": phase_steps.get("wdro_warmup_compute_fraction"),
             "wdro_reference_robust_step_batch_equiv": phase_steps.get("wdro_robust_step_batch_equiv"),
             "cdro_estimated_robust_step_batch_equiv": phase_steps.get("cdro_robust_step_batch_equiv"),
@@ -1253,8 +1593,38 @@ def run_experiment(cfg) -> dict:
             "baseline_ckpt_saved_at": baseline_ckpt_saved_at,
             "baseline_ckpt_signature_hash": baseline_signature_hash,
             "compute_accounting": {
+                "primary_metric_name": "train_wall_clock_sec",
+                "primary_metric_definition": (
+                    "Effective training-only wall-clock for the planned training budget on fixed hardware, "
+                    "including reused baseline warmup time when a reference runtime is available."
+                ),
+                "secondary_metric_name": "weighted_compute_units",
+                "secondary_metric_definition": (
+                    "Weighted-op budget defined as "
+                    "1*N_fwd + alpha*N_fwd_plus_inputgrad + beta*N_fwd_plus_parambackward, "
+                    "with alpha/beta supplied by a profiler calibration on the same denoiser workload."
+                ),
+                "train_wall_clock_sec": None,
+                "train_gpu_hours": None,
+                "train_wall_clock_complete": None,
+                "train_wall_clock_baseline_source": baseline_train_wall_clock_source,
+                "train_wall_clock_baseline_reference": baseline_reference_runtime,
+                "train_accelerator_kind": accelerator_meta["train_accelerator_kind"],
+                "train_accelerator_name": accelerator_meta["train_accelerator_name"],
+                "train_accelerator_count": int(accelerator_meta["train_accelerator_count"]),
+                "train_gpu_count": int(accelerator_meta["train_gpu_count"]),
+                "weighted_compute_units": weighted_accounting["effective"]["weighted_compute_units"],
+                "baseline_weighted_compute_units": weighted_accounting["baseline"]["weighted_compute_units"],
+                "robust_weighted_compute_units": weighted_accounting["robust"]["weighted_compute_units"],
+                "weighted_compute_calibration": weighted_calibration,
+                "weighted_counts": weighted_accounting,
                 "unit_name": "batch_equiv_denoiser_evals",
                 "unit_definition": (
+                    "One denoiser forward over one training batch counts as 1 unit; "
+                    "a forward over B*T path states counts as T units."
+                ),
+                "legacy_unit_name": "batch_equiv_denoiser_evals",
+                "legacy_unit_definition": (
                     "One denoiser forward over one training batch counts as 1 unit; "
                     "a forward over B*T path states counts as T units."
                 ),
@@ -1700,8 +2070,8 @@ def run_experiment(cfg) -> dict:
         else None
     )
     runtime_sec["robust_steps_per_sec"] = (
-        float(robust_steps_for_phase) / float(runtime_sec["robust_phase"])
-        if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_steps_for_phase > 0
+        float(actual_robust_steps_completed) / float(runtime_sec["robust_phase"])
+        if attack_training_executed and runtime_sec["robust_phase"] > 0 and actual_robust_steps_completed > 0
         else None
     )
     runtime_sec["baseline_images_seen_total"] = baseline_images_seen_total
@@ -1718,14 +2088,16 @@ def run_experiment(cfg) -> dict:
     runtime_sec["run_started_utc"] = str(robust_resume_runtime.get("run_started_utc", run_wall_start))
     runtime_sec["run_finished_utc"] = run_wall_end
     runtime_sec["attack_training_executed"] = bool(attack_training_executed)
+    runtime_sec["weighted_compute_units"] = weighted_accounting["effective"]["weighted_compute_units"]
+    runtime_sec["baseline_weighted_compute_units"] = weighted_accounting["baseline"]["weighted_compute_units"]
+    runtime_sec["robust_weighted_compute_units"] = weighted_accounting["robust"]["weighted_compute_units"]
     if robust_resume_loaded:
-        if method_name == "wdro":
-            runtime_sec["baseline_phase"] = float(runtime_sec["baseline_phase"]) + float(
-                robust_resume_runtime.get("baseline_phase", 0.0)
-            )
-            runtime_sec["baseline_train"] = float(runtime_sec["baseline_train"]) + float(
-                robust_resume_runtime.get("baseline_train", 0.0)
-            )
+        runtime_sec["baseline_phase"] = float(runtime_sec["baseline_phase"]) + float(
+            robust_resume_runtime.get("baseline_phase", 0.0)
+        )
+        runtime_sec["baseline_train"] = float(runtime_sec["baseline_train"]) + float(
+            robust_resume_runtime.get("baseline_train", 0.0)
+        )
         runtime_sec["total"] = float(runtime_sec["total"]) + float(robust_resume_runtime.get("total", 0.0))
         runtime_sec["total_without_fid"] = float(runtime_sec["total_without_fid"]) + float(
             robust_resume_runtime.get("total_without_fid", 0.0)
@@ -1747,8 +2119,8 @@ def run_experiment(cfg) -> dict:
             else None
         )
         runtime_sec["robust_steps_per_sec"] = (
-            float(robust_steps_for_phase) / float(runtime_sec["robust_phase"])
-            if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_steps_for_phase > 0
+            float(actual_robust_steps_completed) / float(runtime_sec["robust_phase"])
+            if attack_training_executed and runtime_sec["robust_phase"] > 0 and actual_robust_steps_completed > 0
             else None
         )
         runtime_sec["robust_batch_equiv_denoiser_evals_per_sec"] = (
@@ -1756,9 +2128,42 @@ def run_experiment(cfg) -> dict:
             if attack_training_executed and runtime_sec["robust_phase"] > 0 and robust_batch_equiv_total > 0
             else None
         )
+    train_wall_clock_complete = baseline_train_wall_clock_sec_effective is not None
+    train_wall_clock_sec = (
+        None
+        if not train_wall_clock_complete
+        else float(baseline_train_wall_clock_sec_effective + float(runtime_sec["robust_phase"]))
+    )
+    train_gpu_hours = (
+        None
+        if train_wall_clock_sec is None
+        else float(train_wall_clock_sec) * float(accelerator_meta["train_gpu_count"]) / 3600.0
+    )
+    runtime_sec["train_wall_clock_sec"] = train_wall_clock_sec
+    runtime_sec["train_gpu_hours"] = train_gpu_hours
+    runtime_sec["train_wall_clock_complete"] = bool(train_wall_clock_complete)
+    runtime_sec["baseline_train_wall_clock_sec_effective_source"] = baseline_train_wall_clock_source
+    runtime_sec["baseline_reference_train_wall_clock_sec"] = baseline_reference_runtime["train_wall_clock_sec"]
+    runtime_sec["baseline_reference_train_wall_clock_source"] = baseline_reference_runtime["source"]
+
+    metrics["flow_debug"]["compute_accounting"]["train_wall_clock_sec"] = train_wall_clock_sec
+    metrics["flow_debug"]["compute_accounting"]["train_gpu_hours"] = train_gpu_hours
+    metrics["flow_debug"]["compute_accounting"]["train_wall_clock_complete"] = bool(train_wall_clock_complete)
+    metrics["flow_debug"]["compute_accounting"]["baseline_weighted_compute_units"] = (
+        weighted_accounting["baseline"]["weighted_compute_units"]
+    )
+    metrics["flow_debug"]["compute_accounting"]["robust_weighted_compute_units"] = (
+        weighted_accounting["robust"]["weighted_compute_units"]
+    )
+    metrics["flow_debug"]["compute_accounting"]["weighted_compute_units"] = (
+        weighted_accounting["effective"]["weighted_compute_units"]
+    )
 
     metrics["flow_debug"]["runtime"] = runtime_sec
     metrics["flow_debug"]["runtime_total_sec"] = float(runtime_sec["total"])
+    metrics["flow_debug"]["train_wall_clock_sec"] = train_wall_clock_sec
+    metrics["flow_debug"]["train_gpu_hours"] = train_gpu_hours
+    metrics["flow_debug"]["weighted_compute_units"] = weighted_accounting["effective"]["weighted_compute_units"]
     metrics["flow_debug"]["robust_resume_loaded"] = bool(robust_resume_loaded)
     metrics["flow_debug"]["robust_resume_ckpt_path"] = robust_resume_path or None
     metrics["flow_debug"]["robust_resume_completed_steps"] = int(robust_resume_completed_steps)
@@ -1842,7 +2247,9 @@ def run_experiment(cfg) -> dict:
         f" robust_phase={runtime_sec['robust_phase']:.2f}s,"
         f" post_eval={runtime_sec['post_train_eval']:.2f}s,"
         f" fid_baseline={runtime_sec['fid_baseline']:.2f}s,"
-        f" fid_robust={runtime_sec['fid_robust']:.2f}s",
+        f" fid_robust={runtime_sec['fid_robust']:.2f}s,"
+        f" train_wall_clock_sec={runtime_sec['train_wall_clock_sec']}"
+        f" weighted_compute_units={runtime_sec['weighted_compute_units']}",
         flush=True,
     )
     print(f"[result] artifacts saved to: {exp_dir}", flush=True)

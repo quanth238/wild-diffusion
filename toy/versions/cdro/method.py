@@ -9,7 +9,7 @@ from .trainer import train_trajectory_robust_cdro
 NAME = "cdro"
 IMPLEMENTED = True
 DESCRIPTION = (
-    "Route-A CDRO path attack: beta-space greedy ascent with exact uniform local caps "
+    "Route-A CDRO path attack: beta-space greedy ascent with sigma-time-weighted local caps "
     "on the Jiang-style additive-drift cost, no learned attack policy."
 )
 
@@ -45,7 +45,7 @@ def rollout_eval(
 
 
 def build_constraint_radii_for_method(*, cfg, sigma_levels):
-    """Method-scoped helper used by experiment metrics for exact CDRO cap statistics."""
+    """Method-scoped helper used by experiment metrics for exact sigma-time CDRO cap statistics."""
 
     return build_constraint_radii_impl(
         sigma_levels=sigma_levels,

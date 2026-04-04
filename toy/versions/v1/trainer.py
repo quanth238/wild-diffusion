@@ -2,6 +2,7 @@ from typing import Callable, Optional
 
 import torch
 
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
@@ -91,6 +92,7 @@ def train_trajectory_robust_energy(
         "diag_path_delta_mean": [],
         "diag_terminal_delta_mean": [],
     }
+    ensure_denoiser_op_count_history(history)
 
     for step in range(1, cfg.steps + 1):
         lambda_value = float(lambda_dual.item())
@@ -122,6 +124,7 @@ def train_trajectory_robust_energy(
         last_delta_norm_max = 0.0
         last_delta_ratio_mean = 0.0
         last_delta_ratio_max = 0.0
+        attack_construction_units = 0.0
 
         if control_updates_enabled and phi_lr_scale > 0.0 and cfg.inner_steps > 0:
             for _ in range(cfg.inner_steps):
@@ -157,6 +160,7 @@ def train_trajectory_robust_energy(
                 delta_ratio = delta_l2 / radius.clamp_min(1e-8)
                 last_delta_ratio_mean = scalarize(delta_ratio.mean())
                 last_delta_ratio_max = scalarize(delta_ratio.max())
+            attack_construction_units = float(max(int(cfg.inner_steps), 0))
 
         set_requires_grad(denoiser, True)
         set_requires_grad(control, False)
@@ -223,6 +227,12 @@ def train_trajectory_robust_energy(
         history["sched_attack_weight"].append(float(attack_weight))
         history["sched_clean_weight"].append(float(clean_weight))
         history["sched_phi_lr_scale"].append(float(phi_lr_scale))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(attack_construction_units),
+            n_fwd_parambackward=float(int(attack_weight > 0.0) + int(clean_weight > 0.0)),
+        )
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)

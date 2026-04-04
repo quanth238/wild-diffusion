@@ -3,6 +3,7 @@ from typing import Callable, Optional
 
 import torch
 
+from ..compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ..models import set_requires_grad
 from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
@@ -25,6 +26,7 @@ def train_baseline(
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     history = {"loss": [], "proxy_weighted_denoise_loss": []}
+    ensure_denoiser_op_count_history(history)
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
@@ -73,6 +75,12 @@ def train_baseline(
                 with autocast_context(sigma_levels.device, amp_dtype):
                     proxy_loss = weighted_denoise_loss(denoiser, x_noisy, x0, sigma, cfg.sigma_data)
         history["proxy_weighted_denoise_loss"].append(scalarize(proxy_loss))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=1.0,
+        )
 
         if step % cfg.log_every == 0:
             if str(getattr(cfg, "training_objective", "edm")).lower() == "edm":

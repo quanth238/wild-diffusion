@@ -2,6 +2,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
@@ -174,6 +175,7 @@ def train_trajectory_robust_wild(
         "batch_equiv_denoiser_evals_clean_eval": [],
         "batch_equiv_denoiser_evals_cumulative": [],
     }
+    ensure_denoiser_op_count_history(history)
     for key in (
         "outer_loss",
         "outer_loss_attack",
@@ -334,6 +336,12 @@ def train_trajectory_robust_wild(
         history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
         history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(attack_construction_units),
+            n_fwd_parambackward=float(int(attack_weight > 0.0) + int(clean_weight > 0.0)),
+        )
 
         if step % cfg.log_every == 0:
             print(

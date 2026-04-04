@@ -4,6 +4,7 @@ from typing import Callable, Optional
 import torch
 
 from ...app.utils import empty_robust_history
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss
 from ...shared.runtime import autocast_context, resolve_amp_dtype
@@ -42,6 +43,7 @@ def train_trajectory_robust_clean(
     history = history_state if history_state is not None else empty_robust_history()
     for key in empty_robust_history():
         history.setdefault(key, [])
+    ensure_denoiser_op_count_history(history)
     cumulative_batch_equiv_evals = (
         float(history["batch_equiv_denoiser_evals_cumulative"][-1])
         if history["batch_equiv_denoiser_evals_cumulative"]
@@ -108,6 +110,12 @@ def train_trajectory_robust_clean(
         history["batch_equiv_denoiser_evals_attack_eval"].append(0.0)
         history["batch_equiv_denoiser_evals_clean_eval"].append(1.0)
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=1.0,
+        )
 
         if step % cfg.log_every == 0:
             print(

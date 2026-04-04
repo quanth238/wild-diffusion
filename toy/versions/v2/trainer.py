@@ -2,6 +2,7 @@ from typing import Callable, Optional
 
 import torch
 
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
@@ -116,6 +117,7 @@ def train_trajectory_robust_constrained(
         "batch_equiv_denoiser_evals_cumulative",
     ):
         history.setdefault(key, [])
+    ensure_denoiser_op_count_history(history)
     cumulative_batch_equiv_evals = float(history["batch_equiv_denoiser_evals_cumulative"][-1]) if history["batch_equiv_denoiser_evals_cumulative"] else 0.0
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
@@ -246,6 +248,12 @@ def train_trajectory_robust_constrained(
         history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
         history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(attack_construction_units),
+            n_fwd_parambackward=float(int(attack_weight > 0.0) + int(clean_weight > 0.0)),
+        )
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)

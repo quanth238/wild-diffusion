@@ -1,4 +1,3 @@
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,19 +35,57 @@ def build_time_deltas(
     sigma_levels: torch.Tensor,
     time_horizon: float,
 ) -> torch.Tensor:
-    """Build a uniform physical-time grid used by the Route-A beta parameterization."""
+    """Build sigma-induced auxiliary-time deltas over the positive VE ladder.
+
+    The clean anchor `sigma_0 = 0` is treated as a boundary condition, not as part of
+    the log-sigma control clock. Consequently the first hop `0 -> sigma_min` receives
+    zero sigma-time, while positive-noise hops are spaced by normalized log-sigma and
+    scaled to `time_horizon`.
+    """
 
     n_steps = int(sigma_levels.numel() - 1)
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
     if time_horizon <= 0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
-    return torch.full(
-        (n_steps,),
-        float(time_horizon) / float(n_steps),
-        device=sigma_levels.device,
-        dtype=sigma_levels.dtype,
-    )
+
+    if n_steps == 1:
+        return torch.full(
+            (1,),
+            float(time_horizon),
+            device=sigma_levels.device,
+            dtype=sigma_levels.dtype,
+        )
+
+    positive_sigma = sigma_levels[1:]
+    if torch.any(positive_sigma <= 0):
+        raise ValueError("sigma_levels[1:] must be strictly positive for the log-sigma CDRO clock.")
+
+    dt = torch.zeros((n_steps,), device=sigma_levels.device, dtype=sigma_levels.dtype)
+    log_sigma = positive_sigma.log()
+    log_span = log_sigma[-1] - log_sigma[0]
+    if float(log_span.abs().item()) <= 1e-12:
+        dt[1:] = float(time_horizon) / float(n_steps - 1)
+        return dt
+
+    tau = float(time_horizon) * (log_sigma - log_sigma[0]) / log_span
+    dt[1:] = tau[1:] - tau[:-1]
+    return dt
+
+
+def _build_beta_budget_by_step(
+    sigma_levels: torch.Tensor,
+    total_budget: float,
+    time_horizon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sigma-time deltas and matching per-step beta-space budget shares."""
+
+    dt = build_time_deltas(sigma_levels, time_horizon)
+    total_tau = float(dt.sum().item())
+    if total_tau <= 0:
+        raise ValueError("sigma-induced CDRO time grid must have positive total length.")
+    beta_budget_by_step = float(total_budget) * dt / total_tau
+    return dt, beta_budget_by_step
 
 
 def build_constraint_radii(
@@ -56,7 +93,7 @@ def build_constraint_radii(
     total_budget: float,
     time_horizon: float,
 ) -> torch.Tensor:
-    """Exact Route-A uniform local cap expressed in state-increment (`delta`) space."""
+    """Exact Route-A local cap expressed in state-increment (`delta`) space."""
 
     n_steps = int(sigma_levels.numel() - 1)
     if n_steps <= 0:
@@ -64,28 +101,20 @@ def build_constraint_radii(
     if total_budget < 0:
         raise ValueError(f"total_budget must be >= 0, got {total_budget}")
 
-    dt = build_time_deltas(sigma_levels, time_horizon)
-    weight = float(total_budget) / float(n_steps)
-    radius_sq = dt * weight
+    dt, beta_budget_by_step = _build_beta_budget_by_step(sigma_levels, total_budget, time_horizon)
+    radius_sq = dt * beta_budget_by_step
     return torch.sqrt(radius_sq.clamp_min(0.0))
 
 
-def _beta_radius(
-    *,
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    n_steps: int,
+def _build_beta_radii_by_step(
+    sigma_levels: torch.Tensor,
     total_budget: float,
+    time_horizon: float,
 ) -> torch.Tensor:
-    """Uniform local cap radius in beta-space: ||beta_k||^2 <= rho / K."""
+    """Per-step beta-space radii with ||beta_k||^2 <= rho * Delta tau_k / T_tau."""
 
-    return torch.full(
-        (batch_size,),
-        math.sqrt(max(float(total_budget), 0.0) / float(max(n_steps, 1))),
-        device=device,
-        dtype=dtype,
-    )
+    _, beta_budget_by_step = _build_beta_budget_by_step(sigma_levels, total_budget, time_horizon)
+    return torch.sqrt(beta_budget_by_step.clamp_min(0.0))
 
 
 def _as_sigma_batch(value: torch.Tensor, batch_size: int, x_ref: torch.Tensor) -> torch.Tensor:
@@ -115,7 +144,7 @@ def rollout_path_heuristic_attack(
     time_horizon: float,
     eps_schedule: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
-    """Greedy Route-A CDRO attack: beta-space local ascent with exact uniform local caps."""
+    """Greedy Route-A CDRO attack with sigma-time-weighted local beta caps."""
 
     batch_size = x0.shape[0]
     n_steps = int(sigma_levels.numel() - 1)
@@ -131,14 +160,8 @@ def rollout_path_heuristic_attack(
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
 
     dt = build_time_deltas(sigma_levels, time_horizon)
-    sqrt_dt = torch.sqrt(dt.clamp_min(1e-12))
-    beta_radius = _beta_radius(
-        batch_size=batch_size,
-        device=x0.device,
-        dtype=x0.dtype,
-        n_steps=n_steps,
-        total_budget=total_budget,
-    )
+    sqrt_dt = torch.sqrt(dt.clamp_min(0.0))
+    beta_radius_by_step = _build_beta_radii_by_step(sigma_levels, total_budget, time_horizon)
     amp_dtype = resolve_amp_dtype(x0.device, getattr(cfg, "amp_dtype", "auto"))
 
     x_ref = x0.detach()
@@ -163,20 +186,24 @@ def rollout_path_heuristic_attack(
         sigma_batch = _as_sigma_batch(sigma_next, batch_size, x0)
 
         beta = torch.zeros_like(x_ctrl)
-        if int(inner_steps) == 1:
+        step_sqrt_dt = float(sqrt_dt[k].item())
+        step_beta_radius = float(beta_radius_by_step[k].item())
+        if step_sqrt_dt > 0.0 and step_beta_radius > 0.0 and int(inner_steps) == 1:
             # With one inner step, solve the linearized local-cap problem exactly:
-            # max_{||beta|| <= sqrt(rho/K)} <grad, beta>.
+            # max_{||beta|| <= sqrt(rho_k)} <grad, beta> where rho_k = rho * Delta tau_k / T_tau.
             beta = beta.requires_grad_(True)
-            candidate = x_nominal_next + float(sqrt_dt[k].item()) * beta
+            candidate = x_nominal_next + step_sqrt_dt * beta
             with autocast_context(x0.device, amp_dtype):
                 step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
             grad = torch.autograd.grad(step_loss, beta)[0]
             grad_unit = _l2_normalize_per_sample(grad)
+            beta_radius = torch.full((batch_size,), step_beta_radius, device=x0.device, dtype=x0.dtype)
             beta = (grad_unit.reshape(batch_size, -1) * beta_radius[:, None]).reshape_as(grad).detach()
-        else:
+        elif step_sqrt_dt > 0.0 and step_beta_radius > 0.0:
+            beta_radius = torch.full((batch_size,), step_beta_radius, device=x0.device, dtype=x0.dtype)
             for _ in range(int(inner_steps)):
                 beta.requires_grad_(True)
-                candidate = x_nominal_next + float(sqrt_dt[k].item()) * beta
+                candidate = x_nominal_next + step_sqrt_dt * beta
                 with autocast_context(x0.device, amp_dtype):
                     step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
                 grad = torch.autograd.grad(step_loss, beta)[0]
@@ -186,7 +213,7 @@ def rollout_path_heuristic_attack(
                 beta = (beta + step).detach()
                 beta = project_l2_ball(beta, beta_radius).detach()
 
-        delta_effective = float(sqrt_dt[k].item()) * beta
+        delta_effective = step_sqrt_dt * beta
         candidate_final = (x_nominal_next + delta_effective).detach()
         x_ref = reference_state
         x_ctrl = candidate_final

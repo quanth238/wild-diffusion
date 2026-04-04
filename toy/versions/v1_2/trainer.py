@@ -2,6 +2,7 @@ from typing import Callable, Optional
 
 import torch
 
+from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
 from ...shared.objective import inner_objective_attack_only
 from ...shared.train_utils import sample_train_batch
@@ -295,6 +296,7 @@ def train_trajectory_robust_constrained(
         "diag_path_delta_mean": [],
         "diag_terminal_delta_mean": [],
     }
+    ensure_denoiser_op_count_history(history)
 
     # CDRO-EDM does not optimize a persistent control policy network.
     del sigma_levels
@@ -322,6 +324,7 @@ def train_trajectory_robust_constrained(
         activation = _activation_scale(step, cfg)
         set_requires_grad(denoiser, False)
         lambda_prev = float(lambda_dual)
+        attack_construction_units = float(max(int(cfg.inner_steps), 0))
         attack = _build_cdro_batch(
             cfg=cfg,
             denoiser=denoiser,
@@ -395,6 +398,12 @@ def train_trajectory_robust_constrained(
         history["transport_inner"].append(float(last_transport))
         history["delta_norm_mean"].append(last_delta_norm_mean)
         history["delta_norm_max"].append(last_delta_norm_max)
+        append_denoiser_op_count_step(
+            history,
+            n_fwd=0.0,
+            n_fwd_inputgrad=float(attack_construction_units),
+            n_fwd_parambackward=float(int(robust_mix > 0.0) + int((1.0 - robust_mix) > 0.0)),
+        )
 
         if step % cfg.log_every == 0:
             print(
