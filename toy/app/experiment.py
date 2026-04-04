@@ -817,6 +817,7 @@ def _save_robust_resume_checkpoint(
     ckpt_path: str,
     cfg,
     method,
+    baseline_eval,
     robust,
     control,
     history_robust: Dict[str, Any],
@@ -839,6 +840,7 @@ def _save_robust_resume_checkpoint(
         "method_version": str(cfg.method_version),
         "completed_steps": int(trainer_state.get("completed_steps", cfg.steps)),
         "history_robust": history_robust,
+        "baseline_state_dict": baseline_eval.state_dict(),
         "robust_state_dict": resume_robust_state_dict,
         "control_state_dict": control.state_dict(),
         "trainer_state": trainer_state,
@@ -1210,8 +1212,27 @@ def run_experiment(cfg) -> dict:
     robust_resume_path = str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
     robust_save_path = str(getattr(cfg, "robust_save_ckpt_path", "")).strip()
     t_baseline_phase = time.perf_counter()
+    baseline_restored_from_robust_resume = False
 
-    if baseline_ckpt_enabled and os.path.isfile(baseline_ckpt_path) and not baseline_ckpt_force_retrain:
+    if robust_resume_path:
+        robust_resume_payload = _load_robust_resume_checkpoint(
+            ckpt_path=robust_resume_path,
+            method_name=str(getattr(method, "NAME", cfg.method_version)).lower(),
+        )
+        baseline_state_dict = robust_resume_payload.get("baseline_state_dict")
+        if isinstance(baseline_state_dict, dict):
+            baseline.load_state_dict(baseline_state_dict, strict=True)
+            history_baseline = _empty_baseline_history()
+            baseline_eval = baseline
+            baseline_restored_from_robust_resume = True
+            print(f"[baseline] restored from robust resume: {robust_resume_path}", flush=True)
+
+    if (
+        not baseline_restored_from_robust_resume
+        and baseline_ckpt_enabled
+        and os.path.isfile(baseline_ckpt_path)
+        and not baseline_ckpt_force_retrain
+    ):
         t_phase = time.perf_counter()
         load_info = _load_baseline_checkpoint(
             baseline_model=baseline,
@@ -1227,7 +1248,7 @@ def run_experiment(cfg) -> dict:
             baseline_ckpt_saved_at = load_info.get("saved_at")
             baseline_runtime_from_ckpt = load_info.get("runtime")
             print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
-    if not baseline_ckpt_loaded:
+    if not baseline_restored_from_robust_resume and not baseline_ckpt_loaded:
         t_phase = time.perf_counter()
         if baseline_steps_for_phase > 0:
             history_baseline, baseline_eval = train_baseline(
@@ -1262,10 +1283,6 @@ def run_experiment(cfg) -> dict:
     baseline_eval.eval()
     robust.load_state_dict(baseline_eval.state_dict())
     if robust_resume_path:
-        robust_resume_payload = _load_robust_resume_checkpoint(
-            ckpt_path=robust_resume_path,
-            method_name=str(getattr(method, "NAME", cfg.method_version)).lower(),
-        )
         robust.load_state_dict(robust_resume_payload["robust_state_dict"], strict=True)
         if "control_state_dict" in robust_resume_payload:
             control.load_state_dict(robust_resume_payload["control_state_dict"], strict=True)
@@ -2308,6 +2325,7 @@ def run_experiment(cfg) -> dict:
             ckpt_path=robust_save_path,
             cfg=cfg_robust,
             method=method,
+            baseline_eval=baseline_eval,
             robust=robust,
             control=control,
             history_robust=history_robust,
