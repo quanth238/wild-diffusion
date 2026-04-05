@@ -74,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Collect raw per-seed baseline, WDRO, and CDRO data on a shared weighted-compute grid. "
+            "Baseline evaluates both comparison knots and auxiliary warmup-support checkpoints. "
             "WDRO/CDRO use independent per-knot runs with native relative warmup; aggregation is deferred "
             "to later analysis."
         )
@@ -163,6 +164,24 @@ def write_csv(path: str, rows: List[Dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _encode_float_list(values: Iterable[float]) -> str:
+    return ",".join(f"{float(value):.12g}" for value in values)
+
+
+def _encode_str_list(values: Iterable[str]) -> str:
+    return ",".join(str(value) for value in values)
+
+
+def _row_role_label(*, is_comparison_knot: bool, is_aux_warmup_support: bool) -> str:
+    if is_comparison_knot and is_aux_warmup_support:
+        return "comparison_knot+aux_warmup_support"
+    if is_comparison_knot:
+        return "comparison_knot"
+    if is_aux_warmup_support:
+        return "aux_warmup_support"
+    return "unlabeled"
 
 
 def run_command(*, cmd: List[str], log_path: str) -> None:
@@ -634,7 +653,12 @@ def _normalize_method_metrics_row(
     out["method"] = str(method_name)
     out["seed"] = int(seed)
     out["row_origin"] = str(row_origin)
+    out["row_role"] = "comparison_knot"
+    out["is_comparison_knot"] = True
+    out["is_aux_warmup_support"] = False
     out["weighted_grid_target"] = float(weighted_grid_target)
+    out["comparison_weighted_targets"] = _encode_float_list([float(weighted_grid_target)])
+    out["warmup_support_methods"] = ""
     out["trajectory_total_steps_max"] = int(trajectory_total_steps_max)
     out["fixed_warmup_steps"] = int(fixed_warmup_steps)
     return out
@@ -908,11 +932,32 @@ def main() -> None:
         )
         for total_steps in cdro_curve_steps
     }
+    wdro_warmup_support_steps = sorted(
+        {
+            int(step)
+            for step in wdro_warmup_steps_by_total.values()
+            if int(step) > 0
+        }
+    )
+    cdro_warmup_support_steps = sorted(
+        {
+            int(step)
+            for step in cdro_warmup_steps_by_total.values()
+            if int(step) > 0
+        }
+    )
     baseline_run_steps = sorted(
         {
             int(step)
-            for step in baseline_curve_steps
-            if step > 0
+            for step in list(baseline_curve_steps) + wdro_warmup_support_steps + cdro_warmup_support_steps
+            if int(step) > 0
+        }
+    )
+    auxiliary_baseline_support_steps = sorted(
+        {
+            int(step)
+            for step in baseline_run_steps
+            if int(step) not in {int(value) for value in baseline_curve_steps}
         }
     )
 
@@ -936,6 +981,7 @@ def main() -> None:
     )
     print(f"[collect-weighted] weighted_targets={weighted_grid_targets}", flush=True)
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
+    print(f"[collect-weighted] baseline_aux_support_steps={auxiliary_baseline_support_steps}", flush=True)
     print(f"[collect-weighted] wdro_steps={wdro_curve_steps}", flush=True)
     print(f"[collect-weighted] cdro_steps={cdro_curve_steps}", flush=True)
 
@@ -1016,13 +1062,32 @@ def main() -> None:
     baseline_ckpt_by_seed_step = {
         (int(row["seed"]), int(row["step"])): row.get("checkpoint_path", "") for row in baseline_raw if row.get("checkpoint_path")
     }
-    weighted_target_by_baseline_step = {
-        int(step): float(target) for step, target in zip(baseline_curve_steps, weighted_grid_targets)
-    }
+    comparison_targets_by_step: Dict[int, List[float]] = {}
+    for step, target in zip(baseline_curve_steps, weighted_grid_targets):
+        comparison_targets_by_step.setdefault(int(step), []).append(float(target))
+    warmup_support_methods_by_step: Dict[int, set] = {}
+    for step in wdro_warmup_support_steps:
+        warmup_support_methods_by_step.setdefault(int(step), set()).add("wdro")
+    for step in cdro_warmup_support_steps:
+        warmup_support_methods_by_step.setdefault(int(step), set()).add("cdro")
     for row in baseline_raw:
-        row["weighted_grid_target"] = weighted_target_by_baseline_step.get(int(row["step"]))
-        row["trajectory_total_steps_max"] = max((int(step) for step in baseline_curve_steps), default=0)
+        step = int(row["step"])
+        comparison_targets = comparison_targets_by_step.get(step, [])
+        warmup_support_methods = sorted(warmup_support_methods_by_step.get(step, set()))
+        is_comparison_knot = bool(comparison_targets)
+        is_aux_warmup_support = bool(warmup_support_methods)
+        row["weighted_grid_target"] = comparison_targets[0] if len(comparison_targets) == 1 else None
+        row["comparison_weighted_targets"] = _encode_float_list(comparison_targets)
+        row["warmup_support_methods"] = _encode_str_list(warmup_support_methods)
+        row["row_role"] = _row_role_label(
+            is_comparison_knot=is_comparison_knot,
+            is_aux_warmup_support=is_aux_warmup_support,
+        )
+        row["is_comparison_knot"] = bool(is_comparison_knot)
+        row["is_aux_warmup_support"] = bool(is_aux_warmup_support)
+        row["trajectory_total_steps_max"] = max((int(step) for step in baseline_run_steps), default=0)
         row["fixed_warmup_steps"] = 0
+    baseline_all_eval_rows = list(baseline_raw)
     baseline_target_rows: List[Dict] = []
     for seed in seeds:
         for target_weighted, total_steps in zip(weighted_grid_targets, baseline_curve_steps):
@@ -1030,7 +1095,13 @@ def main() -> None:
             if baseline_row is None:
                 raise RuntimeError(f"Missing baseline raw row for seed={seed} step={total_steps}")
             row = dict(baseline_row)
+            row["is_comparison_knot"] = True
             row["weighted_grid_target"] = float(target_weighted)
+            row["comparison_weighted_targets"] = _encode_float_list([float(target_weighted)])
+            row["row_role"] = _row_role_label(
+                is_comparison_knot=True,
+                is_aux_warmup_support=bool(row.get("is_aux_warmup_support", False)),
+            )
             row["trajectory_total_steps_max"] = max((int(step) for step in baseline_curve_steps), default=0)
             row["fixed_warmup_steps"] = 0
             baseline_target_rows.append(row)
@@ -1167,10 +1238,12 @@ def main() -> None:
     combined_raw = baseline_target_rows + wdro_rows + cdro_rows
     combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
 
+    baseline_all_eval_raw_csv = os.path.join(args.outdir, f"{args.prefix}_baseline_all_eval_raw_seed_rows.csv")
     baseline_raw_csv = os.path.join(args.outdir, f"{args.prefix}_baseline_raw_seed_rows.csv")
     wdro_raw_csv = os.path.join(args.outdir, f"{args.prefix}_wdro_raw_seed_rows.csv")
     cdro_raw_csv = os.path.join(args.outdir, f"{args.prefix}_cdro_raw_seed_rows.csv")
     combined_raw_csv = os.path.join(args.outdir, f"{args.prefix}_all_methods_raw_seed_rows.csv")
+    write_csv(baseline_all_eval_raw_csv, baseline_all_eval_rows)
     write_csv(baseline_raw_csv, baseline_target_rows)
     write_csv(wdro_raw_csv, wdro_rows)
     write_csv(cdro_raw_csv, cdro_rows)
@@ -1183,7 +1256,9 @@ def main() -> None:
                 "Raw per-seed data collection on a shared weighted-compute grid. Baseline is a native "
                 "checkpointed single trajectory. WDRO and CDRO are independent per-knot runs whose "
                 "warmup budgets are recomputed from each knot's total budget using their native relative "
-                "warmup rules. Aggregation is intentionally deferred to later analysis."
+                "warmup rules. The baseline sweep also evaluates auxiliary warmup-support checkpoints so "
+                "same-seed exact checkpoint transfer is available when possible. Aggregation is intentionally "
+                "deferred to later analysis."
             ),
             "seeds": seeds,
             "shared_grid_template_name": "wdro_dense_25_relative",
@@ -1193,6 +1268,7 @@ def main() -> None:
             "secondary_metric": "train_wall_clock_sec",
             "legacy_metric": "batch_equiv_denoiser_evals",
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
+            "baseline_auxiliary_eval_points_enabled": True,
             "same_seed_baseline_checkpoint_transfer": "opportunistic_exact_match_only",
             "implicit_outdir_baseline_cache_reuse": False,
             "cross_seed_checkpoint_reuse": False,
@@ -1211,24 +1287,29 @@ def main() -> None:
         "trajectories": {
             "baseline": {
                 "max_total_steps": max(baseline_run_steps) if baseline_run_steps else 0,
+                "comparison_steps": baseline_curve_steps,
+                "auxiliary_warmup_support_steps": auxiliary_baseline_support_steps,
                 "checkpoint_steps": baseline_run_steps,
             },
             "wdro": {
                 "max_total_steps": int(args.wdro_max_total_steps),
                 "warmup_mode": "per_point_fraction",
                 "max_total_warmup_steps": int(wdro_max_total_warmup_steps),
+                "warmup_support_steps": wdro_warmup_support_steps,
                 "checkpoint_steps": wdro_curve_steps,
             },
             "cdro": {
                 "max_total_steps": int(cdro_max_total_steps),
                 "warmup_mode": "per_point_weighted_match",
                 "max_total_warmup_steps": int(cdro_fixed_warmup_steps),
+                "warmup_support_steps": cdro_warmup_support_steps,
                 "checkpoint_steps": cdro_curve_steps,
             },
         },
         "artifacts": {
             "baseline_runs_csv": baseline_runs_csv,
             "baseline_aggregate_csv": baseline_agg_csv,
+            "baseline_all_eval_raw_csv": baseline_all_eval_raw_csv,
             "baseline_raw_csv": baseline_raw_csv,
             "wdro_raw_csv": wdro_raw_csv,
             "cdro_raw_csv": cdro_raw_csv,
@@ -1243,6 +1324,7 @@ def main() -> None:
     with open(manifest_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
 
+    print(f"[collect-weighted] wrote {baseline_all_eval_raw_csv}", flush=True)
     print(f"[collect-weighted] wrote {baseline_raw_csv}", flush=True)
     print(f"[collect-weighted] wrote {wdro_raw_csv}", flush=True)
     print(f"[collect-weighted] wrote {cdro_raw_csv}", flush=True)
