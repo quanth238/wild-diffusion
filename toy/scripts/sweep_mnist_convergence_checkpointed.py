@@ -40,6 +40,7 @@ if __package__ is None or __package__ == "":
     from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
     from toy.model_backends.provider import build_model_bundle
     from toy.models import set_requires_grad
+    from toy.process_title import apply_process_title, build_process_title
     from toy.shared.objective import compute_training_loss, weighted_denoise_loss
     from toy.shared.reverse import sample_reverse_paths
     from toy.shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
@@ -52,11 +53,15 @@ else:
     from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
     from ..model_backends.provider import build_model_bundle
     from ..models import set_requires_grad
+    from ..process_title import apply_process_title, build_process_title
     from ..shared.objective import compute_training_loss, weighted_denoise_loss
     from ..shared.reverse import sample_reverse_paths
     from ..shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
     from ..shared.train_utils import sample_train_batch
     from ..utils import batch_scalar_like, ensure_dir, has_nan_or_inf, pick_device, scalarize, set_seed
+
+
+_APPLIED_PROCESS_TITLE = apply_process_title()
 
 
 def _repo_root() -> Path:
@@ -1223,6 +1228,8 @@ def build_parser():
 
 def main() -> None:
     args = build_parser().parse_args()
+    if _APPLIED_PROCESS_TITLE is None:
+        apply_process_title(build_process_title("wdiff", "baseline", args.prefix))
     seeds = _parse_int_list(args.seeds, allow_zero=True)
     train_percents = _parse_float_list(args.train_percents)
     if str(args.mimg_list).strip():

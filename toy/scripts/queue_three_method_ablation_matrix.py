@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
@@ -13,6 +13,12 @@ import matplotlib.pyplot as plt
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+
+
+from toy.process_title import apply_process_title, build_process_title, child_process_env
+
+
+_APPLIED_PROCESS_TITLE = apply_process_title()
 
 
 DEFAULT_TRAIN_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "train")
@@ -170,6 +176,212 @@ SUMMARY_GROUPS = {
     "cdro_rho": ["warm05_default", "warm05_rho0p05", "warm05_rho0p01"],
     "cdro_n_steps": ["warm05_default", "warm05_n12", "warm05_n32"],
 }
+
+
+def _format_token(value: float, digits: int) -> str:
+    return f"{float(value):.{digits}f}".replace("-", "m").replace(".", "p")
+
+
+def _format_percent_label(fraction: float) -> str:
+    percent = 100.0 * float(fraction)
+    rounded = round(percent)
+    if abs(percent - rounded) < 1e-9:
+        return f"{int(rounded)}%"
+    return f"{percent:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def _generated_case_id(
+    *,
+    warmup_fraction: float,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+    total_budget_rho: float,
+    n_steps_path: int,
+) -> str:
+    return (
+        f"warm{_format_token(warmup_fraction, 3)}"
+        f"_aw{_format_token(outer_attack_weight, 2)}"
+        f"_cw{_format_token(outer_clean_weight, 2)}"
+        f"_rho{_format_token(total_budget_rho, 2)}"
+        f"_n{int(n_steps_path)}"
+    )
+
+
+def _generated_case_label(
+    *,
+    warmup_fraction: float,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+    total_budget_rho: float,
+    n_steps_path: int,
+) -> str:
+    return (
+        f"warm={_format_percent_label(warmup_fraction)}, "
+        f"aw={float(outer_attack_weight):.2f}, "
+        f"cw={float(outer_clean_weight):.2f}, "
+        f"rho={float(total_budget_rho):.2f}, "
+        f"N={int(n_steps_path)}"
+    )
+
+
+def _append_unique(values: List[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def _register_round2_case(
+    *,
+    warmup_fraction: float,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+    total_budget_rho: float,
+    n_steps_path: int,
+    baseline_anchor: Optional[str],
+    wdro_anchor_by_warm: Dict[str, str],
+) -> Tuple[str, Optional[str]]:
+    case_id = _generated_case_id(
+        warmup_fraction=warmup_fraction,
+        outer_attack_weight=outer_attack_weight,
+        outer_clean_weight=outer_clean_weight,
+        total_budget_rho=total_budget_rho,
+        n_steps_path=n_steps_path,
+    )
+    warm_key = _format_token(warmup_fraction, 3)
+    is_new = case_id not in CASE_LIBRARY
+    if is_new:
+        CASE_LIBRARY[case_id] = {
+            "label": _generated_case_label(
+                warmup_fraction=warmup_fraction,
+                outer_attack_weight=outer_attack_weight,
+                outer_clean_weight=outer_clean_weight,
+                total_budget_rho=total_budget_rho,
+                n_steps_path=n_steps_path,
+            ),
+            "wdro_warmup_fraction": float(warmup_fraction),
+            "cdro_warmup_fraction": float(warmup_fraction),
+            "outer_attack_weight": float(outer_attack_weight),
+            "outer_clean_weight": float(outer_clean_weight),
+            "cdro_total_budget_rho": float(total_budget_rho),
+            "cdro_n_steps_path": int(n_steps_path),
+            "reuse_baseline_from": baseline_anchor,
+            "reuse_wdro_from": wdro_anchor_by_warm.get(warm_key),
+        }
+
+    if baseline_anchor is None:
+        CASE_LIBRARY[case_id]["reuse_baseline_from"] = None
+        baseline_anchor = case_id
+    if warm_key not in wdro_anchor_by_warm:
+        CASE_LIBRARY[case_id]["reuse_wdro_from"] = None
+        wdro_anchor_by_warm[warm_key] = case_id
+    return case_id, baseline_anchor
+
+
+def _extend_case_library_for_round2() -> None:
+    warmups = [0.0, 0.025, 0.05]
+    rhos = [0.01, 0.02, 0.05, 0.10, 0.20]
+    n_steps_values = [8, 12, 24, 32, 48]
+    attack_weights = [0.25, 0.30, 0.50, 1.0, 2.0, 4.0]
+    clean_weights = [1.0, 0.5, 0.0]
+    weight_anchors = [
+        (0.05, 0.02, 24),
+        (0.05, 0.01, 32),
+        (0.00, 0.01, 32),
+    ]
+
+    baseline_anchor: Optional[str] = None
+    wdro_anchor_by_warm: Dict[str, str] = {}
+    structural_case_ids: Dict[Tuple[float, float, int], str] = {}
+    round2_structural: List[str] = []
+    round2_weights: List[str] = []
+    round2_full: List[str] = []
+
+    for warmup_fraction in warmups:
+        for total_budget_rho in rhos:
+            for n_steps_path in n_steps_values:
+                case_id, baseline_anchor = _register_round2_case(
+                    warmup_fraction=warmup_fraction,
+                    outer_attack_weight=0.50,
+                    outer_clean_weight=1.0,
+                    total_budget_rho=total_budget_rho,
+                    n_steps_path=n_steps_path,
+                    baseline_anchor=baseline_anchor,
+                    wdro_anchor_by_warm=wdro_anchor_by_warm,
+                )
+                structural_case_ids[(warmup_fraction, total_budget_rho, n_steps_path)] = case_id
+                _append_unique(round2_structural, case_id)
+                _append_unique(round2_full, case_id)
+
+    for case_id in wdro_anchor_by_warm.values():
+        _append_unique(round2_weights, case_id)
+
+    for warmup_fraction, total_budget_rho, n_steps_path in weight_anchors:
+        for outer_attack_weight in attack_weights:
+            for outer_clean_weight in clean_weights:
+                case_id, baseline_anchor = _register_round2_case(
+                    warmup_fraction=warmup_fraction,
+                    outer_attack_weight=outer_attack_weight,
+                    outer_clean_weight=outer_clean_weight,
+                    total_budget_rho=total_budget_rho,
+                    n_steps_path=n_steps_path,
+                    baseline_anchor=baseline_anchor,
+                    wdro_anchor_by_warm=wdro_anchor_by_warm,
+                )
+                _append_unique(round2_weights, case_id)
+                _append_unique(round2_full, case_id)
+
+    PROFILE_CASES["round2_structural"] = round2_structural
+    PROFILE_CASES["round2_weights"] = round2_weights
+    PROFILE_CASES["round2_full"] = round2_full
+
+    SUMMARY_GROUPS.update(
+        {
+            "round2_warmup_rho0p01_n32": [
+                structural_case_ids[(warmup_fraction, 0.01, 32)]
+                for warmup_fraction in warmups
+            ],
+            "round2_rho_warm0p05_n32": [
+                structural_case_ids[(0.05, total_budget_rho, 32)]
+                for total_budget_rho in rhos
+            ],
+            "round2_n_warm0p05_rho0p01": [
+                structural_case_ids[(0.05, 0.01, n_steps_path)]
+                for n_steps_path in n_steps_values
+            ],
+            "round2_aw_warm0p05_rho0p01_n32": [
+                _generated_case_id(
+                    warmup_fraction=0.05,
+                    outer_attack_weight=outer_attack_weight,
+                    outer_clean_weight=1.0,
+                    total_budget_rho=0.01,
+                    n_steps_path=32,
+                )
+                for outer_attack_weight in attack_weights
+            ],
+            "round2_cw_aw0p30_warm0p05_rho0p01_n32": [
+                _generated_case_id(
+                    warmup_fraction=0.05,
+                    outer_attack_weight=0.30,
+                    outer_clean_weight=outer_clean_weight,
+                    total_budget_rho=0.01,
+                    n_steps_path=32,
+                )
+                for outer_clean_weight in clean_weights
+            ],
+            "round2_cw_aw4p00_warm0p05_rho0p01_n32": [
+                _generated_case_id(
+                    warmup_fraction=0.05,
+                    outer_attack_weight=4.0,
+                    outer_clean_weight=outer_clean_weight,
+                    total_budget_rho=0.01,
+                    n_steps_path=32,
+                )
+                for outer_clean_weight in clean_weights
+            ],
+        }
+    )
+
+
+_extend_case_library_for_round2()
 
 
 def parse_args() -> argparse.Namespace:
@@ -361,7 +573,7 @@ def _build_collector_cmd(*, args: argparse.Namespace, case_id: str, case_cfg: Di
         "--outer-attack-weight",
         str(case_cfg["outer_attack_weight"]),
         "--outer-clean-weight",
-        str(args.outer_clean_weight),
+        str(case_cfg.get("outer_clean_weight", args.outer_clean_weight)),
         "--cdro-step-size",
         str(args.cdro_step_size),
         "--cdro-total-budget-rho",
@@ -412,13 +624,20 @@ def _build_plot_cmd(*, args: argparse.Namespace, case_id: str) -> List[str]:
     ]
 
 
-def _run_logged_command(*, cmd: List[str], log_path: str, dry_run: bool) -> None:
+def _run_logged_command(*, cmd: List[str], log_path: str, dry_run: bool, proc_title: Optional[str] = None) -> None:
     ensure_dir(os.path.dirname(log_path))
     if dry_run:
         print("[dry-run]", " ".join(cmd), flush=True)
         return
     with open(log_path, "w", encoding="utf-8") as handle:
-        subprocess.run(cmd, cwd=ROOT_DIR, check=True, stdout=handle, stderr=subprocess.STDOUT)
+        subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            check=True,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=child_process_env(proc_title=proc_title),
+        )
 
 
 def _load_rows(path: str) -> List[Dict[str, str]]:
@@ -472,6 +691,45 @@ def _best_robust_row(rows: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
     return _best_row(robust_rows)
 
 
+ROW_DIAGNOSTIC_FIELDS = [
+    "outer_loss_final",
+    "outer_loss_mean_last",
+    "outer_loss_attack_final",
+    "outer_loss_attack_mean_last",
+    "outer_loss_clean_final",
+    "outer_loss_clean_mean_last",
+    "attack_metric_kind",
+    "attack_metric_final",
+    "attack_metric_mean_last",
+    "transport_cost_kind",
+    "transport_cost_final",
+    "transport_cost_mean_last",
+    "delta_norm_mean_final",
+    "delta_norm_max_final",
+    "delta_norm_ratio_mean_final",
+    "delta_norm_ratio_max_final",
+    "sched_attack_weight_final",
+    "sched_clean_weight_final",
+    "diag_delta_norm_ratio_mean_final",
+    "diag_inner_obj_gap_ratio_final",
+]
+ROW_DIAGNOSTIC_STRING_FIELDS = {"attack_metric_kind", "transport_cost_kind"}
+
+
+def _row_diagnostic_fields(*, prefix: str, row: Optional[Dict[str, str]]) -> Dict:
+    out: Dict[str, Optional[float]] = {}
+    for key in ROW_DIAGNOSTIC_FIELDS:
+        field_name = f"{prefix}_{key}"
+        if row is None:
+            out[field_name] = None
+        elif key in ROW_DIAGNOSTIC_STRING_FIELDS:
+            value = row.get(key)
+            out[field_name] = None if value in (None, "") else str(value)
+        else:
+            out[field_name] = _safe_float(row.get(key))
+    return out
+
+
 def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[Dict]:
     rows = _load_rows(combined_csv)
     summary_rows: List[Dict] = []
@@ -491,6 +749,7 @@ def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[
                 "wdro_warmup_fraction": case_cfg["wdro_warmup_fraction"],
                 "cdro_warmup_fraction": case_cfg["cdro_warmup_fraction"],
                 "cdro_outer_attack_weight": case_cfg["outer_attack_weight"],
+                "cdro_outer_clean_weight": case_cfg.get("outer_clean_weight", 1.0),
                 "cdro_total_budget_rho": case_cfg["cdro_total_budget_rho"],
                 "cdro_n_steps_path": case_cfg["cdro_n_steps_path"],
                 "best_fid": None if best_row is None else float(best_row["fid"]),
@@ -508,6 +767,8 @@ def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[
                 "best_robust_fid_weighted_compute": (
                     None if best_robust_row is None else float(best_robust_row["weighted_compute_units"])
                 ),
+                **_row_diagnostic_fields(prefix="best_fid", row=best_row),
+                **_row_diagnostic_fields(prefix="final", row=final_row),
             }
         )
     return summary_rows
@@ -555,7 +816,8 @@ def _make_family_plot(
         linestyle="-",
     )
 
-    if group_name == "warmup":
+    wdro_per_case = len({case_cfgs[case_id]["wdro_warmup_fraction"] for case_id in available_case_ids}) > 1
+    if wdro_per_case:
         for case_index, case_id in enumerate(available_case_ids):
             linestyle = LINESTYLES[case_index % len(LINESTYLES)]
             case_label = case_cfgs[case_id]["label"]
@@ -612,6 +874,8 @@ def _make_family_plot(
 
 def main() -> None:
     args = parse_args()
+    if _APPLIED_PROCESS_TITLE is None:
+        apply_process_title(build_process_title("wdiff", "queue", args.prefix))
     case_ids = _parse_case_ids(args)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
@@ -629,13 +893,23 @@ def main() -> None:
 
         print(f"[matrix] case={case_id} label={case_cfg['label']}", flush=True)
         collector_cmd = _build_collector_cmd(args=args, case_id=case_id, case_cfg=case_cfg)
-        _run_logged_command(cmd=collector_cmd, log_path=collector_log, dry_run=args.dry_run)
+        _run_logged_command(
+            cmd=collector_cmd,
+            log_path=collector_log,
+            dry_run=args.dry_run,
+            proc_title=build_process_title("wdiff", "collect", case_id),
+        )
 
         if not args.dry_run:
             if not os.path.isfile(paths["combined_csv"]):
                 raise RuntimeError(f"Missing combined csv after collector run: {paths['combined_csv']}")
             plot_cmd = _build_plot_cmd(args=args, case_id=case_id)
-            _run_logged_command(cmd=plot_cmd, log_path=plot_log, dry_run=False)
+            _run_logged_command(
+                cmd=plot_cmd,
+                log_path=plot_log,
+                dry_run=False,
+                proc_title=build_process_title("wdiff", "plot", case_id),
+            )
             case_rows[case_id] = _load_rows(paths["combined_csv"])
             summary_rows.extend(_summarize_case(case_id=case_id, case_cfg=case_cfg, combined_csv=paths["combined_csv"]))
 
@@ -683,7 +957,7 @@ def main() -> None:
             "fid_samples": args.fid_samples,
             "cdro_step_size": args.cdro_step_size,
             "cdro_time_horizon": args.cdro_time_horizon,
-            "outer_clean_weight": args.outer_clean_weight,
+            "default_outer_clean_weight": args.outer_clean_weight,
         },
         "cases": {
             case_id: dict(CASE_LIBRARY[case_id])

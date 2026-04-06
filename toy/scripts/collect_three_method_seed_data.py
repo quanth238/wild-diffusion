@@ -21,6 +21,10 @@ from toy.compute_accounting import (  # noqa: E402
     wdro_robust_step_weighted_compute_units,
 )
 from toy.config import ToyConfig  # noqa: E402
+from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
+
+
+_APPLIED_PROCESS_TITLE = apply_process_title()
 
 
 DEFAULT_TRAIN_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "train")
@@ -247,6 +251,98 @@ def _optional_float(value) -> Optional[float]:
         return None
 
 
+def _summary_stat(series, stat_name: str) -> Optional[float]:
+    if not isinstance(series, dict):
+        return None
+    return _optional_float(series.get(stat_name))
+
+
+def _pick_objective_series(objective: Dict, keys: Iterable[str]) -> Tuple[Optional[str], Optional[Dict]]:
+    for key in keys:
+        series = objective.get(str(key))
+        if not isinstance(series, dict):
+            continue
+        if any(_summary_stat(series, stat_name) is not None for stat_name in ("final", "mean_last", "min", "max")):
+            return str(key), series
+    return None, None
+
+
+def _empty_objective_debug_fields() -> Dict:
+    return {
+        "outer_loss_final": None,
+        "outer_loss_mean_last": None,
+        "outer_loss_attack_final": None,
+        "outer_loss_attack_mean_last": None,
+        "outer_loss_clean_final": None,
+        "outer_loss_clean_mean_last": None,
+        "attack_metric_kind": None,
+        "attack_metric_final": None,
+        "attack_metric_mean_last": None,
+        "transport_cost_kind": None,
+        "transport_cost_final": None,
+        "transport_cost_mean_last": None,
+        "delta_norm_mean_final": None,
+        "delta_norm_max_final": None,
+        "delta_norm_ratio_mean_final": None,
+        "delta_norm_ratio_max_final": None,
+        "sched_attack_weight_final": None,
+        "sched_clean_weight_final": None,
+        "diag_delta_norm_ratio_mean_final": None,
+        "diag_inner_obj_gap_ratio_final": None,
+    }
+
+
+def _objective_debug_fields(*, objective: Dict) -> Dict:
+    transport_kind, transport_series = _pick_objective_series(
+        objective,
+        (
+            "cdro_transport_cost",
+            "robust_energy",
+            "wdro_transport_cost",
+            "v11_path_transport_cost",
+            "wild_sample_transport_cost",
+            "wild_inner_transport_cost",
+        ),
+    )
+    attack_metric_kind, attack_metric_series = _pick_objective_series(
+        objective,
+        (
+            "robust_inner_obj",
+            "wdro_attack_loss",
+            "wild_inner_attack_loss",
+        ),
+    )
+    fields = _empty_objective_debug_fields()
+    fields.update(
+        {
+            "outer_loss_final": _summary_stat(objective.get("robust_outer_loss"), "final"),
+            "outer_loss_mean_last": _summary_stat(objective.get("robust_outer_loss"), "mean_last"),
+            "outer_loss_attack_final": _summary_stat(objective.get("robust_outer_loss_attack"), "final"),
+            "outer_loss_attack_mean_last": _summary_stat(objective.get("robust_outer_loss_attack"), "mean_last"),
+            "outer_loss_clean_final": _summary_stat(objective.get("robust_outer_loss_clean"), "final"),
+            "outer_loss_clean_mean_last": _summary_stat(objective.get("robust_outer_loss_clean"), "mean_last"),
+            "attack_metric_kind": attack_metric_kind,
+            "attack_metric_final": _summary_stat(attack_metric_series, "final"),
+            "attack_metric_mean_last": _summary_stat(attack_metric_series, "mean_last"),
+            "transport_cost_kind": transport_kind,
+            "transport_cost_final": _summary_stat(transport_series, "final"),
+            "transport_cost_mean_last": _summary_stat(transport_series, "mean_last"),
+            "delta_norm_mean_final": _summary_stat(objective.get("robust_delta_norm_mean"), "final"),
+            "delta_norm_max_final": _summary_stat(objective.get("robust_delta_norm_max"), "final"),
+            "delta_norm_ratio_mean_final": _summary_stat(objective.get("robust_delta_norm_ratio_mean"), "final"),
+            "delta_norm_ratio_max_final": _summary_stat(objective.get("robust_delta_norm_ratio_max"), "final"),
+            "sched_attack_weight_final": _summary_stat(objective.get("robust_sched_attack_weight"), "final"),
+            "sched_clean_weight_final": _summary_stat(objective.get("robust_sched_clean_weight"), "final"),
+            "diag_delta_norm_ratio_mean_final": _summary_stat(
+                objective.get("diag_delta_norm_ratio_mean"),
+                "final",
+            ),
+            "diag_inner_obj_gap_ratio_final": _summary_stat(objective.get("diag_inner_obj_gap_ratio"), "final"),
+        }
+    )
+    return fields
+
+
 def _row_role_label(*, is_comparison_knot: bool, is_aux_warmup_support: bool) -> str:
     if is_comparison_knot and is_aux_warmup_support:
         return "comparison_knot+aux_warmup_support"
@@ -257,10 +353,17 @@ def _row_role_label(*, is_comparison_knot: bool, is_aux_warmup_support: bool) ->
     return "unlabeled"
 
 
-def run_command(*, cmd: List[str], log_path: str) -> None:
+def run_command(*, cmd: List[str], log_path: str, proc_title: Optional[str] = None) -> None:
     ensure_dir(os.path.dirname(log_path))
     with open(log_path, "w", encoding="utf-8") as handle:
-        subprocess.run(cmd, cwd=ROOT_DIR, check=True, stdout=handle, stderr=subprocess.STDOUT)
+        subprocess.run(
+            cmd,
+            cwd=ROOT_DIR,
+            check=True,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            env=child_process_env(proc_title=proc_title),
+        )
 
 
 def realize_shared_weighted_grid(*, shared_weighted_cap: float, template_steps: List[int]) -> List[float]:
@@ -536,6 +639,7 @@ def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
                 "exp_name": row["exp_name"],
                 "exp_dir": row["exp_dir"],
                 "checkpoint_path": row["checkpoint_path"],
+                **_empty_objective_debug_fields(),
             }
         )
     return out
@@ -636,6 +740,7 @@ def _extract_wdro_row(
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
+        **_objective_debug_fields(objective=objective),
     }
 
 
@@ -731,6 +836,7 @@ def _extract_cdro_row(
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
+        **_objective_debug_fields(objective=objective),
     }
 
 
@@ -1053,7 +1159,11 @@ def _run_method_local_warmup_trajectory(
             f"[collect-weighted] {method_name} warmup seed={seed} steps={warmup_eval_steps}",
             flush=True,
         )
-        run_command(cmd=warmup_cmd, log_path=warmup_log)
+        run_command(
+            cmd=warmup_cmd,
+            log_path=warmup_log,
+            proc_title=build_process_title("wdiff", "warmup", method_name, f"s{int(seed)}"),
+        )
 
     warmup_rows = _normalize_baseline_runs(runs_csv=warmup_runs_csv)
     warmup_by_step = {(int(row["seed"]), int(row["step"])): row for row in warmup_rows}
@@ -1106,6 +1216,8 @@ def _run_method_local_warmup_trajectory(
 
 def main() -> None:
     args = parse_args()
+    if _APPLIED_PROCESS_TITLE is None:
+        apply_process_title(build_process_title("wdiff", "collect", args.prefix))
     seeds = parse_int_list(args.seeds)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
@@ -1274,7 +1386,11 @@ def main() -> None:
             print(f"[collect-weighted] reuse baseline outputs: {baseline_outdir}", flush=True)
         else:
             print(f"[collect-weighted] baseline seeds={seeds} steps={baseline_run_steps}", flush=True)
-            run_command(cmd=baseline_cmd, log_path=baseline_log)
+            run_command(
+                cmd=baseline_cmd,
+                log_path=baseline_log,
+                proc_title=build_process_title("wdiff", "baseline", args.prefix),
+            )
 
     baseline_raw = _normalize_baseline_runs(runs_csv=baseline_runs_csv)
     baseline_raw.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
@@ -1384,7 +1500,11 @@ def main() -> None:
                         save_path=checkpoint_path,
                         baseline_ckpt_path=baseline_ckpt_requested,
                     )
-                    run_command(cmd=cmd, log_path=log_path)
+                    run_command(
+                        cmd=cmd,
+                        log_path=log_path,
+                        proc_title=build_process_title("wdiff", "wdro", f"s{int(seed)}", f"st{int(total_steps)}"),
+                    )
                 row = _extract_wdro_row(
                     metrics_path=metrics_path,
                     calibration=calibration,
@@ -1479,7 +1599,11 @@ def main() -> None:
                     save_path=checkpoint_path,
                     baseline_ckpt_path=baseline_ckpt_requested,
                 )
-                run_command(cmd=cmd, log_path=log_path)
+                run_command(
+                    cmd=cmd,
+                    log_path=log_path,
+                    proc_title=build_process_title("wdiff", "cdro", f"s{int(seed)}", f"st{int(total_steps)}"),
+                )
             row = _extract_cdro_row(
                 metrics_path=metrics_path,
                 baseline_ckpt_requested=baseline_ckpt_requested,
