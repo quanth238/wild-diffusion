@@ -40,7 +40,7 @@ DEFAULT_CALIBRATION = os.path.join(
 )
 
 # Reuse the previous 25-knot relative template, but apply it in weighted-compute space.
-GRID_TEMPLATE_STEPS = [
+GRID_TEMPLATE_STEPS_STANDARD = [
     0,
     10,
     25,
@@ -67,16 +67,74 @@ GRID_TEMPLATE_STEPS = [
     70000,
     76970,
 ]
-GRID_TEMPLATE_MAX = GRID_TEMPLATE_STEPS[-1]
+GRID_TEMPLATE_STEPS_DENSER = [
+    0,
+    5,
+    10,
+    15,
+    25,
+    35,
+    50,
+    75,
+    100,
+    150,
+    250,
+    350,
+    500,
+    750,
+    1000,
+    1500,
+    2000,
+    2500,
+    3500,
+    5000,
+    7500,
+    10000,
+    12500,
+    15000,
+    17500,
+    20000,
+    22500,
+    25000,
+    27500,
+    30000,
+    32500,
+    35000,
+    37500,
+    40000,
+    45000,
+    50000,
+    55000,
+    60000,
+    65000,
+    70000,
+    73500,
+    76970,
+]
+GRID_TEMPLATES = {
+    "standard": {
+        "name": "wdro_dense_25_relative",
+        "steps": GRID_TEMPLATE_STEPS_STANDARD,
+    },
+    "denser": {
+        "name": "wdro_dense_41_relative",
+        "steps": GRID_TEMPLATE_STEPS_DENSER,
+    },
+}
+
+
+def _grid_template_names() -> List[str]:
+    return sorted(GRID_TEMPLATES.keys())
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Collect raw per-seed baseline, WDRO, and CDRO data on a shared weighted-compute grid. "
-            "Baseline evaluates both comparison knots and auxiliary warmup-support checkpoints. "
-            "WDRO/CDRO use independent per-knot runs with native relative warmup; aggregation is deferred "
-            "to later analysis."
+            "Each method/seed is evaluated along a single checkpointed trajectory: baseline is trained as one "
+            "continuous baseline trajectory, while WDRO/CDRO use a method-local warmup baseline trajectory up "
+            "to one fixed warmup checkpoint and then continue the robust phase via same-seed same-method "
+            "resume checkpoints. Aggregation is deferred to later analysis."
         )
     )
     parser.add_argument("--outdir", type=str, required=True)
@@ -100,16 +158,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=2000)
+    parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
     parser.add_argument("--debug-terminal-step", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--n-steps-path", type=int, default=24)
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
-    parser.add_argument("--shared-weighted-cap", type=float, default=0.0)
+    parser.add_argument("--shared-weighted-cap", type=float, default=200000.0)
+    parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
     parser.add_argument("--baseline-max-steps", type=int, default=80000)
     parser.add_argument("--wdro-max-total-steps", type=int, default=76970)
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--reuse-baseline-runs-csv", type=str, default="")
+    parser.add_argument("--reuse-baseline-aggregate-csv", type=str, default="")
+    parser.add_argument("--reuse-wdro-raw-csv", type=str, default="")
     parser.add_argument("--wdro-warmup-fraction", type=float, default=0.2)
     parser.add_argument("--wdro-refresh-epochs", type=float, default=100.0)
     parser.add_argument("--wdro-adv-prob", type=float, default=0.3)
@@ -123,6 +186,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-total-budget-rho", type=float, default=0.02)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
     parser.add_argument("--cdro-warmup-fraction", type=float, default=0.2)
+    parser.add_argument("--cdro-n-steps-path", type=int, default=0)
     return parser.parse_args()
 
 
@@ -174,6 +238,15 @@ def _encode_str_list(values: Iterable[str]) -> str:
     return ",".join(str(value) for value in values)
 
 
+def _optional_float(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _row_role_label(*, is_comparison_knot: bool, is_aux_warmup_support: bool) -> str:
     if is_comparison_knot and is_aux_warmup_support:
         return "comparison_knot+aux_warmup_support"
@@ -190,14 +263,19 @@ def run_command(*, cmd: List[str], log_path: str) -> None:
         subprocess.run(cmd, cwd=ROOT_DIR, check=True, stdout=handle, stderr=subprocess.STDOUT)
 
 
-def realize_shared_weighted_grid(shared_weighted_cap: float) -> List[float]:
+def realize_shared_weighted_grid(*, shared_weighted_cap: float, template_steps: List[int]) -> List[float]:
     cap = max(float(shared_weighted_cap), 0.0)
     if cap <= 0.0:
         return [0.0]
+    if not template_steps:
+        raise ValueError("Expected at least one grid template step.")
+    template_max = max(int(step) for step in template_steps)
+    if template_max <= 0:
+        raise ValueError("Grid template must have a positive max step.")
     out: List[float] = []
     previous = -1.0
-    for base_step in GRID_TEMPLATE_STEPS:
-        scaled = float(base_step) * cap / float(GRID_TEMPLATE_MAX)
+    for base_step in template_steps:
+        scaled = float(base_step) * cap / float(template_max)
         if scaled <= previous:
             scaled = previous + 1e-6
         out.append(float(scaled))
@@ -228,9 +306,16 @@ def _wdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
     return float(units)
 
 
+def _effective_cdro_n_steps_path(args: argparse.Namespace) -> int:
+    override_value = max(int(getattr(args, "cdro_n_steps_path", 0)), 0)
+    if override_value > 0:
+        return int(override_value)
+    return int(args.n_steps_path)
+
+
 def _cdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibration: Dict) -> float:
     units = cdro_robust_step_weighted_compute_units(
-        n_steps_path=int(args.n_steps_path),
+        n_steps_path=int(_effective_cdro_n_steps_path(args)),
         inner_steps=int(args.inner_steps),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
@@ -442,6 +527,9 @@ def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
                 "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
                 "weighted_compute_units": float(row["weighted_compute_units"]),
                 "batch_equiv_denoiser_evals": float(row["batch_equiv_denoiser_evals"]),
+                "loss_kind": "baseline_loss",
+                "loss_final": float(row["baseline_loss_final"]),
+                "loss_mean_last": float(row["baseline_loss_mean_last"]),
                 "images_shown_m": float(row["images_shown_m"]),
                 "row_origin": "baseline_seed_run",
                 "source_csv": runs_csv,
@@ -519,6 +607,9 @@ def _extract_wdro_row(
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
         "fid": float(fid_value),
+        "loss_kind": "robust_outer_loss",
+        "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
+        "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
         "metrics_path": metrics_path,
         "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
         "train_elapsed_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
@@ -560,6 +651,7 @@ def _extract_cdro_row(
     flow = metrics["flow_debug"]
     runtime = flow["runtime"]
     sample_quality = metrics.get("sample_quality_debug", {})
+    objective = metrics["objective_debug"]
     batch_size = int(flow["budget_accounting"]["batch_size"])
     baseline_phase_steps = int(flow["baseline_phase_steps"])
     robust_phase_steps = int(flow["robust_phase_steps"])
@@ -614,6 +706,9 @@ def _extract_cdro_row(
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
         "fid": float(fid_value),
+        "loss_kind": "robust_outer_loss",
+        "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
+        "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
         "metrics_path": metrics_path,
         "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
         "train_elapsed_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
@@ -671,18 +766,89 @@ def _transfer_baseline_row_to_method(
     weighted_grid_target: float,
     trajectory_total_steps_max: int,
     fixed_warmup_steps: int,
+    row_origin: str = "trajectory_warmup_phase",
 ) -> Dict:
     row = dict(baseline_row)
     row["method"] = str(method_name)
-    row["row_origin"] = "baseline_warmup_transfer"
+    row["row_origin"] = str(row_origin)
     row["weighted_grid_target"] = float(weighted_grid_target)
+    row["comparison_weighted_targets"] = _encode_float_list([float(weighted_grid_target)])
+    row["warmup_support_methods"] = ""
+    row["row_role"] = _row_role_label(is_comparison_knot=True, is_aux_warmup_support=False)
+    row["is_comparison_knot"] = True
+    row["is_aux_warmup_support"] = False
     row["trajectory_total_steps_max"] = int(trajectory_total_steps_max)
     row["fixed_warmup_steps"] = int(fixed_warmup_steps)
     row["warmup_only"] = True
-    row["baseline_ckpt_loaded"] = True
+    row["baseline_ckpt_loaded"] = False
     row["robust_resume_loaded"] = False
-    row["phase_step_split_mode"] = "single_trajectory_fixed_warmup_baseline_transfer"
+    row["phase_step_split_mode"] = "single_trajectory_warmup_phase"
     return row
+
+
+def _build_baseline_sweep_cmd(
+    *,
+    args: argparse.Namespace,
+    outdir: str,
+    prefix: str,
+    seeds_text: str,
+    steps: List[int],
+) -> List[str]:
+    cmd = [
+        args.python_bin,
+        os.path.join(ROOT_DIR, "toy", "scripts", "sweep_mnist_convergence_checkpointed.py"),
+        "--outdir",
+        outdir,
+        "--prefix",
+        prefix,
+        "--seeds",
+        seeds_text,
+        "--train-percents",
+        "1",
+        "--steps-list",
+        format_steps_list(steps),
+        "--device",
+        args.device,
+        "--require-cuda",
+        "--dataset-kind",
+        "image_folder",
+        "--dataset-path",
+        args.dataset_path,
+        "--dataset-val-path",
+        args.dataset_val_path,
+        "--image-size",
+        str(args.image_size),
+        "--image-channels",
+        str(args.image_channels),
+        "--batch-size",
+        str(args.batch_size),
+        "--hidden-dim",
+        str(args.hidden_dim),
+        "--n-steps-path",
+        str(args.n_steps_path),
+        "--sigma-min",
+        str(args.sigma_min),
+        "--sigma-max",
+        str(args.sigma_max),
+        "--fid-ref-path",
+        args.fid_ref_path,
+        "--fid-samples",
+        str(args.fid_samples),
+        "--weighted-compute-calibration-path",
+        str(args.weighted_compute_calibration_path).strip(),
+        "--train-accelerator-count",
+        str(args.train_accelerator_count),
+    ]
+    if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
+        cmd.extend(
+            [
+                "--weighted-inputgrad-alpha",
+                str(args.weighted_inputgrad_alpha),
+                "--weighted-parambackward-beta",
+                str(args.weighted_parambackward_beta),
+            ]
+        )
+    return cmd
 
 
 def _build_run_toy_cmd(
@@ -695,9 +861,10 @@ def _build_run_toy_cmd(
     total_steps: int,
     fixed_warmup_steps: Optional[int],
     resume_path: Optional[str],
+    save_path: Optional[str],
     baseline_ckpt_path: Optional[str],
-    use_resume: bool,
 ) -> List[str]:
+    n_steps_path_value = int(_effective_cdro_n_steps_path(args)) if method_name == "cdro" else int(args.n_steps_path)
     cmd = [
         args.python_bin,
         os.path.join(ROOT_DIR, "toy", "run_toy.py"),
@@ -717,12 +884,14 @@ def _build_run_toy_cmd(
         str(args.log_every),
         "--eval-samples",
         str(args.eval_samples),
+        "--fid-samples",
+        str(args.fid_samples),
         "--debug-eval-batch",
         str(args.debug_eval_batch),
         "--debug-terminal-step",
         str(args.debug_terminal_step),
         "--n-steps-path",
-        str(args.n_steps_path),
+        str(n_steps_path_value),
         "--hidden-dim",
         str(args.hidden_dim),
         "--dataset-kind",
@@ -784,13 +953,13 @@ def _build_run_toy_cmd(
             ]
         )
     else:
-        # Per-knot runs may only reuse baseline warmup through explicit same-seed transfers.
-        # Disable run_toy's implicit outdir-scoped auto cache so one knot cannot seed another.
+        # Keep checkpoint lineage explicit: only the provided warmup/support checkpoint
+        # or same-method resume checkpoint may seed a later run.
         cmd.append("--disable-baseline-ckpt")
-    if resume_path:
-        if use_resume and os.path.exists(resume_path):
-            cmd.extend(["--robust-resume-ckpt-path", resume_path])
-        cmd.extend(["--robust-save-ckpt-path", resume_path])
+    if resume_path and os.path.exists(resume_path):
+        cmd.extend(["--robust-resume-ckpt-path", resume_path])
+    if save_path:
+        cmd.extend(["--robust-save-ckpt-path", save_path])
     if method_name == "wdro":
         cmd.extend(
             [
@@ -833,12 +1002,115 @@ def _build_run_toy_cmd(
     return cmd
 
 
+def _trajectory_checkpoint_path(*, trajectory_dir: str, method_name: str, seed: int, total_steps: int) -> str:
+    ckpt_dir = os.path.join(trajectory_dir, "_trajectory_checkpoints")
+    ensure_dir(ckpt_dir)
+    return os.path.join(ckpt_dir, f"{method_name}_s{int(seed)}_step{int(total_steps):06d}.pt")
+
+
+def _run_method_local_warmup_trajectory(
+    *,
+    args: argparse.Namespace,
+    method_name: str,
+    method_root: str,
+    seed: int,
+    weighted_grid_targets: List[float],
+    comparison_steps: List[int],
+    fixed_warmup_steps: int,
+    trajectory_total_steps_max: int,
+) -> Tuple[List[Dict], Optional[str], Dict]:
+    warmup_eval_steps = sorted(
+        {
+            int(step)
+            for step in list(comparison_steps) + [int(fixed_warmup_steps)]
+            if int(step) > 0 and int(step) <= int(fixed_warmup_steps)
+        }
+    )
+    if not warmup_eval_steps:
+        return [], None, {"runs_csv": None, "warmup_eval_steps": [], "support_checkpoint_path": None}
+
+    seed_root = os.path.join(method_root, f"s{seed}")
+    warmup_outdir = os.path.join(seed_root, "_warmup_baseline")
+    ensure_dir(warmup_outdir)
+    warmup_prefix = f"{args.prefix}_{method_name}_s{seed}_warmup"
+    warmup_runs_csv = os.path.join(warmup_outdir, f"{warmup_prefix}_runs.csv")
+    warmup_agg_csv = os.path.join(warmup_outdir, f"{warmup_prefix}_aggregate.csv")
+    warmup_log = os.path.join(args.outdir, "logs", f"{warmup_prefix}.log")
+    warmup_cmd = _build_baseline_sweep_cmd(
+        args=args,
+        outdir=warmup_outdir,
+        prefix=warmup_prefix,
+        seeds_text=str(int(seed)),
+        steps=warmup_eval_steps,
+    )
+    if args.skip_existing and os.path.isfile(warmup_runs_csv) and os.path.isfile(warmup_agg_csv):
+        print(
+            f"[collect-weighted] reuse {method_name} warmup seed={seed}: {warmup_outdir}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[collect-weighted] {method_name} warmup seed={seed} steps={warmup_eval_steps}",
+            flush=True,
+        )
+        run_command(cmd=warmup_cmd, log_path=warmup_log)
+
+    warmup_rows = _normalize_baseline_runs(runs_csv=warmup_runs_csv)
+    warmup_by_step = {(int(row["seed"]), int(row["step"])): row for row in warmup_rows}
+    support_row = warmup_by_step.get((int(seed), int(fixed_warmup_steps)))
+    if support_row is None:
+        raise RuntimeError(
+            f"Missing {method_name} warmup support checkpoint for seed={seed} step={fixed_warmup_steps} "
+            f"in {warmup_runs_csv}"
+        )
+    support_checkpoint_path = support_row.get("checkpoint_path")
+    if not support_checkpoint_path:
+        raise RuntimeError(
+            f"Warmup support checkpoint path missing for {method_name} seed={seed} step={fixed_warmup_steps}"
+        )
+    if not os.path.isfile(support_checkpoint_path):
+        raise RuntimeError(
+            f"Warmup support checkpoint does not exist for {method_name} seed={seed}: {support_checkpoint_path}"
+        )
+
+    comparison_rows: List[Dict] = []
+    for target_weighted, total_steps in zip(weighted_grid_targets, comparison_steps):
+        if int(total_steps) <= 0 or int(total_steps) > int(fixed_warmup_steps):
+            continue
+        baseline_row = warmup_by_step.get((int(seed), int(total_steps)))
+        if baseline_row is None:
+            raise RuntimeError(
+                f"Missing {method_name} warmup comparison row for seed={seed} step={total_steps} in {warmup_runs_csv}"
+            )
+        comparison_rows.append(
+            _transfer_baseline_row_to_method(
+                baseline_row=baseline_row,
+                method_name=method_name,
+                weighted_grid_target=float(target_weighted),
+                trajectory_total_steps_max=int(trajectory_total_steps_max),
+                fixed_warmup_steps=int(fixed_warmup_steps),
+                row_origin="trajectory_warmup_phase",
+            )
+        )
+
+    manifest_entry = {
+        "outdir": warmup_outdir,
+        "runs_csv": warmup_runs_csv,
+        "aggregate_csv": warmup_agg_csv,
+        "warmup_eval_steps": [int(step) for step in warmup_eval_steps],
+        "support_checkpoint_step": int(fixed_warmup_steps),
+        "support_checkpoint_path": support_checkpoint_path,
+    }
+    return comparison_rows, support_checkpoint_path, manifest_entry
+
+
 def main() -> None:
     args = parse_args()
     seeds = parse_int_list(args.seeds)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
     ensure_dir(logs_dir)
+    grid_template = GRID_TEMPLATES[str(args.grid_template)]
 
     calibration = load_weighted_compute_calibration(
         calibration_path=str(args.weighted_compute_calibration_path).strip(),
@@ -852,22 +1124,30 @@ def main() -> None:
     wdro_robust_step_weighted_units = _wdro_expected_robust_step_weighted_units(args, calibration)
     cdro_robust_step_weighted_units = _cdro_expected_robust_step_weighted_units(args, calibration)
 
-    wdro_max_total_warmup_steps = _wdro_warmup_steps_for_total(
-        total_steps=int(args.wdro_max_total_steps),
-        args=args,
+    baseline_cap_from_limit = float(int(args.baseline_max_steps)) * float(baseline_step_weighted_units)
+    requested_shared_cap = (
+        float(baseline_cap_from_limit)
+        if float(args.shared_weighted_cap) <= 0.0
+        else min(float(args.shared_weighted_cap), float(baseline_cap_from_limit))
     )
-    wdro_shared_cap = _piecewise_weighted_prefix(
-        total_steps_prefix=int(args.wdro_max_total_steps),
-        fixed_warmup_steps=int(wdro_max_total_warmup_steps),
+    wdro_max_total_steps = _solve_total_steps_for_target_weighted(
+        target_weighted_units=float(requested_shared_cap),
+        max_total_steps=int(args.wdro_max_total_steps),
+        warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
         baseline_step_weighted_units=float(baseline_step_weighted_units),
         robust_step_weighted_units=float(wdro_robust_step_weighted_units),
     )
-    baseline_cap_from_limit = float(int(args.baseline_max_steps)) * float(baseline_step_weighted_units)
-    shared_weighted_cap = (
-        min(baseline_cap_from_limit, wdro_shared_cap)
-        if float(args.shared_weighted_cap) <= 0.0
-        else min(float(args.shared_weighted_cap), baseline_cap_from_limit, wdro_shared_cap)
+    wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
+        total_steps=int(wdro_max_total_steps),
+        args=args,
     )
+    wdro_shared_cap = _piecewise_weighted_prefix(
+        total_steps_prefix=int(wdro_max_total_steps),
+        fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+        baseline_step_weighted_units=float(baseline_step_weighted_units),
+        robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+    )
+    shared_weighted_cap = min(float(requested_shared_cap), float(wdro_shared_cap))
 
     cdro_max_total_steps, cdro_fixed_warmup_steps, cdro_shared_cap = _solve_cdro_total_steps_for_shared_cap(
         shared_weighted_cap=float(shared_weighted_cap),
@@ -877,10 +1157,30 @@ def main() -> None:
         cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
     )
     shared_weighted_cap = min(float(shared_weighted_cap), float(cdro_shared_cap))
+    wdro_max_total_steps = _solve_total_steps_for_target_weighted(
+        target_weighted_units=float(shared_weighted_cap),
+        max_total_steps=int(args.wdro_max_total_steps),
+        warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
+        baseline_step_weighted_units=float(baseline_step_weighted_units),
+        robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+    )
+    wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
+        total_steps=int(wdro_max_total_steps),
+        args=args,
+    )
+    wdro_shared_cap = _piecewise_weighted_prefix(
+        total_steps_prefix=int(wdro_max_total_steps),
+        fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+        baseline_step_weighted_units=float(baseline_step_weighted_units),
+        robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+    )
 
     weighted_grid_targets = [
         float(target)
-        for target in realize_shared_weighted_grid(float(shared_weighted_cap))
+        for target in realize_shared_weighted_grid(
+            shared_weighted_cap=float(shared_weighted_cap),
+            template_steps=list(grid_template["steps"]),
+        )
         # Raw collection should only request measured checkpoints, not a synthetic step-0 origin.
         if float(target) > 0.0
     ]
@@ -893,97 +1193,55 @@ def main() -> None:
         for target in weighted_grid_targets
     ]
     wdro_curve_steps = [
-        _solve_total_steps_for_target_weighted(
+        _solve_prefix_steps_for_target_weighted(
             target_weighted_units=float(target),
-            max_total_steps=int(args.wdro_max_total_steps),
-            warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
+            max_total_steps=int(wdro_max_total_steps),
+            fixed_warmup_steps=int(wdro_fixed_warmup_steps),
             baseline_step_weighted_units=float(baseline_step_weighted_units),
             robust_step_weighted_units=float(wdro_robust_step_weighted_units),
         )
         for target in weighted_grid_targets
     ]
     cdro_curve_steps = [
-        _solve_total_steps_for_target_weighted(
+        _solve_prefix_steps_for_target_weighted(
             target_weighted_units=float(target),
             max_total_steps=int(cdro_max_total_steps),
-            warmup_steps_fn=lambda total: _cdro_fixed_warmup_steps(
-                total_steps=int(total),
-                args=args,
-                baseline_step_weighted_units=float(baseline_step_weighted_units),
-                wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
-                cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
-            ),
+            fixed_warmup_steps=int(cdro_fixed_warmup_steps),
             baseline_step_weighted_units=float(baseline_step_weighted_units),
             robust_step_weighted_units=float(cdro_robust_step_weighted_units),
         )
         for target in weighted_grid_targets
     ]
-    wdro_warmup_steps_by_total = {
-        int(total_steps): _wdro_warmup_steps_for_total(total_steps=int(total_steps), args=args)
-        for total_steps in wdro_curve_steps
-    }
-    cdro_warmup_steps_by_total = {
-        int(total_steps): _cdro_fixed_warmup_steps(
-            total_steps=int(total_steps),
-            args=args,
-            baseline_step_weighted_units=float(baseline_step_weighted_units),
-            wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
-            cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
-        )
-        for total_steps in cdro_curve_steps
-    }
-    wdro_warmup_support_steps = sorted(
-        {
-            int(step)
-            for step in wdro_warmup_steps_by_total.values()
-            if int(step) > 0
-        }
-    )
-    cdro_warmup_support_steps = sorted(
-        {
-            int(step)
-            for step in cdro_warmup_steps_by_total.values()
-            if int(step) > 0
-        }
-    )
-    baseline_run_steps = sorted(
-        {
-            int(step)
-            for step in list(baseline_curve_steps) + wdro_warmup_support_steps + cdro_warmup_support_steps
-            if int(step) > 0
-        }
-    )
-    auxiliary_baseline_support_steps = sorted(
-        {
-            int(step)
-            for step in baseline_run_steps
-            if int(step) not in {int(value) for value in baseline_curve_steps}
-        }
-    )
+    baseline_run_steps = sorted({int(step) for step in baseline_curve_steps if int(step) > 0})
+    baseline_trajectory_total_steps_max = max(baseline_run_steps) if baseline_run_steps else 0
 
     print(
         "[collect-weighted] shared_cap="
-        f"{shared_weighted_cap:.4f} baseline_cap_limit={baseline_cap_from_limit:.4f} "
+        f"{shared_weighted_cap:.4f} requested_cap={requested_shared_cap:.4f} "
+        f"baseline_cap_limit={baseline_cap_from_limit:.4f} "
         f"wdro_cap={wdro_shared_cap:.4f} cdro_cap={cdro_shared_cap:.4f}",
         flush=True,
     )
     print(
         "[collect-weighted] wdro "
-        f"max_total_steps={int(args.wdro_max_total_steps)} "
-        f"warmup_mode=per_point_fraction max_total_warmup_steps={int(wdro_max_total_warmup_steps)}",
+        f"max_total_steps={int(wdro_max_total_steps)} "
+        f"warmup_mode=fixed_from_max_budget fixed_warmup_steps={int(wdro_fixed_warmup_steps)}",
         flush=True,
     )
     print(
         "[collect-weighted] cdro "
         f"max_total_steps={int(cdro_max_total_steps)} "
-        f"warmup_mode=per_point_weighted_match max_total_warmup_steps={int(cdro_fixed_warmup_steps)}",
+        f"warmup_mode=fixed_from_max_budget fixed_warmup_steps={int(cdro_fixed_warmup_steps)}",
         flush=True,
     )
     print(f"[collect-weighted] weighted_targets={weighted_grid_targets}", flush=True)
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
-    print(f"[collect-weighted] baseline_aux_support_steps={auxiliary_baseline_support_steps}", flush=True)
     print(f"[collect-weighted] wdro_steps={wdro_curve_steps}", flush=True)
     print(f"[collect-weighted] cdro_steps={cdro_curve_steps}", flush=True)
+
+    reused_baseline_runs_csv = str(args.reuse_baseline_runs_csv).strip()
+    reused_baseline_aggregate_csv = str(args.reuse_baseline_aggregate_csv).strip()
+    reused_wdro_raw_csv = str(args.reuse_wdro_raw_csv).strip()
 
     baseline_outdir = os.path.join(args.outdir, "baseline")
     wdro_root = os.path.join(args.outdir, "wdro")
@@ -993,101 +1251,34 @@ def main() -> None:
     ensure_dir(cdro_root)
 
     baseline_prefix = f"{args.prefix}_baseline"
-    baseline_runs_csv = os.path.join(baseline_outdir, f"{baseline_prefix}_runs.csv")
-    baseline_agg_csv = os.path.join(baseline_outdir, f"{baseline_prefix}_aggregate.csv")
-    baseline_log = os.path.join(logs_dir, f"{baseline_prefix}.log")
-    baseline_cmd = [
-        args.python_bin,
-        os.path.join(ROOT_DIR, "toy", "scripts", "sweep_mnist_convergence_checkpointed.py"),
-        "--outdir",
-        baseline_outdir,
-        "--prefix",
-        baseline_prefix,
-        "--seeds",
-        args.seeds,
-        "--train-percents",
-        "1",
-        "--steps-list",
-        format_steps_list(baseline_run_steps),
-        "--device",
-        args.device,
-        "--require-cuda",
-        "--dataset-kind",
-        "image_folder",
-        "--dataset-path",
-        args.dataset_path,
-        "--dataset-val-path",
-        args.dataset_val_path,
-        "--image-size",
-        str(args.image_size),
-        "--image-channels",
-        str(args.image_channels),
-        "--batch-size",
-        str(args.batch_size),
-        "--hidden-dim",
-        str(args.hidden_dim),
-        "--n-steps-path",
-        str(args.n_steps_path),
-        "--sigma-min",
-        str(args.sigma_min),
-        "--sigma-max",
-        str(args.sigma_max),
-        "--fid-ref-path",
-        args.fid_ref_path,
-        "--fid-samples",
-        str(args.eval_samples),
-        "--weighted-compute-calibration-path",
-        str(args.weighted_compute_calibration_path).strip(),
-        "--train-accelerator-count",
-        str(args.train_accelerator_count),
-    ]
-    if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
-        baseline_cmd.extend(
-            [
-                "--weighted-inputgrad-alpha",
-                str(args.weighted_inputgrad_alpha),
-                "--weighted-parambackward-beta",
-                str(args.weighted_parambackward_beta),
-            ]
-        )
-    if args.skip_existing and os.path.isfile(baseline_runs_csv) and os.path.isfile(baseline_agg_csv):
-        print(f"[collect-weighted] reuse baseline outputs: {baseline_outdir}", flush=True)
+    if reused_baseline_runs_csv:
+        baseline_runs_csv = reused_baseline_runs_csv
+        baseline_agg_csv = reused_baseline_aggregate_csv
+        if not os.path.isfile(baseline_runs_csv):
+            raise FileNotFoundError(f"Requested reused baseline runs CSV not found: {baseline_runs_csv}")
+        if baseline_agg_csv and not os.path.isfile(baseline_agg_csv):
+            raise FileNotFoundError(f"Requested reused baseline aggregate CSV not found: {baseline_agg_csv}")
+        print(f"[collect-weighted] reuse baseline runs csv: {baseline_runs_csv}", flush=True)
     else:
-        print(f"[collect-weighted] baseline seeds={seeds} steps={baseline_run_steps}", flush=True)
-        run_command(cmd=baseline_cmd, log_path=baseline_log)
+        baseline_runs_csv = os.path.join(baseline_outdir, f"{baseline_prefix}_runs.csv")
+        baseline_agg_csv = os.path.join(baseline_outdir, f"{baseline_prefix}_aggregate.csv")
+        baseline_log = os.path.join(logs_dir, f"{baseline_prefix}.log")
+        baseline_cmd = _build_baseline_sweep_cmd(
+            args=args,
+            outdir=baseline_outdir,
+            prefix=baseline_prefix,
+            seeds_text=args.seeds,
+            steps=baseline_run_steps,
+        )
+        if args.skip_existing and os.path.isfile(baseline_runs_csv) and os.path.isfile(baseline_agg_csv):
+            print(f"[collect-weighted] reuse baseline outputs: {baseline_outdir}", flush=True)
+        else:
+            print(f"[collect-weighted] baseline seeds={seeds} steps={baseline_run_steps}", flush=True)
+            run_command(cmd=baseline_cmd, log_path=baseline_log)
 
     baseline_raw = _normalize_baseline_runs(runs_csv=baseline_runs_csv)
     baseline_raw.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
     baseline_by_seed_step = {(int(row["seed"]), int(row["step"])): row for row in baseline_raw}
-    baseline_ckpt_by_seed_step = {
-        (int(row["seed"]), int(row["step"])): row.get("checkpoint_path", "") for row in baseline_raw if row.get("checkpoint_path")
-    }
-    comparison_targets_by_step: Dict[int, List[float]] = {}
-    for step, target in zip(baseline_curve_steps, weighted_grid_targets):
-        comparison_targets_by_step.setdefault(int(step), []).append(float(target))
-    warmup_support_methods_by_step: Dict[int, set] = {}
-    for step in wdro_warmup_support_steps:
-        warmup_support_methods_by_step.setdefault(int(step), set()).add("wdro")
-    for step in cdro_warmup_support_steps:
-        warmup_support_methods_by_step.setdefault(int(step), set()).add("cdro")
-    for row in baseline_raw:
-        step = int(row["step"])
-        comparison_targets = comparison_targets_by_step.get(step, [])
-        warmup_support_methods = sorted(warmup_support_methods_by_step.get(step, set()))
-        is_comparison_knot = bool(comparison_targets)
-        is_aux_warmup_support = bool(warmup_support_methods)
-        row["weighted_grid_target"] = comparison_targets[0] if len(comparison_targets) == 1 else None
-        row["comparison_weighted_targets"] = _encode_float_list(comparison_targets)
-        row["warmup_support_methods"] = _encode_str_list(warmup_support_methods)
-        row["row_role"] = _row_role_label(
-            is_comparison_knot=is_comparison_knot,
-            is_aux_warmup_support=is_aux_warmup_support,
-        )
-        row["is_comparison_knot"] = bool(is_comparison_knot)
-        row["is_aux_warmup_support"] = bool(is_aux_warmup_support)
-        row["trajectory_total_steps_max"] = max((int(step) for step in baseline_run_steps), default=0)
-        row["fixed_warmup_steps"] = 0
-    baseline_all_eval_rows = list(baseline_raw)
     baseline_target_rows: List[Dict] = []
     for seed in seeds:
         for target_weighted, total_steps in zip(weighted_grid_targets, baseline_curve_steps):
@@ -1095,100 +1286,185 @@ def main() -> None:
             if baseline_row is None:
                 raise RuntimeError(f"Missing baseline raw row for seed={seed} step={total_steps}")
             row = dict(baseline_row)
-            row["is_comparison_knot"] = True
             row["weighted_grid_target"] = float(target_weighted)
             row["comparison_weighted_targets"] = _encode_float_list([float(target_weighted)])
-            row["row_role"] = _row_role_label(
-                is_comparison_knot=True,
-                is_aux_warmup_support=bool(row.get("is_aux_warmup_support", False)),
-            )
-            row["trajectory_total_steps_max"] = max((int(step) for step in baseline_curve_steps), default=0)
+            row["warmup_support_methods"] = ""
+            row["row_role"] = _row_role_label(is_comparison_knot=True, is_aux_warmup_support=False)
+            row["is_comparison_knot"] = True
+            row["is_aux_warmup_support"] = False
+            row["trajectory_total_steps_max"] = int(baseline_trajectory_total_steps_max)
             row["fixed_warmup_steps"] = 0
             baseline_target_rows.append(row)
+    baseline_all_eval_rows = list(baseline_target_rows)
 
     wdro_rows: List[Dict] = []
     cdro_rows: List[Dict] = []
-    wdro_manifest_rows: List[Dict] = []
-    cdro_manifest_rows: List[Dict] = []
+    wdro_seed_manifests: List[Dict] = []
+    cdro_seed_manifests: List[Dict] = []
+
+    if reused_wdro_raw_csv:
+        if not os.path.isfile(reused_wdro_raw_csv):
+            raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
+        reused_rows = [
+            row
+            for row in load_csv_rows(reused_wdro_raw_csv)
+            if str(row.get("method", "")) == "wdro" and int(row["seed"]) in seeds
+        ]
+        if not reused_rows:
+            raise RuntimeError(f"No WDRO rows found in reused raw CSV for seeds={seeds}: {reused_wdro_raw_csv}")
+        wdro_rows.extend(reused_rows)
+        wdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
+        wdro_seed_manifests = [
+            {
+                "seed": int(seed),
+                "reused_raw_csv": reused_wdro_raw_csv,
+            }
+            for seed in seeds
+        ]
+        print(f"[collect-weighted] reuse wdro raw csv: {reused_wdro_raw_csv}", flush=True)
 
     for seed in seeds:
-        wdro_outdir = os.path.join(wdro_root, f"s{seed}")
-        ensure_dir(wdro_outdir)
-        for target_weighted, total_steps in zip(weighted_grid_targets, wdro_curve_steps):
-            warmup_steps = int(wdro_warmup_steps_by_total[int(total_steps)])
-            seed_baseline_warmup_ckpt = (
-                baseline_ckpt_by_seed_step.get((int(seed), int(warmup_steps))) if int(warmup_steps) > 0 else None
+        if not reused_wdro_raw_csv:
+            wdro_outdir = os.path.join(wdro_root, f"s{seed}")
+            ensure_dir(wdro_outdir)
+            wdro_warmup_rows, wdro_support_checkpoint, wdro_warmup_manifest = _run_method_local_warmup_trajectory(
+                args=args,
+                method_name="wdro",
+                method_root=wdro_root,
+                seed=int(seed),
+                weighted_grid_targets=weighted_grid_targets,
+                comparison_steps=wdro_curve_steps,
+                fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+                trajectory_total_steps_max=int(wdro_max_total_steps),
             )
-            exp_name = f"{args.prefix}_wdro_s{seed}_st{int(total_steps)}"
-            metrics_path = os.path.join(wdro_outdir, exp_name, "metrics.json")
-            log_path = os.path.join(logs_dir, f"{exp_name}.log")
-            if args.skip_existing and os.path.isfile(metrics_path):
-                print(f"[collect-weighted] reuse wdro seed={seed} step={total_steps}: {metrics_path}", flush=True)
-            else:
-                print(
-                    f"[collect-weighted] wdro seed={seed} step={total_steps} "
-                    f"target_weighted={target_weighted:.4f} warmup_steps={warmup_steps} "
-                    f"baseline_ckpt={'yes' if seed_baseline_warmup_ckpt else 'no'}",
-                    flush=True,
-                )
-                cmd = _build_run_toy_cmd(
-                    args=args,
+            wdro_rows.extend(wdro_warmup_rows)
+            wdro_seed_manifest = {
+                "seed": int(seed),
+                "trajectory_total_steps_max": int(wdro_max_total_steps),
+                "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
+                "warmup": wdro_warmup_manifest,
+                "robust_checkpoints": [],
+            }
+            wdro_resume_checkpoint = None
+            for target_weighted, total_steps in zip(weighted_grid_targets, wdro_curve_steps):
+                if int(total_steps) <= int(wdro_fixed_warmup_steps):
+                    continue
+                checkpoint_path = _trajectory_checkpoint_path(
+                    trajectory_dir=wdro_outdir,
                     method_name="wdro",
-                    outdir=wdro_outdir,
-                    exp_name=exp_name,
                     seed=int(seed),
                     total_steps=int(total_steps),
-                    fixed_warmup_steps=None,
-                    resume_path=None,
-                    baseline_ckpt_path=seed_baseline_warmup_ckpt,
-                    use_resume=False,
                 )
-                run_command(cmd=cmd, log_path=log_path)
-            row = _extract_wdro_row(
-                metrics_path=metrics_path,
-                calibration=calibration,
-                train_accelerator_count=int(args.train_accelerator_count),
-            )
-            wdro_rows.append(
-                _normalize_method_metrics_row(
-                    row=row,
-                    seed=int(seed),
-                    method_name="wdro",
-                    row_origin="method_metrics",
-                    weighted_grid_target=float(target_weighted),
-                    trajectory_total_steps_max=int(args.wdro_max_total_steps),
-                    fixed_warmup_steps=int(warmup_steps),
+                baseline_ckpt_requested = wdro_support_checkpoint if wdro_resume_checkpoint is None else None
+                exp_name = f"{args.prefix}_wdro_s{seed}_st{int(total_steps)}"
+                metrics_path = os.path.join(wdro_outdir, exp_name, "metrics.json")
+                log_path = os.path.join(logs_dir, f"{exp_name}.log")
+                if args.skip_existing and os.path.isfile(metrics_path) and os.path.isfile(checkpoint_path):
+                    print(
+                        f"[collect-weighted] reuse wdro seed={seed} step={total_steps}: {metrics_path}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[collect-weighted] wdro seed={seed} step={total_steps} "
+                        f"target_weighted={target_weighted:.4f} fixed_warmup_steps={int(wdro_fixed_warmup_steps)} "
+                        f"baseline_ckpt={'yes' if baseline_ckpt_requested else 'no'} "
+                        f"resume_ckpt={'yes' if wdro_resume_checkpoint else 'no'}",
+                        flush=True,
+                    )
+                    cmd = _build_run_toy_cmd(
+                        args=args,
+                        method_name="wdro",
+                        outdir=wdro_outdir,
+                        exp_name=exp_name,
+                        seed=int(seed),
+                        total_steps=int(total_steps),
+                        fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+                        resume_path=wdro_resume_checkpoint,
+                        save_path=checkpoint_path,
+                        baseline_ckpt_path=baseline_ckpt_requested,
+                    )
+                    run_command(cmd=cmd, log_path=log_path)
+                row = _extract_wdro_row(
+                    metrics_path=metrics_path,
+                    calibration=calibration,
+                    train_accelerator_count=int(args.train_accelerator_count),
                 )
-            )
-            wdro_manifest_rows.append(
-                {
-                    "seed": int(seed),
-                    "step": int(total_steps),
-                    "warmup_steps": int(warmup_steps),
-                    "weighted_grid_target": float(target_weighted),
-                    "row_origin": "method_metrics",
-                    "metrics_path": metrics_path,
-                    "baseline_ckpt_path": seed_baseline_warmup_ckpt,
-                }
-            )
+                row["checkpoint_path"] = checkpoint_path
+                row["baseline_ckpt_requested"] = baseline_ckpt_requested
+                row["robust_resume_ckpt_requested"] = wdro_resume_checkpoint
+                wdro_rows.append(
+                    _normalize_method_metrics_row(
+                        row=row,
+                        seed=int(seed),
+                        method_name="wdro",
+                        row_origin="trajectory_robust_phase",
+                        weighted_grid_target=float(target_weighted),
+                        trajectory_total_steps_max=int(wdro_max_total_steps),
+                        fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+                    )
+                )
+                wdro_seed_manifest["robust_checkpoints"].append(
+                    {
+                        "seed": int(seed),
+                        "step": int(total_steps),
+                        "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
+                        "weighted_grid_target": float(target_weighted),
+                        "row_origin": "trajectory_robust_phase",
+                        "metrics_path": metrics_path,
+                        "checkpoint_path": checkpoint_path,
+                        "baseline_ckpt_path": baseline_ckpt_requested,
+                        "resume_ckpt_path": wdro_resume_checkpoint,
+                    }
+                )
+                wdro_resume_checkpoint = checkpoint_path
+            wdro_seed_manifests.append(wdro_seed_manifest)
 
         cdro_outdir = os.path.join(cdro_root, f"s{seed}")
         ensure_dir(cdro_outdir)
+        cdro_warmup_rows, cdro_support_checkpoint, cdro_warmup_manifest = _run_method_local_warmup_trajectory(
+            args=args,
+            method_name="cdro",
+            method_root=cdro_root,
+            seed=int(seed),
+            weighted_grid_targets=weighted_grid_targets,
+            comparison_steps=cdro_curve_steps,
+            fixed_warmup_steps=int(cdro_fixed_warmup_steps),
+            trajectory_total_steps_max=int(cdro_max_total_steps),
+        )
+        cdro_rows.extend(cdro_warmup_rows)
+        cdro_seed_manifest = {
+            "seed": int(seed),
+            "trajectory_total_steps_max": int(cdro_max_total_steps),
+            "fixed_warmup_steps": int(cdro_fixed_warmup_steps),
+            "warmup": cdro_warmup_manifest,
+            "robust_checkpoints": [],
+        }
+        cdro_resume_checkpoint = None
         for target_weighted, total_steps in zip(weighted_grid_targets, cdro_curve_steps):
-            warmup_steps = int(cdro_warmup_steps_by_total[int(total_steps)])
-            seed_baseline_warmup_ckpt = (
-                baseline_ckpt_by_seed_step.get((int(seed), int(warmup_steps))) if int(warmup_steps) > 0 else None
+            if int(total_steps) <= int(cdro_fixed_warmup_steps):
+                continue
+            checkpoint_path = _trajectory_checkpoint_path(
+                trajectory_dir=cdro_outdir,
+                method_name="cdro",
+                seed=int(seed),
+                total_steps=int(total_steps),
             )
+            baseline_ckpt_requested = cdro_support_checkpoint if cdro_resume_checkpoint is None else None
             exp_name = f"{args.prefix}_cdro_s{seed}_st{int(total_steps)}"
             metrics_path = os.path.join(cdro_outdir, exp_name, "metrics.json")
             log_path = os.path.join(logs_dir, f"{exp_name}.log")
-            if args.skip_existing and os.path.isfile(metrics_path):
-                print(f"[collect-weighted] reuse cdro seed={seed} step={total_steps}: {metrics_path}", flush=True)
+            if args.skip_existing and os.path.isfile(metrics_path) and os.path.isfile(checkpoint_path):
+                print(
+                    f"[collect-weighted] reuse cdro seed={seed} step={total_steps}: {metrics_path}",
+                    flush=True,
+                )
             else:
                 print(
                     f"[collect-weighted] cdro seed={seed} step={total_steps} "
-                    f"target_weighted={target_weighted:.4f} warmup_steps={warmup_steps} "
-                    f"baseline_ckpt={'yes' if seed_baseline_warmup_ckpt else 'no'}",
+                    f"target_weighted={target_weighted:.4f} fixed_warmup_steps={int(cdro_fixed_warmup_steps)} "
+                    f"baseline_ckpt={'yes' if baseline_ckpt_requested else 'no'} "
+                    f"resume_ckpt={'yes' if cdro_resume_checkpoint else 'no'}",
                     flush=True,
                 )
                 cmd = _build_run_toy_cmd(
@@ -1198,40 +1474,46 @@ def main() -> None:
                     exp_name=exp_name,
                     seed=int(seed),
                     total_steps=int(total_steps),
-                    fixed_warmup_steps=None,
-                    resume_path=None,
-                    baseline_ckpt_path=seed_baseline_warmup_ckpt,
-                    use_resume=False,
+                    fixed_warmup_steps=int(cdro_fixed_warmup_steps),
+                    resume_path=cdro_resume_checkpoint,
+                    save_path=checkpoint_path,
+                    baseline_ckpt_path=baseline_ckpt_requested,
                 )
                 run_command(cmd=cmd, log_path=log_path)
             row = _extract_cdro_row(
                 metrics_path=metrics_path,
-                baseline_ckpt_requested=seed_baseline_warmup_ckpt,
+                baseline_ckpt_requested=baseline_ckpt_requested,
                 calibration=calibration,
                 train_accelerator_count=int(args.train_accelerator_count),
             )
+            row["checkpoint_path"] = checkpoint_path
+            row["robust_resume_ckpt_requested"] = cdro_resume_checkpoint
             cdro_rows.append(
                 _normalize_method_metrics_row(
                     row=row,
                     seed=int(seed),
                     method_name="cdro",
-                    row_origin="method_metrics",
+                    row_origin="trajectory_robust_phase",
                     weighted_grid_target=float(target_weighted),
                     trajectory_total_steps_max=int(cdro_max_total_steps),
-                    fixed_warmup_steps=int(warmup_steps),
+                    fixed_warmup_steps=int(cdro_fixed_warmup_steps),
                 )
             )
-            cdro_manifest_rows.append(
+            cdro_seed_manifest["robust_checkpoints"].append(
                 {
                     "seed": int(seed),
                     "step": int(total_steps),
-                    "warmup_steps": int(warmup_steps),
+                    "fixed_warmup_steps": int(cdro_fixed_warmup_steps),
                     "weighted_grid_target": float(target_weighted),
-                    "row_origin": "method_metrics",
+                    "row_origin": "trajectory_robust_phase",
                     "metrics_path": metrics_path,
-                    "baseline_ckpt_path": seed_baseline_warmup_ckpt,
+                    "checkpoint_path": checkpoint_path,
+                    "baseline_ckpt_path": baseline_ckpt_requested,
+                    "resume_ckpt_path": cdro_resume_checkpoint,
                 }
             )
+            cdro_resume_checkpoint = checkpoint_path
+        cdro_seed_manifests.append(cdro_seed_manifest)
 
     wdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
     cdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
@@ -1251,30 +1533,37 @@ def main() -> None:
 
     manifest = {
         "protocol": {
-            "name": "three_method_raw_seed_collection_weighted_grid",
+            "name": "three_method_single_trajectory_weighted_grid",
             "description": (
-                "Raw per-seed data collection on a shared weighted-compute grid. Baseline is a native "
-                "checkpointed single trajectory. WDRO and CDRO are independent per-knot runs whose "
-                "warmup budgets are recomputed from each knot's total budget using their native relative "
-                "warmup rules. The baseline sweep also evaluates auxiliary warmup-support checkpoints so "
-                "same-seed exact checkpoint transfer is available when possible. Aggregation is intentionally "
-                "deferred to later analysis."
+                "Raw per-seed data collection on a shared weighted-compute grid. Baseline runs as one native "
+                "checkpointed trajectory. WDRO and CDRO each use one same-seed same-method trajectory: a "
+                "method-local checkpointed warmup baseline trajectory up to a fixed warmup checkpoint, then a "
+                "continued robust trajectory resumed only from that method's own checkpoints. Comparison rows are "
+                "emitted only at shared weighted-grid checkpoints; exact warmup checkpoints are auxiliary support "
+                "artifacts. Aggregation is intentionally deferred to later analysis."
             ),
             "seeds": seeds,
-            "shared_grid_template_name": "wdro_dense_25_relative",
-            "shared_grid_template_steps": GRID_TEMPLATE_STEPS,
-            "grid_strategy": "25-knot relative template applied in weighted-compute space",
+            "shared_grid_template_name": str(grid_template["name"]),
+            "shared_grid_template_steps": list(grid_template["steps"]),
+            "grid_strategy": (
+                f"{len(list(grid_template['steps'])) - 1}-knot relative template applied in weighted-compute space"
+            ),
             "primary_metric": "weighted_compute_units",
             "secondary_metric": "train_wall_clock_sec",
             "legacy_metric": "batch_equiv_denoiser_evals",
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
-            "baseline_auxiliary_eval_points_enabled": True,
-            "same_seed_baseline_checkpoint_transfer": "opportunistic_exact_match_only",
+            "baseline_auxiliary_eval_points_enabled": False,
+            "method_local_warmup_support_checkpoints_enabled": True,
+            "fid_evaluation_schedule": "every_comparison_checkpoint",
+            "checkpoint_schedule": "every_comparison_checkpoint_plus_exact_warmup_support",
             "implicit_outdir_baseline_cache_reuse": False,
             "cross_seed_checkpoint_reuse": False,
+            "cross_method_checkpoint_reuse": False,
             "cross_method_baseline_cache_reuse": False,
-            "cross_knot_robust_resume_reuse": False,
+            "cross_knot_robust_resume_reuse": "same_seed_same_method_only",
             "cdro_collapse_diagnostics_disabled": True,
+            "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
+            "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
         },
         "weighted_compute": {
             "shared_cap": float(shared_weighted_cap),
@@ -1282,33 +1571,36 @@ def main() -> None:
             "baseline_step_weighted_units": float(baseline_step_weighted_units),
             "wdro_expected_robust_step_weighted_units": float(wdro_robust_step_weighted_units),
             "cdro_expected_robust_step_weighted_units": float(cdro_robust_step_weighted_units),
+            "cdro_effective_n_steps_path": int(_effective_cdro_n_steps_path(args)),
             "calibration": calibration,
         },
         "trajectories": {
             "baseline": {
-                "max_total_steps": max(baseline_run_steps) if baseline_run_steps else 0,
+                "max_total_steps": int(baseline_trajectory_total_steps_max),
                 "comparison_steps": baseline_curve_steps,
-                "auxiliary_warmup_support_steps": auxiliary_baseline_support_steps,
                 "checkpoint_steps": baseline_run_steps,
             },
             "wdro": {
-                "max_total_steps": int(args.wdro_max_total_steps),
-                "warmup_mode": "per_point_fraction",
-                "max_total_warmup_steps": int(wdro_max_total_warmup_steps),
-                "warmup_support_steps": wdro_warmup_support_steps,
+                "max_total_steps": int(wdro_max_total_steps),
+                "warmup_mode": "fixed_from_max_budget_trajectory",
+                "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
+                "warmup_support_steps": [int(wdro_fixed_warmup_steps)] if int(wdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": wdro_curve_steps,
             },
             "cdro": {
                 "max_total_steps": int(cdro_max_total_steps),
-                "warmup_mode": "per_point_weighted_match",
-                "max_total_warmup_steps": int(cdro_fixed_warmup_steps),
-                "warmup_support_steps": cdro_warmup_support_steps,
+                "warmup_mode": "fixed_from_max_budget_trajectory",
+                "fixed_warmup_steps": int(cdro_fixed_warmup_steps),
+                "warmup_support_steps": [int(cdro_fixed_warmup_steps)] if int(cdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": cdro_curve_steps,
             },
         },
         "artifacts": {
             "baseline_runs_csv": baseline_runs_csv,
             "baseline_aggregate_csv": baseline_agg_csv,
+            "reused_baseline_runs_csv": reused_baseline_runs_csv or None,
+            "reused_baseline_aggregate_csv": reused_baseline_aggregate_csv or None,
+            "reused_wdro_raw_csv": reused_wdro_raw_csv or None,
             "baseline_all_eval_raw_csv": baseline_all_eval_raw_csv,
             "baseline_raw_csv": baseline_raw_csv,
             "wdro_raw_csv": wdro_raw_csv,
@@ -1316,8 +1608,8 @@ def main() -> None:
             "combined_raw_csv": combined_raw_csv,
         },
         "per_seed_runs": {
-            "wdro": wdro_manifest_rows,
-            "cdro": cdro_manifest_rows,
+            "wdro": wdro_seed_manifests,
+            "cdro": cdro_seed_manifests,
         },
     }
     manifest_path = os.path.join(args.outdir, f"{args.prefix}_manifest.json")
