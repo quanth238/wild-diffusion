@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
+import pickle
 import subprocess
 import sys
-from typing import Dict, List, Optional, Tuple
+import time
+from typing import Dict, List, Optional, TextIO, Tuple
+
+import numpy as np
+import torch
 
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -13,7 +21,14 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 
+from toy.config import ToyConfig  # noqa: E402
+from toy.data_backends.provider import build_dataset_bundle  # noqa: E402
+from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
+from toy.shared.reverse import reverse_posterior_mean, reverse_posterior_std  # noqa: E402
+from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
+from toy.shared.sigma import build_sigma_levels  # noqa: E402
+from toy.utils import batch_scalar_like, ensure_dir, pick_device, set_seed  # noqa: E402
 
 
 _APPLIED_PROCESS_TITLE = apply_process_title()
@@ -33,13 +48,26 @@ DEFAULT_CALIBRATION = os.path.join(
     "compute_calibration",
     "simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json",
 )
+DEFAULT_FID_BATCH_SIZE = 512
+
+
+@dataclass
+class EvalContext:
+    key: Tuple[object, ...]
+    cfg: ToyConfig
+    device: torch.device
+    amp_dtype: Optional[torch.dtype]
+    dataset: object
+    sigma_levels: torch.Tensor
+    baseline_model: torch.nn.Module
+    robust_model: torch.nn.Module
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Re-evaluate existing three-method trajectory checkpoints with a larger FID sample count "
-            "without retraining, then regenerate per-case plots from the refreshed combined CSV."
+            "Re-evaluate existing three-method trajectory checkpoints with in-memory batched FID "
+            "directly from saved checkpoints, then regenerate per-case plots from the refreshed combined CSV."
         )
     )
     parser.add_argument("--combined-csv", type=str, required=True)
@@ -52,6 +80,7 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(ROOT_DIR, "toy", "scripts", "plot_three_method_fid_curves.py"),
     )
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--amp-dtype", type=str, default="auto")
     parser.add_argument("--dataset-path", type=str, default=DEFAULT_TRAIN_ROOT)
     parser.add_argument("--dataset-val-path", type=str, default=DEFAULT_VAL_ROOT)
     parser.add_argument("--fid-ref-path", type=str, default=DEFAULT_FID_REF)
@@ -67,19 +96,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=50000)
+    parser.add_argument("--fid-batch-size", type=int, default=DEFAULT_FID_BATCH_SIZE)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
     parser.add_argument("--debug-terminal-step", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--n-steps-path-default", type=int, default=24)
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
+    parser.add_argument("--metrics-eval-seed-offset", type=int, default=ToyConfig.eval_seed_offset_metrics)
     parser.add_argument("--train-percent-label", type=str, default="1%")
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
-
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
 
 
 def load_rows(path: str) -> List[Dict[str, str]]:
@@ -115,6 +142,20 @@ def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _load_json(path: str) -> Dict:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _resolve_repo_path(path: str) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if os.path.isabs(text):
+        return text
+    return os.path.join(ROOT_DIR, text)
+
+
 def _row_seed(row: Dict[str, str]) -> int:
     return _safe_int(row.get("seed"), 0)
 
@@ -129,216 +170,12 @@ def _is_baseline_style_row(row: Dict[str, str]) -> bool:
     return method == "baseline_edm" or row_origin == "trajectory_warmup_phase"
 
 
-def _load_json(path: str) -> Dict:
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+def _checkpoint_branch(row: Dict[str, str]) -> str:
+    return "baseline" if _is_baseline_style_row(row) else "robust"
 
 
-def _common_run_toy_prefix(
-    *,
-    args: argparse.Namespace,
-    exp_name: str,
-    eval_outdir: str,
-    seed: int,
-    n_steps_path: int,
-    batch_size: int,
-    hidden_dim: int,
-    sigma_min: float,
-    sigma_max: float,
-) -> List[str]:
-    cmd = [
-        args.python_bin,
-        os.path.join(ROOT_DIR, "toy", "run_toy.py"),
-        "--exp-name",
-        exp_name,
-        "--outdir",
-        eval_outdir,
-        "--device",
-        args.device,
-        "--seed",
-        str(seed),
-        "--batch-size",
-        str(batch_size),
-        "--log-every",
-        str(args.log_every),
-        "--eval-samples",
-        str(args.eval_samples),
-        "--fid-samples",
-        str(args.fid_samples),
-        "--debug-eval-batch",
-        str(args.debug_eval_batch),
-        "--debug-terminal-step",
-        str(args.debug_terminal_step),
-        "--n-steps-path",
-        str(n_steps_path),
-        "--hidden-dim",
-        str(hidden_dim),
-        "--dataset-kind",
-        "image_folder",
-        "--model-kind",
-        "image_conv",
-        "--diagnostics-kind",
-        "image_basic",
-        "--dataset-path",
-        args.dataset_path,
-        "--dataset-val-path",
-        args.dataset_val_path,
-        "--image-size",
-        str(args.image_size),
-        "--image-channels",
-        str(args.image_channels),
-        "--image-train-size",
-        str(args.image_train_size),
-        "--image-val-size",
-        str(args.image_val_size),
-        "--image-split-seed",
-        str(args.image_split_seed),
-        "--sigma-min",
-        str(sigma_min),
-        "--sigma-max",
-        str(sigma_max),
-        "--compute-fid",
-        "--fid-ref-path",
-        args.fid_ref_path,
-        "--skip-checks",
-        "--disable-baseline-gate",
-        "--weighted-compute-calibration-path",
-        args.weighted_compute_calibration_path,
-    ]
-    if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
-        cmd.extend(
-            [
-                "--weighted-inputgrad-alpha",
-                str(args.weighted_inputgrad_alpha),
-                "--weighted-parambackward-beta",
-                str(args.weighted_parambackward_beta),
-            ]
-        )
-    return cmd
-
-
-def _baseline_eval_command(
-    *,
-    args: argparse.Namespace,
-    row: Dict[str, str],
-    exp_name: str,
-    eval_outdir: str,
-) -> List[str]:
-    step = _row_step(row)
-    cmd = _common_run_toy_prefix(
-        args=args,
-        exp_name=exp_name,
-        eval_outdir=eval_outdir,
-        seed=_row_seed(row),
-        n_steps_path=int(args.n_steps_path_default),
-        batch_size=int(args.batch_size),
-        hidden_dim=int(args.hidden_dim),
-        sigma_min=float(args.sigma_min),
-        sigma_max=float(args.sigma_max),
-    )
-    cmd.extend(
-        [
-            "--steps",
-            str(step),
-            "--method-version",
-            "clean",
-            "--baseline-only",
-            "--baseline-ckpt-path",
-            str(row["checkpoint_path"]),
-            "--disable-baseline-ckpt-strict-meta",
-        ]
-    )
-    return cmd
-
-
-def _robust_eval_command(
-    *,
-    args: argparse.Namespace,
-    row: Dict[str, str],
-    exp_name: str,
-    eval_outdir: str,
-) -> List[str]:
-    metrics_path = str(row.get("metrics_path", "")).strip()
-    if not metrics_path:
-        raise RuntimeError(f"Missing metrics_path for robust row: method={row.get('method')} step={row.get('step')}")
-    payload = _load_json(metrics_path)
-    cfg = payload.get("config", {})
-    method_name = str(row["method"]).strip()
-    cmd = _common_run_toy_prefix(
-        args=args,
-        exp_name=exp_name,
-        eval_outdir=eval_outdir,
-        seed=_row_seed(row),
-        n_steps_path=_safe_int(cfg.get("n_steps_path"), int(args.n_steps_path_default)),
-        batch_size=_safe_int(cfg.get("batch_size"), int(args.batch_size)),
-        hidden_dim=_safe_int(cfg.get("hidden_dim"), int(args.hidden_dim)),
-        sigma_min=float(_safe_float(cfg.get("sigma_min"), float(args.sigma_min))),
-        sigma_max=float(_safe_float(cfg.get("sigma_max"), float(args.sigma_max))),
-    )
-    cmd.extend(
-        [
-            "--steps",
-            str(_safe_int(cfg.get("steps"), _row_step(row))),
-            "--method-version",
-            method_name,
-            "--disable-baseline-ckpt",
-            "--robust-resume-ckpt-path",
-            str(row["checkpoint_path"]),
-        ]
-    )
-    baseline_steps_override = _safe_int(cfg.get("baseline_steps_override"), 0)
-    if baseline_steps_override > 0:
-        cmd.extend(["--baseline-steps-override", str(baseline_steps_override)])
-
-    if method_name == "wdro":
-        cmd.extend(
-            [
-                "--wdro-warmup-fraction",
-                str(float(cfg.get("wdro_warmup_fraction", 0.0))),
-                "--wdro-refresh-epochs",
-                str(float(cfg.get("wdro_refresh_epochs", 100.0))),
-                "--wdro-adv-prob",
-                str(float(cfg.get("wdro_adv_prob", 0.3))),
-                "--wdro-attack-steps",
-                str(_safe_int(cfg.get("wdro_attack_steps"), 2)),
-                "--wdro-attack-step-size",
-                str(float(cfg.get("wdro_attack_step_size", 1e-3))),
-                "--wdro-gamma",
-                str(float(cfg.get("wdro_gamma", 1.0))),
-            ]
-        )
-    elif method_name == "cdro":
-        cmd.extend(
-            [
-                "--inner-steps",
-                str(_safe_int(cfg.get("inner_steps"), 1)),
-                "--outer-attack-weight",
-                str(float(cfg.get("outer_attack_weight", 0.5))),
-                "--outer-clean-weight",
-                str(float(cfg.get("outer_clean_weight", 1.0))),
-                "--cdro-step-size",
-                str(float(cfg.get("cdro_step_size", 0.02))),
-                "--cdro-total-budget-rho",
-                str(float(cfg.get("cdro_total_budget_rho", 0.02))),
-                "--cdro-time-horizon",
-                str(float(cfg.get("cdro_time_horizon", 1.0))),
-                "--cdro-warmup-fraction",
-                str(float(cfg.get("cdro_warmup_fraction", 0.0))),
-                "--disable-collapse-diagnostics",
-            ]
-        )
-    else:
-        raise RuntimeError(f"Unsupported robust method for reevaluation: {method_name}")
-    return cmd
-
-
-def _reeval_cache_key(row: Dict[str, str]) -> Tuple[str, str]:
-    checkpoint_path = str(row.get("checkpoint_path", "")).strip()
-    if not checkpoint_path:
-        raise RuntimeError(f"Missing checkpoint_path in row: method={row.get('method')} step={row.get('step')}")
-    if _is_baseline_style_row(row):
-        return ("baseline", checkpoint_path)
-    return (str(row.get("method", "")).strip(), checkpoint_path)
+def _metrics_fid_key(row: Dict[str, str]) -> str:
+    return "baseline_fid" if _is_baseline_style_row(row) else "robust_fid"
 
 
 def _exp_name_from_row(prefix: str, row: Dict[str, str], occurrence_index: int) -> str:
@@ -349,35 +186,539 @@ def _exp_name_from_row(prefix: str, row: Dict[str, str], occurrence_index: int) 
     return f"{prefix}_{method}_{row_origin}_st{step}_s{seed}_k{occurrence_index:03d}"
 
 
+def _reeval_cache_key(row: Dict[str, str]) -> Tuple[str, str]:
+    checkpoint_path = _resolve_repo_path(row.get("checkpoint_path", ""))
+    if not checkpoint_path:
+        raise RuntimeError(f"Missing checkpoint_path in row: method={row.get('method')} step={row.get('step')}")
+    return (_checkpoint_branch(row), checkpoint_path)
+
+
+def _find_detector_path() -> str:
+    env_path = os.environ.get("FID_DETECTOR_PATH", "").strip()
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    cache_root = Path.home() / ".cache" / "dnnlib" / "downloads"
+    matches = sorted(cache_root.rglob("*inception-2015-12-05.pkl"))
+    if matches:
+        return str(matches[0])
+    return ""
+
+
+def _load_detector(device: torch.device):
+    import dnnlib
+
+    detector_path = _find_detector_path()
+    detector_url = (
+        "https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/"
+        "versions/1/files/metrics/inception-2015-12-05.pkl"
+    )
+    if detector_path:
+        with open(detector_path, "rb") as handle:
+            detector_net = pickle.load(handle).to(device)
+    else:
+        with dnnlib.util.open_url(detector_url, verbose=True) as handle:
+            detector_net = pickle.load(handle).to(device)
+    detector_net.eval()
+    return detector_net
+
+
+def _load_ref_stats(path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    ref = np.load(path)
+    mu = torch.from_numpy(ref["mu"]).to(dtype=torch.float64)
+    sigma = torch.from_numpy(ref["sigma"]).to(dtype=torch.float64)
+    return mu, sigma
+
+
+def _symmetrize_cov_torch(matrix: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (matrix + matrix.transpose(-1, -2))
+
+
+def _trace_sqrt_product_torch(sigma: torch.Tensor, sigma_ref: torch.Tensor) -> torch.Tensor:
+    sigma = _symmetrize_cov_torch(sigma)
+    sigma_ref = _symmetrize_cov_torch(sigma_ref)
+    evals, evecs = torch.linalg.eigh(sigma)
+    evals = evals.clamp_min(0.0)
+    sqrt_sigma = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.transpose(-1, -2)
+    middle = _symmetrize_cov_torch(sqrt_sigma @ sigma_ref @ sqrt_sigma)
+    middle_evals = torch.linalg.eigvalsh(middle).clamp_min(0.0)
+    return middle_evals.sqrt().sum()
+
+
+def _calculate_fid_from_stats_torch(
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+) -> float:
+    diff = mu - mu_ref
+    trace_sqrt = _trace_sqrt_product_torch(sigma, sigma_ref)
+    fid = diff.dot(diff) + torch.trace(sigma) + torch.trace(sigma_ref) - (2.0 * trace_sqrt)
+    return float(torch.real(fid).item())
+
+
+@torch.no_grad()
+def _sample_reverse_x0(
+    *,
+    denoiser: torch.nn.Module,
+    sigma_levels: torch.Tensor,
+    n_samples: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    sample_terminal_batch_fn,
+) -> torch.Tensor:
+    x = sample_terminal_batch_fn(n_samples, sigma_levels[-1]).to(device=device)
+    n_steps = sigma_levels.numel() - 1
+    for k in range(n_steps, 0, -1):
+        sigma = torch.full((n_samples,), sigma_levels[k], device=device, dtype=x.dtype)
+        sigma_prev = torch.full((n_samples,), sigma_levels[k - 1], device=device, dtype=x.dtype)
+        with autocast_context(device, amp_dtype):
+            x0_pred = denoiser(x, sigma)
+            mean = reverse_posterior_mean(x, x0_pred, sigma, sigma_prev)
+        if k > 1:
+            std = reverse_posterior_std(sigma, sigma_prev)
+            x = mean + batch_scalar_like(std, x) * torch.randn_like(x)
+        else:
+            x = mean
+    return x
+
+
+@torch.no_grad()
+def _compute_fid_for_model(
+    *,
+    denoiser: torch.nn.Module,
+    sigma_levels: torch.Tensor,
+    dataset,
+    detector_net,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+    num_images: int,
+    gen_batch: int,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    log_handle: Optional[TextIO] = None,
+) -> float:
+    feature_dim = 2048
+    mu = torch.zeros([feature_dim], dtype=torch.float64, device=device)
+    sigma = torch.zeros([feature_dim, feature_dim], dtype=torch.float64, device=device)
+    n_done = 0
+    t_start = time.perf_counter()
+
+    denoiser.eval()
+    while n_done < num_images:
+        cur = min(gen_batch, num_images - n_done)
+        images = _sample_reverse_x0(
+            denoiser=denoiser,
+            sigma_levels=sigma_levels,
+            n_samples=cur,
+            device=device,
+            amp_dtype=amp_dtype,
+            sample_terminal_batch_fn=dataset.sample_terminal_batch,
+        )
+        images = ((images + 1.0) * 127.5).clamp(0.0, 255.0).to(torch.uint8)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        features = detector_net(images, return_features=True).to(torch.float64)
+        mu += features.sum(0)
+        sigma += features.T @ features
+        n_done += cur
+        if log_handle is not None:
+            elapsed = time.perf_counter() - t_start
+            log_handle.write(
+                f"[fid-only] progress images={n_done}/{num_images} batch={cur} elapsed_sec={elapsed:.2f}\n"
+            )
+            log_handle.flush()
+
+    mu /= num_images
+    sigma -= mu.ger(mu) * num_images
+    sigma /= max(num_images - 1, 1)
+    return _calculate_fid_from_stats_torch(mu, sigma, mu_ref, sigma_ref)
+
+
+def _load_checkpoint_payload(ckpt_path: str) -> Dict:
+    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid checkpoint format (expect dict): {ckpt_path}")
+    return payload
+
+
+def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
+    payload = _load_checkpoint_payload(ckpt_path)
+    if "baseline_state_dict" in payload:
+        state_dict = payload["baseline_state_dict"]
+    elif "state_dict" in payload:
+        state_dict = payload["state_dict"]
+    else:
+        raise RuntimeError(
+            "Missing keys 'baseline_state_dict' and 'state_dict' in baseline checkpoint: "
+            f"{ckpt_path}"
+        )
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Invalid baseline state_dict in checkpoint: {ckpt_path}")
+    return state_dict
+
+
+def _load_robust_state_dict(ckpt_path: str, method_name: str) -> Dict[str, torch.Tensor]:
+    payload = _load_checkpoint_payload(ckpt_path)
+    saved_method = str(payload.get("method_name", "")).strip().lower()
+    expected_method = str(method_name).strip().lower()
+    if saved_method and saved_method != expected_method:
+        raise RuntimeError(
+            f"Robust resume checkpoint method mismatch: current={expected_method} saved={saved_method} ({ckpt_path})"
+        )
+    state_dict = payload.get("robust_state_dict")
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Missing robust_state_dict in robust checkpoint: {ckpt_path}")
+    return state_dict
+
+
+def _base_cfg_from_args(args: argparse.Namespace) -> ToyConfig:
+    cfg = ToyConfig()
+    cfg.outdir = args.outdir
+    cfg.exp_name = args.prefix
+    cfg.seed = 0
+    cfg.device = args.device
+    cfg.amp_dtype = args.amp_dtype
+    cfg.dataset_kind = "image_folder"
+    cfg.model_kind = "image_conv"
+    cfg.diagnostics_kind = "image_basic"
+    cfg.dataset_path = args.dataset_path
+    cfg.dataset_val_path = args.dataset_val_path
+    cfg.image_size = int(args.image_size)
+    cfg.image_channels = int(args.image_channels)
+    cfg.image_train_size = int(args.image_train_size)
+    cfg.image_val_size = int(args.image_val_size)
+    cfg.image_split_seed = int(args.image_split_seed)
+    cfg.batch_size = int(args.batch_size)
+    cfg.hidden_dim = int(args.hidden_dim)
+    cfg.eval_samples = int(args.eval_samples)
+    cfg.fid_samples = int(args.fid_samples)
+    cfg.n_steps_path = int(args.n_steps_path_default)
+    cfg.sigma_min = float(args.sigma_min)
+    cfg.sigma_max = float(args.sigma_max)
+    cfg.training_objective = "edm"
+    cfg.compute_fid = True
+    cfg.run_checks = False
+    cfg.baseline_gate_enabled = False
+    cfg.eval_seed_offset_metrics = int(args.metrics_eval_seed_offset)
+    return cfg
+
+
+def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
+    field_names = {
+        "amp_dtype",
+        "allow_tf32",
+        "batch_size",
+        "cudnn_benchmark",
+        "dataset_kind",
+        "dataset_path",
+        "dataset_val_path",
+        "eval_seed_offset_metrics",
+        "fid_ref_path",
+        "hidden_dim",
+        "image_channels",
+        "image_size",
+        "image_split_seed",
+        "image_train_size",
+        "image_val_size",
+        "limited_data_enabled",
+        "model_kind",
+        "n_steps_path",
+        "sigma_data",
+        "sigma_max",
+        "sigma_min",
+        "training_objective",
+        "use_ema_eval",
+    }
+    for key in field_names:
+        if key in source and source.get(key) is not None:
+            setattr(cfg, key, source.get(key))
+
+
+def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig:
+    cfg = _base_cfg_from_args(args)
+    cfg.seed = _row_seed(row)
+    cfg.steps = _row_step(row)
+    metrics_path = _resolve_repo_path(row.get("metrics_path", ""))
+    if metrics_path:
+        payload = _load_json(metrics_path)
+        source_cfg = payload.get("config", {})
+        if isinstance(source_cfg, dict):
+            _apply_cfg_overrides(cfg, source_cfg)
+    cfg.outdir = args.outdir
+    cfg.exp_name = args.prefix
+    cfg.dataset_path = _resolve_repo_path(cfg.dataset_path)
+    cfg.dataset_val_path = _resolve_repo_path(cfg.dataset_val_path)
+    cfg.fid_ref_path = _resolve_repo_path(getattr(cfg, "fid_ref_path", "") or args.fid_ref_path)
+    return cfg
+
+
+def _context_key_for_cfg(cfg: ToyConfig, device: torch.device) -> Tuple[object, ...]:
+    return (
+        str(device),
+        str(cfg.amp_dtype),
+        str(cfg.dataset_kind),
+        str(cfg.model_kind),
+        str(cfg.training_objective),
+        str(cfg.dataset_path),
+        str(cfg.dataset_val_path),
+        int(cfg.image_size),
+        int(cfg.image_channels),
+        int(cfg.image_train_size),
+        int(cfg.image_val_size),
+        int(cfg.image_split_seed),
+        bool(cfg.limited_data_enabled),
+        int(cfg.hidden_dim),
+        int(cfg.n_steps_path),
+        float(cfg.sigma_min),
+        float(cfg.sigma_max),
+        float(getattr(cfg, "sigma_data", -1.0)),
+        bool(getattr(cfg, "allow_tf32", True)),
+        bool(getattr(cfg, "cudnn_benchmark", True)),
+        int(getattr(cfg, "eval_seed_offset_metrics", ToyConfig.eval_seed_offset_metrics)),
+    )
+
+
+def _get_or_build_context(
+    *,
+    args: argparse.Namespace,
+    row: Dict[str, str],
+    cache: Dict[Tuple[object, ...], EvalContext],
+) -> EvalContext:
+    cfg = _config_from_row(args, row)
+    device = pick_device(str(cfg.device))
+    key = _context_key_for_cfg(cfg, device)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    configure_runtime(
+        device=device,
+        allow_tf32=bool(getattr(cfg, "allow_tf32", True)),
+        cudnn_benchmark=bool(getattr(cfg, "cudnn_benchmark", True)),
+    )
+    amp_dtype = resolve_amp_dtype(device, str(cfg.amp_dtype))
+    dataset = build_dataset_bundle(cfg, device)
+    if float(getattr(cfg, "sigma_data", -1.0)) <= 0.0:
+        cfg.sigma_data = float(dataset.estimate_sigma_data())
+    model_bundle = build_model_bundle(cfg, dataset, float(cfg.sigma_data), device)
+    sigma_levels = build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
+    context = EvalContext(
+        key=key,
+        cfg=cfg,
+        device=device,
+        amp_dtype=amp_dtype,
+        dataset=dataset,
+        sigma_levels=sigma_levels,
+        baseline_model=model_bundle.baseline,
+        robust_model=model_bundle.robust,
+    )
+    cache[key] = context
+    return context
+
+
 def _extract_fid(metrics_path: str, row: Dict[str, str]) -> float:
     payload = _load_json(metrics_path)
     sample_quality = payload.get("metrics", {}).get("sample_quality_debug", {})
-    key = "baseline_fid" if _is_baseline_style_row(row) else "robust_fid"
+    key = _metrics_fid_key(row)
     fid_value = _safe_float(sample_quality.get(key))
     if fid_value is None:
         raise RuntimeError(f"Missing {key} in reevaluated metrics: {metrics_path}")
     return float(fid_value)
 
 
-def _run_command(*, cmd: List[str], log_path: str, proc_title: str, skip_existing: bool, expected_metrics_path: str) -> None:
+def _write_metrics_payload(
+    *,
+    path: str,
+    row: Dict[str, str],
+    ctx: EvalContext,
+    fid_value: float,
+    fid_batch_size: int,
+    metrics_eval_seed: int,
+    runtime_sec: float,
+    checkpoint_path: str,
+) -> None:
+    branch = _checkpoint_branch(row)
+    sample_quality = {
+        "baseline_fid": None,
+        "robust_fid": None,
+        "fid_branch": branch,
+        "fid_samples": int(ctx.cfg.fid_samples),
+        "fid_batch_size": int(fid_batch_size),
+        "evaluation_protocol": {
+            "metrics_eval_seed": int(metrics_eval_seed),
+            "seed_reset_per_branch": True,
+            "direct_fid_only": True,
+        },
+    }
+    sample_quality[_metrics_fid_key(row)] = float(fid_value)
+    payload = {
+        "format": "toy_fid_reeval_direct_v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "config": {
+            "dataset_kind": str(ctx.cfg.dataset_kind),
+            "dataset_path": str(ctx.cfg.dataset_path),
+            "dataset_val_path": str(ctx.cfg.dataset_val_path),
+            "image_size": int(ctx.cfg.image_size),
+            "image_channels": int(ctx.cfg.image_channels),
+            "image_train_size": int(ctx.cfg.image_train_size),
+            "image_val_size": int(ctx.cfg.image_val_size),
+            "image_split_seed": int(ctx.cfg.image_split_seed),
+            "hidden_dim": int(ctx.cfg.hidden_dim),
+            "n_steps_path": int(ctx.cfg.n_steps_path),
+            "sigma_min": float(ctx.cfg.sigma_min),
+            "sigma_max": float(ctx.cfg.sigma_max),
+            "sigma_data": float(ctx.cfg.sigma_data),
+            "training_objective": str(ctx.cfg.training_objective),
+            "amp_dtype": str(ctx.cfg.amp_dtype),
+            "eval_seed_offset_metrics": int(ctx.cfg.eval_seed_offset_metrics),
+            "fid_ref_path": str(ctx.cfg.fid_ref_path),
+            "compute_fid": True,
+        },
+        "row": {
+            "method": str(row.get("method", "")),
+            "row_origin": str(row.get("row_origin", "")),
+            "seed": int(_row_seed(row)),
+            "step": int(_row_step(row)),
+            "checkpoint_path": checkpoint_path,
+        },
+        "metrics": {
+            "sample_quality_debug": sample_quality,
+            "flow_debug": {
+                "baseline_only": bool(branch == "baseline"),
+                "direct_fid_only": True,
+                "checkpoint_branch": branch,
+            },
+        },
+        "runtime_sec": {
+            "fid_total": float(runtime_sec),
+        },
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def _evaluate_checkpoint_fid(
+    *,
+    args: argparse.Namespace,
+    row: Dict[str, str],
+    ctx: EvalContext,
+    detector_net,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+    metrics_path: str,
+    log_path: str,
+) -> float:
+    checkpoint_path = _resolve_repo_path(row.get("checkpoint_path", ""))
+    if not checkpoint_path:
+        raise RuntimeError(f"Missing checkpoint_path in row: method={row.get('method')} step={row.get('step')}")
+    ensure_dir(os.path.dirname(metrics_path))
     ensure_dir(os.path.dirname(log_path))
-    if skip_existing and os.path.isfile(expected_metrics_path):
-        return
-    with open(log_path, "w", encoding="utf-8") as handle:
+
+    branch = _checkpoint_branch(row)
+    metrics_eval_seed = int(_row_seed(row) + int(ctx.cfg.eval_seed_offset_metrics))
+    proc_title = build_process_title("wdiff", "reeval", row.get("method", ""), f"st{_row_step(row)}")
+    apply_process_title(proc_title)
+    model = ctx.baseline_model if branch == "baseline" else ctx.robust_model
+
+    with open(log_path, "w", encoding="utf-8") as log_handle:
+        log_handle.write(
+            f"[fid-only] branch={branch} method={row.get('method')} row_origin={row.get('row_origin')} "
+            f"step={_row_step(row)} seed={_row_seed(row)}\n"
+        )
+        log_handle.write(f"[fid-only] checkpoint={checkpoint_path}\n")
+        log_handle.write(
+            f"[fid-only] device={ctx.device} amp_dtype={format_amp_dtype(ctx.amp_dtype)} "
+            f"fid_samples={int(args.fid_samples)} fid_batch_size={int(args.fid_batch_size)}\n"
+        )
+        log_handle.write(
+            f"[fid-only] metrics_seed={metrics_eval_seed} image_shape="
+            f"{tuple(int(v) for v in ctx.dataset.data_shape)} sigma_data={float(ctx.cfg.sigma_data):.6f}\n"
+        )
+        log_handle.write("[fid-only] legacy eval-samples argument is ignored in direct FID mode.\n")
+        log_handle.flush()
+
+        state_dict = (
+            _load_baseline_state_dict(checkpoint_path)
+            if branch == "baseline"
+            else _load_robust_state_dict(checkpoint_path, str(row.get("method", "")))
+        )
+        model.load_state_dict(state_dict, strict=True)
+        model.eval()
+
+        set_seed(metrics_eval_seed)
+        t_start = time.perf_counter()
+        fid_value = _compute_fid_for_model(
+            denoiser=model,
+            sigma_levels=ctx.sigma_levels,
+            dataset=ctx.dataset,
+            detector_net=detector_net,
+            mu_ref=mu_ref.to(device=ctx.device),
+            sigma_ref=sigma_ref.to(device=ctx.device),
+            num_images=int(args.fid_samples),
+            gen_batch=max(int(args.fid_batch_size), 1),
+            device=ctx.device,
+            amp_dtype=ctx.amp_dtype,
+            log_handle=log_handle,
+        )
+        runtime_sec = float(time.perf_counter() - t_start)
+        log_handle.write(f"[fid-only] done fid={fid_value:.6f} runtime_sec={runtime_sec:.2f}\n")
+        log_handle.flush()
+
+    _write_metrics_payload(
+        path=metrics_path,
+        row=row,
+        ctx=ctx,
+        fid_value=fid_value,
+        fid_batch_size=max(int(args.fid_batch_size), 1),
+        metrics_eval_seed=metrics_eval_seed,
+        runtime_sec=runtime_sec,
+        checkpoint_path=checkpoint_path,
+    )
+    return fid_value
+
+
+def _run_plot_command(
+    *,
+    args: argparse.Namespace,
+    combined_out: str,
+    plots_dir: str,
+    plot_log: str,
+) -> None:
+    plot_cmd = [
+        args.python_bin,
+        args.plot_script,
+        "--combined-csv",
+        combined_out,
+        "--outdir",
+        plots_dir,
+        "--prefix",
+        args.prefix,
+        "--train-percent-label",
+        args.train_percent_label,
+    ]
+    with open(plot_log, "w", encoding="utf-8") as handle:
         subprocess.run(
-            cmd,
+            plot_cmd,
             cwd=ROOT_DIR,
             check=True,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            env=child_process_env(proc_title=proc_title),
+            env=child_process_env(proc_title=build_process_title("wdiff", "plot", args.prefix)),
         )
 
 
 def main() -> None:
     args = parse_args()
+    args.combined_csv = _resolve_repo_path(args.combined_csv)
+    args.outdir = _resolve_repo_path(args.outdir)
+    args.plot_script = _resolve_repo_path(args.plot_script)
+    args.dataset_path = _resolve_repo_path(args.dataset_path)
+    args.dataset_val_path = _resolve_repo_path(args.dataset_val_path)
+    args.fid_ref_path = _resolve_repo_path(args.fid_ref_path)
+
     if _APPLIED_PROCESS_TITLE is None:
         apply_process_title(build_process_title("wdiff", "reeval", args.prefix))
+
     ensure_dir(args.outdir)
     eval_runs_dir = os.path.join(args.outdir, "reeval_runs")
     logs_dir = os.path.join(args.outdir, "logs")
@@ -387,30 +728,42 @@ def main() -> None:
     ensure_dir(plots_dir)
 
     input_rows = load_rows(args.combined_csv)
+    if not input_rows:
+        raise RuntimeError(f"No rows found in combined CSV: {args.combined_csv}")
+
+    device = pick_device(args.device)
+    detector_net = _load_detector(device)
+    mu_ref, sigma_ref = _load_ref_stats(args.fid_ref_path)
+    mu_ref = mu_ref.to(device=device)
+    sigma_ref = sigma_ref.to(device=device)
+
     reevaluated_rows: List[Dict[str, str]] = []
     cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+    context_cache: Dict[Tuple[object, ...], EvalContext] = {}
 
     for row_index, row in enumerate(input_rows):
         cache_key = _reeval_cache_key(row)
         cached = cache.get(cache_key)
         if cached is None:
             exp_name = _exp_name_from_row(args.prefix, row, row_index)
-            if _is_baseline_style_row(row):
-                cmd = _baseline_eval_command(args=args, row=row, exp_name=exp_name, eval_outdir=eval_runs_dir)
-            else:
-                cmd = _robust_eval_command(args=args, row=row, exp_name=exp_name, eval_outdir=eval_runs_dir)
             metrics_path = os.path.join(eval_runs_dir, exp_name, "metrics.json")
             log_path = os.path.join(logs_dir, f"{exp_name}.log")
-            proc_title = build_process_title("wdiff", "reeval", row.get("method", ""), f"st{_row_step(row)}")
-            _run_command(
-                cmd=cmd,
-                log_path=log_path,
-                proc_title=proc_title or "wdiff:reeval",
-                skip_existing=bool(args.skip_existing),
-                expected_metrics_path=metrics_path,
-            )
+            if bool(args.skip_existing) and os.path.isfile(metrics_path):
+                fid_value = _extract_fid(metrics_path, row)
+            else:
+                ctx = _get_or_build_context(args=args, row=row, cache=context_cache)
+                fid_value = _evaluate_checkpoint_fid(
+                    args=args,
+                    row=row,
+                    ctx=ctx,
+                    detector_net=detector_net,
+                    mu_ref=mu_ref,
+                    sigma_ref=sigma_ref,
+                    metrics_path=metrics_path,
+                    log_path=log_path,
+                )
             cached = {
-                "fid": str(_extract_fid(metrics_path, row)),
+                "fid": str(fid_value),
                 "reeval_metrics_path": metrics_path,
                 "reeval_log_path": log_path,
                 "reeval_exp_name": exp_name,
@@ -424,45 +777,43 @@ def main() -> None:
         updated["reeval_log_path"] = str(cached["reeval_log_path"])
         updated["reeval_exp_name"] = str(cached["reeval_exp_name"])
         updated["reeval_fid_samples"] = str(int(args.fid_samples))
+        updated["reeval_fid_batch_size"] = str(max(int(args.fid_batch_size), 1))
+        updated["reeval_mode"] = "direct_fid_only_in_memory"
         reevaluated_rows.append(updated)
 
     combined_out = os.path.join(args.outdir, f"{args.prefix}_all_methods_raw_seed_rows.csv")
     write_csv(combined_out, reevaluated_rows)
 
-    plot_cmd = [
-        args.python_bin,
-        args.plot_script,
-        "--combined-csv",
-        combined_out,
-        "--outdir",
-        plots_dir,
-        "--prefix",
-        args.prefix,
-        "--train-percent-label",
-        args.train_percent_label,
-    ]
     plot_log = os.path.join(logs_dir, f"{args.prefix}_plot.log")
-    _run_command(
-        cmd=plot_cmd,
-        log_path=plot_log,
-        proc_title=build_process_title("wdiff", "plot", args.prefix) or "wdiff:plot",
-        skip_existing=False,
-        expected_metrics_path=os.path.join(plots_dir, f"{args.prefix}_three_method_compare_summary.json"),
+    _run_plot_command(
+        args=args,
+        combined_out=combined_out,
+        plots_dir=plots_dir,
+        plot_log=plot_log,
     )
 
     manifest = {
         "combined_csv_in": args.combined_csv,
         "combined_csv_out": combined_out,
         "fid_samples": int(args.fid_samples),
+        "fid_batch_size": max(int(args.fid_batch_size), 1),
+        "reeval_mode": "direct_fid_only_in_memory",
+        "device": str(device),
+        "fid_ref_path": args.fid_ref_path,
         "plots_dir": plots_dir,
         "plot_log": plot_log,
         "unique_reevaluations": len(cache),
+        "unique_contexts": len(context_cache),
     }
     with open(os.path.join(args.outdir, f"{args.prefix}_reeval_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
 
     print(f"[reeval] wrote {combined_out}", flush=True)
-    print(f"[reeval] unique_reevaluations={len(cache)} fid_samples={int(args.fid_samples)}", flush=True)
+    print(
+        f"[reeval] unique_reevaluations={len(cache)} fid_samples={int(args.fid_samples)} "
+        f"fid_batch_size={max(int(args.fid_batch_size), 1)}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
