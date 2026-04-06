@@ -293,6 +293,68 @@ def save_method_training_metric_comparison(
     plt.close(fig)
 
 
+def save_labeled_metric_tradeoff_curves(
+    *,
+    path: Path,
+    title: str,
+    run_histories: dict[str, list[dict]],
+    metric_key: str = "sliced_wasserstein",
+    x_key: str = "elapsed_minutes",
+    x_label: str | None = None,
+    y_label: str | None = None,
+    best_so_far: bool = False,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(1, 1, figsize=(7.5, 4.8))
+
+    palette = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    for idx, (label, history) in enumerate(run_histories.items()):
+        if not history:
+            continue
+        points = [
+            (item.get(x_key), item.get(metric_key))
+            for item in history
+            if item.get(x_key) is not None and item.get(metric_key) is not None
+        ]
+        if not points:
+            continue
+        points.sort(key=lambda pair: float(pair[0]))
+        xs = [float(x) for x, _ in points]
+        ys = [float(y) for _, y in points]
+        if best_so_far:
+            ys = list(np.minimum.accumulate(np.asarray(ys, dtype=float)))
+        ax.plot(
+            xs,
+            ys,
+            label=label,
+            color=palette[idx % len(palette)],
+            linewidth=1.8,
+            marker="o",
+            markersize=4.0,
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel(x_label or x_key.replace("_", " ").title())
+    ax.set_ylabel(y_label or metric_key.replace("_", " ").title())
+    ax.grid(alpha=0.2)
+    ax.legend(frameon=False, loc="best")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def save_process_snapshots(
     *,
     path: Path,

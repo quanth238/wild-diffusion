@@ -124,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-eval-samples", type=int, default=2048)
     parser.add_argument("--metric-samples", type=int, default=1024)
     parser.add_argument("--save-eval-checkpoints", action="store_true")
+    parser.add_argument("--fast-tuning", action="store_true")
     return parser.parse_args()
 
 
@@ -256,9 +257,11 @@ def main() -> None:
                     if args.method == "cdro" and cdro_config is not None and cdro_budget_config is not None
                     else None
                 ),
+                fast_tuning=args.fast_tuning,
             )
             metrics["train_loss"] = mean_loss
             metrics["dataset_size"] = int(current_points.shape[0])
+            metrics["elapsed_minutes"] = (time.time() - start_time) / 60.0
             if latest_adv_stats is not None:
                 metrics["mean_l2_shift"] = latest_adv_stats["mean_l2_shift"]
                 metrics["max_l2_shift"] = latest_adv_stats["max_l2_shift"]
@@ -289,7 +292,7 @@ def main() -> None:
             metrics["method"] = args.method
             eval_history.append(metrics)
             append_jsonl(args.outdir / "metrics.jsonl", metrics)
-            if args.save_eval_checkpoints:
+            if args.save_eval_checkpoints and not args.fast_tuning:
                 save_checkpoint(
                     path=args.outdir / "checkpoints" / f"checkpoint_epoch_{epoch:04d}.pt",
                     model=ema,
@@ -299,7 +302,7 @@ def main() -> None:
                     metrics=metrics,
                 )
 
-            if latest_adv_snapshot is not None and latest_adv_plot_stats is not None:
+            if latest_adv_snapshot is not None and latest_adv_plot_stats is not None and not args.fast_tuning:
                 save_adversarial_debug(
                     path=args.outdir / "plots" / f"adv_epoch_{epoch:04d}.png",
                     original_points=latest_adv_snapshot[0],
@@ -308,24 +311,26 @@ def main() -> None:
                     mean_l2_shift=latest_adv_plot_stats[0],
                     max_l2_shift=latest_adv_plot_stats[1],
                 )
-            save_training_curves(
-                path=args.outdir / "plots" / "training_curves.png",
-                loss_history=loss_history,
-                eval_history=eval_history,
-            )
+            if not args.fast_tuning:
+                save_training_curves(
+                    path=args.outdir / "plots" / "training_curves.png",
+                    loss_history=loss_history,
+                    eval_history=eval_history,
+                )
 
             if metrics["sliced_wasserstein"] < best_swd:
                 best_swd = metrics["sliced_wasserstein"]
                 best_epoch = epoch
                 best_eval = dict(metrics)
-                save_checkpoint(
-                    path=args.outdir / "checkpoint_best.pt",
-                    model=ema,
-                    args=args,
-                    dataset=dataset,
-                    epoch=epoch,
-                    metrics=metrics,
-                )
+                if not args.fast_tuning:
+                    save_checkpoint(
+                        path=args.outdir / "checkpoint_best.pt",
+                        model=ema,
+                        args=args,
+                        dataset=dataset,
+                        epoch=epoch,
+                        metrics=metrics,
+                    )
 
     total_minutes = (time.time() - start_time) / 60.0
     final_summary = {
@@ -339,14 +344,15 @@ def main() -> None:
         "last_eval": eval_history[-1] if eval_history else None,
     }
     save_json(args.outdir / "summary.json", final_summary)
-    save_checkpoint(
-        path=args.outdir / "checkpoint_last.pt",
-        model=ema,
-        args=args,
-        dataset=dataset,
-        epoch=args.epochs,
-        metrics=eval_history[-1] if eval_history else None,
-    )
+    if not args.fast_tuning:
+        save_checkpoint(
+            path=args.outdir / "checkpoint_last.pt",
+            model=ema,
+            args=args,
+            dataset=dataset,
+            epoch=args.epochs,
+            metrics=eval_history[-1] if eval_history else None,
+        )
     print(json.dumps(final_summary, indent=2))
 
 
@@ -471,6 +477,7 @@ def evaluate(
     sampler_steps: int,
     seed: int,
     cdro_debug: CdroDebugConfig | None,
+    fast_tuning: bool = False,
 ) -> dict:
     model.eval()
     generated_std = sample_edm(
@@ -500,19 +507,20 @@ def evaluate(
         "sliced_wasserstein": sliced_wasserstein(real_metric, fake_metric, seed=seed + epoch),
     }
 
-    save_scatter_comparison(
-        path=outdir / "plots" / f"samples_epoch_{epoch:04d}.png",
-        real_points=real_metric.numpy(),
-        generated_points=fake_metric.numpy(),
-        title=f"{dataset.name} | epoch {epoch}",
-    )
-    np.savez(
-        outdir / "samples_latest.npz",
-        real=real_metric.numpy(),
-        generated=fake_metric.numpy(),
-        generated_full=generated.numpy(),
-    )
-    if cdro_debug is not None and cdro_debug.num_snapshots > 0:
+    if not fast_tuning:
+        save_scatter_comparison(
+            path=outdir / "plots" / f"samples_epoch_{epoch:04d}.png",
+            real_points=real_metric.numpy(),
+            generated_points=fake_metric.numpy(),
+            title=f"{dataset.name} | epoch {epoch}",
+        )
+        np.savez(
+            outdir / "samples_latest.npz",
+            real=real_metric.numpy(),
+            generated=fake_metric.numpy(),
+            generated_full=generated.numpy(),
+        )
+    if not fast_tuning and cdro_debug is not None and cdro_debug.num_snapshots > 0:
         save_cdro_debug_process(
             dataset=dataset,
             model=model,

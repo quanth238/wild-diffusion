@@ -220,6 +220,7 @@ def main() -> None:
     best_epoch: int | None = None
     best_eval: dict | None = None
     budget_state: dict[str, float | None] = {"raw": None, "smoothed": None}
+    cumulative_compute = make_empty_compute_tracker()
     latest_adv_stats: dict | None = None
     latest_adv_snapshot: tuple[np.ndarray, np.ndarray] | None = None
     latest_adv_plot_stats: tuple[float, float] | None = None
@@ -236,6 +237,16 @@ def main() -> None:
             warmup=args.wdro_warmup_epochs,
             refresh_every=args.wdro_refresh_every,
         ):
+            refresh_batches_equiv = estimate_refresh_attack_batches(
+                num_points=int(base_points.shape[0]),
+                batch_size=int(args.batch_size),
+                p_adv=float(args.wdro_p_adv),
+            )
+            accumulate_compute(
+                cumulative_compute,
+                score_forward_step_equiv=refresh_batches_equiv * int(args.wdro_k) * int(schedule.dt.shape[0]),
+                score_backward_step_equiv=refresh_batches_equiv * int(args.wdro_k) * int(schedule.dt.shape[0]),
+            )
             refresh = build_score_wdro_dataset(
                 base_points=base_points,
                 score_net=score_ema,
@@ -309,6 +320,7 @@ def main() -> None:
         epoch_control_max_norms: list[float] = []
         epoch_score_grad_norms: list[float] = []
         epoch_control_grad_norms: list[float] = []
+        epoch_compute = make_empty_compute_tracker()
 
         for (batch,) in loader:
             batch = batch.to(device, non_blocking=device.type == "cuda")
@@ -321,6 +333,20 @@ def main() -> None:
                 score_model.eval()
                 control_model.train()
                 for _ in range(args.adversary_steps):
+                    accumulate_compute(
+                        epoch_compute,
+                        score_forward_step_equiv=int(schedule.dt.shape[0]),
+                        score_backward_step_equiv=int(schedule.dt.shape[0]),
+                        control_forward_step_equiv=int(schedule.dt.shape[0]),
+                        control_backward_step_equiv=int(schedule.dt.shape[0]),
+                    )
+                    accumulate_compute(
+                        cumulative_compute,
+                        score_forward_step_equiv=int(schedule.dt.shape[0]),
+                        score_backward_step_equiv=int(schedule.dt.shape[0]),
+                        control_forward_step_equiv=int(schedule.dt.shape[0]),
+                        control_backward_step_equiv=int(schedule.dt.shape[0]),
+                    )
                     control_optimizer.zero_grad(set_to_none=True)
                     rollout = rollout_markov_forward(
                         clean_points=batch,
@@ -353,6 +379,18 @@ def main() -> None:
             set_module_grad(score_model, True)
             score_model.train()
             for _ in range(args.score_steps):
+                accumulate_compute(
+                    epoch_compute,
+                    score_forward_step_equiv=int(schedule.dt.shape[0]),
+                    score_backward_step_equiv=int(schedule.dt.shape[0]),
+                    control_forward_step_equiv=(int(schedule.dt.shape[0]) if control_present else 0),
+                )
+                accumulate_compute(
+                    cumulative_compute,
+                    score_forward_step_equiv=int(schedule.dt.shape[0]),
+                    score_backward_step_equiv=int(schedule.dt.shape[0]),
+                    control_forward_step_equiv=(int(schedule.dt.shape[0]) if control_present else 0),
+                )
                 score_optimizer.zero_grad(set_to_none=True)
                 rollout = rollout_markov_forward(
                     clean_points=batch,
@@ -369,6 +407,15 @@ def main() -> None:
                 epoch_score_losses.append(float(score_loss.detach().item()))
 
             with torch.no_grad():
+                if control_present:
+                    accumulate_compute(
+                        epoch_compute,
+                        control_forward_step_equiv=int(schedule.dt.shape[0]),
+                    )
+                    accumulate_compute(
+                        cumulative_compute,
+                        control_forward_step_equiv=int(schedule.dt.shape[0]),
+                    )
                 terminal_rollout = rollout_markov_forward(
                     clean_points=batch,
                     control_net=control_ema if control_present else None,
@@ -410,6 +457,7 @@ def main() -> None:
             "low_budget_utilization_streak": int(low_budget_utilization_streak),
             "high_budget_utilization_streak": int(high_budget_utilization_streak),
             "adversary_disabled_epoch": adversary_disabled_epoch,
+            "elapsed_minutes": (time.time() - start_time) / 60.0,
         }
         if latest_adv_stats is not None:
             epoch_metrics["mean_l2_shift"] = latest_adv_stats["mean_l2_shift"]
@@ -486,6 +534,7 @@ def main() -> None:
             if control_ema is not None
             else 0.0
         )
+        epoch_metrics.update(compute_metrics_from_trackers(epoch_compute=epoch_compute, cumulative_compute=cumulative_compute))
         history.append(epoch_metrics)
 
         if epoch_metrics["epoch"] == 1 or epoch_metrics["epoch"] % args.eval_every == 0 or epoch_metrics["epoch"] == args.epochs:
@@ -970,6 +1019,74 @@ def format_markov_method_name(method: str) -> str:
     if method == "cdro_markov":
         return "CDRO Markov"
     return method.replace("_", " ").title()
+
+
+def make_empty_compute_tracker() -> dict[str, float]:
+    return {
+        "score_forward_step_equiv": 0.0,
+        "score_backward_step_equiv": 0.0,
+        "control_forward_step_equiv": 0.0,
+        "control_backward_step_equiv": 0.0,
+    }
+
+
+def accumulate_compute(
+    tracker: dict[str, float],
+    *,
+    score_forward_step_equiv: float = 0.0,
+    score_backward_step_equiv: float = 0.0,
+    control_forward_step_equiv: float = 0.0,
+    control_backward_step_equiv: float = 0.0,
+) -> None:
+    tracker["score_forward_step_equiv"] += float(score_forward_step_equiv)
+    tracker["score_backward_step_equiv"] += float(score_backward_step_equiv)
+    tracker["control_forward_step_equiv"] += float(control_forward_step_equiv)
+    tracker["control_backward_step_equiv"] += float(control_backward_step_equiv)
+
+
+def weighted_compute_proxy_units(
+    tracker: dict[str, float],
+    *,
+    score_forward_weight: float = 1.0,
+    score_backward_weight: float = 2.0,
+    control_forward_weight: float = 1.0,
+    control_backward_weight: float = 2.0,
+) -> float:
+    return (
+        score_forward_weight * tracker["score_forward_step_equiv"]
+        + score_backward_weight * tracker["score_backward_step_equiv"]
+        + control_forward_weight * tracker["control_forward_step_equiv"]
+        + control_backward_weight * tracker["control_backward_step_equiv"]
+    )
+
+
+def compute_metrics_from_trackers(
+    *,
+    epoch_compute: dict[str, float],
+    cumulative_compute: dict[str, float],
+) -> dict[str, float]:
+    return {
+        "epoch_score_forward_step_equiv": float(epoch_compute["score_forward_step_equiv"]),
+        "epoch_score_backward_step_equiv": float(epoch_compute["score_backward_step_equiv"]),
+        "epoch_control_forward_step_equiv": float(epoch_compute["control_forward_step_equiv"]),
+        "epoch_control_backward_step_equiv": float(epoch_compute["control_backward_step_equiv"]),
+        "epoch_train_compute_proxy_units": float(weighted_compute_proxy_units(epoch_compute)),
+        "train_compute_proxy_units": float(weighted_compute_proxy_units(cumulative_compute)),
+        "cum_score_forward_step_equiv": float(cumulative_compute["score_forward_step_equiv"]),
+        "cum_score_backward_step_equiv": float(cumulative_compute["score_backward_step_equiv"]),
+        "cum_control_forward_step_equiv": float(cumulative_compute["control_forward_step_equiv"]),
+        "cum_control_backward_step_equiv": float(cumulative_compute["control_backward_step_equiv"]),
+    }
+
+
+def estimate_refresh_attack_batches(*, num_points: int, batch_size: int, p_adv: float) -> float:
+    effective_batch_size = num_points if batch_size <= 0 else min(batch_size, num_points)
+    if effective_batch_size <= 0:
+        return 0.0
+    num_batches = math.ceil(num_points / effective_batch_size)
+    if p_adv >= 1.0:
+        return float(num_batches)
+    return float(num_batches) * float(max(p_adv, 0.0))
 
 
 def resolve_target_total_budget(

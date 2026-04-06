@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sampler-steps", type=int, default=20)
     parser.add_argument("--save-eval-checkpoints", action="store_true")
+    parser.add_argument("--fast-tuning", action="store_true")
     parser.add_argument("--figure-epoch-mode", type=str, default="last", choices=("best", "last", "fixed"))
     parser.add_argument("--figure-fixed-epoch", type=int, default=None)
     return parser.parse_args()
@@ -870,6 +871,8 @@ def build_method_command(
             "--wdro-refresh-every",
             str(get_config_value(method_config, "wdro_refresh_every", args.wdro_refresh_every)),
         ]
+        if args.fast_tuning:
+            command.append("--fast-tuning")
         if score_method == "cdro_markov":
             command.extend(
                 [
@@ -932,7 +935,7 @@ def build_method_command(
     legacy_method = resolve_legacy_method(method)
     if legacy_method is None:
         raise ValueError(f"Unsupported comparison method: {method}")
-    return [
+    command = [
         sys.executable,
         "-m",
         "toy_2d.train_wild",
@@ -1018,6 +1021,9 @@ def build_method_command(
         "--sampler-steps",
         str(get_config_value(method_config, "sampler_steps", args.sampler_steps)),
     ]
+    if args.fast_tuning:
+        command.append("--fast-tuning")
+    return command
 
 
 if __name__ == "__main__":
