@@ -57,6 +57,19 @@ DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_OUTDIR = os.path.join(
 DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_PREFIX = (
     "simpsons_mnist_rgb_three_method_1pct_ablation_extended_20260405_warm05_n32_cdro_s0_warmup"
 )
+DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_OUTDIR = os.path.join(
+    ROOT_DIR,
+    "toy_outputs",
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extreme_two_case_probe_20260407",
+    "probe_warm05_aw0p30_cw1p00_rho2p00_n64",
+    "cdro",
+    "s0",
+    "_warmup_baseline",
+)
+DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_PREFIX = (
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extreme_two_case_probe_20260407_"
+    "probe_warm05_aw0p30_cw1p00_rho2p00_n64_cdro_s0_warmup"
+)
 
 METHOD_COLORS = {
     "baseline_edm": "tab:blue",
@@ -528,6 +541,115 @@ def _extend_case_library_for_targeted_followup() -> None:
 _extend_case_library_for_targeted_followup()
 
 
+def _extend_case_library_for_extreme_two_case_probe() -> None:
+    warmup_fraction = 0.05
+    external_baseline_runs_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_runs.csv",
+    )
+    external_baseline_aggregate_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_aggregate.csv",
+    )
+    external_wdro_raw_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_wdro_raw_seed_rows.csv",
+    )
+
+    probe_cases = [
+        ("probe_warm05_aw0p30_cw1p00_rho0p01_n128", 0.30, 1.0, 0.01, 128),
+        ("probe_warm05_aw0p30_cw1p00_rho2p00_n64", 0.30, 1.0, 2.00, 64),
+    ]
+
+    for case_id, outer_attack_weight, outer_clean_weight, total_budget_rho, n_steps_path in probe_cases:
+        _register_targeted_followup_case(
+            case_id=case_id,
+            warmup_fraction=warmup_fraction,
+            outer_attack_weight=outer_attack_weight,
+            outer_clean_weight=outer_clean_weight,
+            total_budget_rho=total_budget_rho,
+            n_steps_path=n_steps_path,
+            reuse_baseline_from=None,
+            reuse_wdro_from=None,
+        )
+        CASE_LIBRARY[case_id]["reuse_baseline_runs_csv"] = external_baseline_runs_csv
+        CASE_LIBRARY[case_id]["reuse_baseline_aggregate_csv"] = external_baseline_aggregate_csv
+        CASE_LIBRARY[case_id]["reuse_wdro_raw_csv"] = external_wdro_raw_csv
+
+    PROFILE_CASES["extreme_two_case_probe"] = [case_id for case_id, *_ in probe_cases]
+    SUMMARY_GROUPS.update(
+        {
+            "extreme_two_case_probe": [case_id for case_id, *_ in probe_cases],
+        }
+    )
+
+
+_extend_case_library_for_extreme_two_case_probe()
+
+
+def _extend_case_library_for_default_n64_rho_stress() -> None:
+    warmup_fraction = 0.05
+    external_baseline_runs_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_runs.csv",
+    )
+    external_baseline_aggregate_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_aggregate.csv",
+    )
+    external_wdro_raw_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_wdro_raw_seed_rows.csv",
+    )
+    external_cdro_n64_warmup_runs_csv = os.path.join(
+        DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_OUTDIR,
+        f"{DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_PREFIX}_runs.csv",
+    )
+    external_cdro_n64_warmup_aggregate_csv = os.path.join(
+        DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_OUTDIR,
+        f"{DEFAULT_AW030_N64_RHO2_PROBE_WARMUP_PREFIX}_aggregate.csv",
+    )
+
+    rho_cases = [
+        ("default_warm05_aw0p30_cw1p00_rho0p01_n64", 0.01),
+        ("stress_warm05_aw0p30_cw1p00_rho4p00_n64", 4.00),
+        ("stress_warm05_aw0p30_cw1p00_rho8p00_n64", 8.00),
+        ("stress_warm05_aw0p30_cw1p00_rho64p00_n64", 64.00),
+        ("stress_warm05_aw0p30_cw1p00_rho128p00_n64", 128.00),
+    ]
+
+    for case_id, total_budget_rho in rho_cases:
+        _register_targeted_followup_case(
+            case_id=case_id,
+            warmup_fraction=warmup_fraction,
+            outer_attack_weight=0.30,
+            outer_clean_weight=1.0,
+            total_budget_rho=total_budget_rho,
+            n_steps_path=64,
+            reuse_baseline_from=None,
+            reuse_wdro_from=None,
+        )
+        CASE_LIBRARY[case_id]["reuse_baseline_runs_csv"] = external_baseline_runs_csv
+        CASE_LIBRARY[case_id]["reuse_baseline_aggregate_csv"] = external_baseline_aggregate_csv
+        CASE_LIBRARY[case_id]["reuse_wdro_raw_csv"] = external_wdro_raw_csv
+        CASE_LIBRARY[case_id]["reuse_cdro_warmup_runs_csv"] = external_cdro_n64_warmup_runs_csv
+        CASE_LIBRARY[case_id]["reuse_cdro_warmup_aggregate_csv"] = external_cdro_n64_warmup_aggregate_csv
+
+    PROFILE_CASES["default_n64_rho_stress"] = [case_id for case_id, _ in rho_cases]
+    SUMMARY_GROUPS.update(
+        {
+            "default_n64_rho_stress": [case_id for case_id, _ in rho_cases],
+        }
+    )
+
+
+_extend_case_library_for_default_n64_rho_stress()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -945,9 +1067,30 @@ def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[
 
 
 def _plot_curve(*, ax, rows: List[Dict[str, str]], method_name: str, label: str, color: str, linestyle: str) -> None:
+    _plot_metric_curve(
+        ax=ax,
+        rows=rows,
+        method_name=method_name,
+        label=label,
+        color=color,
+        linestyle=linestyle,
+        y_field="fid",
+    )
+
+
+def _plot_metric_curve(
+    *,
+    ax,
+    rows: List[Dict[str, str]],
+    method_name: str,
+    label: str,
+    color: str,
+    linestyle: str,
+    y_field: str,
+) -> None:
     method_rows = _method_rows(rows, method_name)
     xs = [_safe_float(row.get("weighted_compute_units")) for row in method_rows]
-    ys = [_safe_float(row.get("fid")) for row in method_rows]
+    ys = [_safe_float(row.get(y_field)) for row in method_rows]
     pairs = [(x_value, y_value) for x_value, y_value in zip(xs, ys) if x_value is not None and y_value is not None]
     if not pairs:
         return
@@ -1037,6 +1180,52 @@ def _make_family_plot(
 
     ensure_dir(outdir)
     plot_path = os.path.join(outdir, f"{group_name}_fid_vs_weighted_compute.png")
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+    return plot_path
+
+
+def _make_cdro_metric_plot(
+    *,
+    group_name: str,
+    case_ids: List[str],
+    case_rows: Dict[str, List[Dict[str, str]]],
+    case_cfgs: Dict[str, Dict],
+    outdir: str,
+    y_field: str,
+    y_label: str,
+    title_suffix: str,
+    filename_suffix: str,
+) -> Optional[str]:
+    available_case_ids = [case_id for case_id in case_ids if case_id in case_rows]
+    if len(available_case_ids) < 2:
+        return None
+
+    fig, ax = plt.subplots(figsize=(8.8, 5.4))
+    color_cycle = list(plt.get_cmap("tab10").colors)
+    for case_index, case_id in enumerate(available_case_ids):
+        linestyle = LINESTYLES[case_index % len(LINESTYLES)]
+        color = color_cycle[case_index % len(color_cycle)]
+        case_label = case_cfgs[case_id]["label"]
+        _plot_metric_curve(
+            ax=ax,
+            rows=case_rows[case_id],
+            method_name="cdro",
+            label=f"CDRO {case_label}",
+            color=color,
+            linestyle=linestyle,
+            y_field=y_field,
+        )
+
+    ax.set_xlabel("Weighted Compute Units")
+    ax.set_ylabel(y_label)
+    ax.set_title(f"Simpsons-MNIST RGB 1%: {title_suffix}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+
+    ensure_dir(outdir)
+    plot_path = os.path.join(outdir, f"{group_name}_{filename_suffix}.png")
     fig.savefig(plot_path, dpi=160)
     plt.close(fig)
     return plot_path
@@ -1150,6 +1339,7 @@ def main() -> None:
     print(f"[matrix] wrote {summary_csv}", flush=True)
 
     family_plot_paths: List[str] = []
+    diagnostic_plot_paths: List[str] = []
     for group_name, group_case_ids in SUMMARY_GROUPS.items():
         plot_path = _make_family_plot(
             group_name=group_name,
@@ -1162,12 +1352,28 @@ def main() -> None:
             family_plot_paths.append(plot_path)
             print(f"[matrix] wrote {plot_path}", flush=True)
 
+    rho_stress_delta_plot = _make_cdro_metric_plot(
+        group_name="default_n64_rho_stress",
+        case_ids=[case_id for case_id in SUMMARY_GROUPS["default_n64_rho_stress"] if case_id in case_ids],
+        case_rows=case_rows,
+        case_cfgs=CASE_LIBRARY,
+        outdir=summary_dir,
+        y_field="delta_norm_mean_final",
+        y_label="Perturbation Distance Moved (mean L2)",
+        title_suffix="Default N=64 Rho Stress: CDRO Perturbation Distance",
+        filename_suffix="cdro_delta_norm_mean_vs_weighted_compute",
+    )
+    if rho_stress_delta_plot:
+        diagnostic_plot_paths.append(rho_stress_delta_plot)
+        print(f"[matrix] wrote {rho_stress_delta_plot}", flush=True)
+
     summary_json = os.path.join(summary_dir, f"{args.prefix}_summary.json")
     with open(summary_json, "w", encoding="utf-8") as handle:
         json.dump(
             {
                 "summary_csv": summary_csv,
                 "family_plots": family_plot_paths,
+                "diagnostic_plots": diagnostic_plot_paths,
                 "cases": case_statuses,
             },
             handle,
