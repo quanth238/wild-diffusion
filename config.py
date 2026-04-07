@@ -65,7 +65,7 @@ class ToyConfig:
     val_size: int = 10000
 
     # Diffusion ladder.
-    n_steps_path: int = 24
+    n_steps_path: int = 64
     sigma_min: float = 0.002
     sigma_max: float = 2.0  # Keep terminal noise moderate for better x0-recovery diagnostics.
     sigma_data: float = -1.0  # <=0: auto-estimate from toy data scale.
@@ -103,7 +103,7 @@ class ToyConfig:
     kappa_mid_multiplier: float = 1.0
     kappa_high_multiplier: float = 1.0
     kappa_preserve_l2_budget: bool = True
-    outer_attack_weight: float = 0.5
+    outer_attack_weight: float = 0.3
     outer_clean_weight: float = 1.0
     warmup_clean_steps: int = 900
     warmup_ramp_steps: int = 600

@@ -76,7 +76,7 @@ class ToyConfig:
     val_size: int = 10000
 
     # Diffusion ladder.
-    n_steps_path: int = 24
+    n_steps_path: int = 64
     sigma_min: float = 0.002
     sigma_max: float = 2.0  # Keep terminal noise moderate for better x0-recovery diagnostics.
     sigma_data: float = -1.0  # <=0: auto-estimate from toy data scale.
@@ -108,12 +108,12 @@ class ToyConfig:
     v11_projection_mode: str = "global_remaining"
     # CDRO Route-A options (beta-space greedy attack with sigma-time local caps).
     cdro_step_size: float = 0.02
-    cdro_total_budget_rho: float = 0.02
+    cdro_total_budget_rho: float = 4.0
     cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
     # Reference WDRO warmup step fraction. CDRO converts this into a target
     # weighted-compute warmup share, then solves for the baseline warmup steps
     # needed to match that share under CDRO's more expensive robust steps.
-    cdro_warmup_fraction: float = 0.2
+    cdro_warmup_fraction: float = 0.05
     # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
     v12_step_size: float = 0.02
     v12_lambda_init: float = 0.1
@@ -135,7 +135,7 @@ class ToyConfig:
     kappa_mid_multiplier: float = 1.0
     kappa_high_multiplier: float = 1.0
     kappa_preserve_l2_budget: bool = True
-    outer_attack_weight: float = 0.5
+    outer_attack_weight: float = 0.3
     outer_clean_weight: float = 1.0
     warmup_clean_steps: int = 900
     warmup_ramp_steps: int = 600
@@ -158,7 +158,7 @@ class ToyConfig:
     wild_sample_min: float = -1.0
     wild_sample_max: float = 1.0
     wild_delta_ratio_denom: float = 1.0
-    wdro_warmup_fraction: float = 0.2
+    wdro_warmup_fraction: float = 0.05
     wdro_refresh_epochs: float = 100.0
     wdro_adv_prob: float = 0.3
     wdro_attack_steps: int = 2

@@ -71,8 +71,9 @@ Outer minimization:
 
 - minimize weighted clean + attacked denoising loss
   (`outer_loss = attack_weight * L_attack + clean_weight * L_clean`).
-- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.5`,
-  with `warmup_clean_steps=900` and `warmup_ramp_steps=600`.
+- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.3`,
+  with `cdro_total_budget_rho=4.0`, `cdro_warmup_fraction=0.05`,
+  and `n_steps_path=64`.
 
 For fair comparison against `wild`, use the batch-equivalent denoiser-eval accounting stored in `metrics.json`.
 
@@ -87,8 +88,9 @@ Outer minimization:
 
 - minimize weighted clean + attacked denoising loss
   (`outer_loss = attack_weight * L_attack + clean_weight * L_clean`).
-- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.5`,
-  with `warmup_clean_steps=900` and `warmup_ramp_steps=600`.
+- current defaults use `outer_clean_weight=1.0`, `outer_attack_weight=0.3`,
+  with `cdro_total_budget_rho=4.0`, `cdro_warmup_fraction=0.05`,
+  and `n_steps_path=64`.
 
 No `R_close` term is used.
 

@@ -620,6 +620,7 @@ def _extend_case_library_for_default_n64_rho_stress() -> None:
         ("stress_warm05_aw0p30_cw1p00_rho8p00_n64", 8.00),
         ("stress_warm05_aw0p30_cw1p00_rho64p00_n64", 64.00),
         ("stress_warm05_aw0p30_cw1p00_rho128p00_n64", 128.00),
+        ("stress_warm05_aw0p30_cw1p00_rho1024p00_n64", 1024.00),
     ]
 
     for case_id, total_budget_rho in rho_cases:
