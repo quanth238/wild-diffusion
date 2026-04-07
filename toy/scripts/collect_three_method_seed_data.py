@@ -177,6 +177,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-baseline-runs-csv", type=str, default="")
     parser.add_argument("--reuse-baseline-aggregate-csv", type=str, default="")
     parser.add_argument("--reuse-wdro-raw-csv", type=str, default="")
+    parser.add_argument("--reuse-cdro-warmup-runs-csv", type=str, default="")
+    parser.add_argument("--reuse-cdro-warmup-aggregate-csv", type=str, default="")
     parser.add_argument("--wdro-warmup-fraction", type=float, default=0.2)
     parser.add_argument("--wdro-refresh-epochs", type=float, default=100.0)
     parser.add_argument("--wdro-adv-prob", type=float, default=0.3)
@@ -1124,6 +1126,8 @@ def _run_method_local_warmup_trajectory(
     comparison_steps: List[int],
     fixed_warmup_steps: int,
     trajectory_total_steps_max: int,
+    reuse_runs_csv: str = "",
+    reuse_aggregate_csv: str = "",
 ) -> Tuple[List[Dict], Optional[str], Dict]:
     warmup_eval_steps = sorted(
         {
@@ -1139,8 +1143,8 @@ def _run_method_local_warmup_trajectory(
     warmup_outdir = os.path.join(seed_root, "_warmup_baseline")
     ensure_dir(warmup_outdir)
     warmup_prefix = f"{args.prefix}_{method_name}_s{seed}_warmup"
-    warmup_runs_csv = os.path.join(warmup_outdir, f"{warmup_prefix}_runs.csv")
-    warmup_agg_csv = os.path.join(warmup_outdir, f"{warmup_prefix}_aggregate.csv")
+    warmup_runs_csv = str(reuse_runs_csv).strip() or os.path.join(warmup_outdir, f"{warmup_prefix}_runs.csv")
+    warmup_agg_csv = str(reuse_aggregate_csv).strip() or os.path.join(warmup_outdir, f"{warmup_prefix}_aggregate.csv")
     warmup_log = os.path.join(args.outdir, "logs", f"{warmup_prefix}.log")
     warmup_cmd = _build_baseline_sweep_cmd(
         args=args,
@@ -1149,7 +1153,12 @@ def _run_method_local_warmup_trajectory(
         seeds_text=str(int(seed)),
         steps=warmup_eval_steps,
     )
-    if args.skip_existing and os.path.isfile(warmup_runs_csv) and os.path.isfile(warmup_agg_csv):
+    if str(reuse_runs_csv).strip():
+        print(
+            f"[collect-weighted] reuse {method_name} warmup runs csv: {warmup_runs_csv}",
+            flush=True,
+        )
+    elif args.skip_existing and os.path.isfile(warmup_runs_csv) and os.path.isfile(warmup_agg_csv):
         print(
             f"[collect-weighted] reuse {method_name} warmup seed={seed}: {warmup_outdir}",
             flush=True,
@@ -1210,6 +1219,8 @@ def _run_method_local_warmup_trajectory(
         "warmup_eval_steps": [int(step) for step in warmup_eval_steps],
         "support_checkpoint_step": int(fixed_warmup_steps),
         "support_checkpoint_path": support_checkpoint_path,
+        "reused_runs_csv": str(reuse_runs_csv).strip() or None,
+        "reused_aggregate_csv": str(reuse_aggregate_csv).strip() or None,
     }
     return comparison_rows, support_checkpoint_path, manifest_entry
 
@@ -1551,6 +1562,8 @@ def main() -> None:
             comparison_steps=cdro_curve_steps,
             fixed_warmup_steps=int(cdro_fixed_warmup_steps),
             trajectory_total_steps_max=int(cdro_max_total_steps),
+            reuse_runs_csv=str(args.reuse_cdro_warmup_runs_csv).strip(),
+            reuse_aggregate_csv=str(args.reuse_cdro_warmup_aggregate_csv).strip(),
         )
         cdro_rows.extend(cdro_warmup_rows)
         cdro_seed_manifest = {

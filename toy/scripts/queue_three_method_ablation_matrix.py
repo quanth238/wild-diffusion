@@ -36,6 +36,27 @@ DEFAULT_CALIBRATION = os.path.join(
     "compute_calibration",
     "simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json",
 )
+DEFAULT_WARM05_EXTENDED_OUTDIR = os.path.join(
+    ROOT_DIR,
+    "toy_outputs",
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extended_20260405",
+    "warm05_default",
+)
+DEFAULT_WARM05_EXTENDED_PREFIX = (
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extended_20260405_warm05_default"
+)
+DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_OUTDIR = os.path.join(
+    ROOT_DIR,
+    "toy_outputs",
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extended_20260405",
+    "warm05_n32",
+    "cdro",
+    "s0",
+    "_warmup_baseline",
+)
+DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_PREFIX = (
+    "simpsons_mnist_rgb_three_method_1pct_ablation_extended_20260405_warm05_n32_cdro_s0_warmup"
+)
 
 METHOD_COLORS = {
     "baseline_edm": "tab:blue",
@@ -384,6 +405,129 @@ def _extend_case_library_for_round2() -> None:
 _extend_case_library_for_round2()
 
 
+def _register_targeted_followup_case(
+    *,
+    case_id: str,
+    warmup_fraction: float,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+    total_budget_rho: float,
+    n_steps_path: int,
+    reuse_baseline_from: Optional[str],
+    reuse_wdro_from: Optional[str],
+) -> None:
+    CASE_LIBRARY[case_id] = {
+        "label": _generated_case_label(
+            warmup_fraction=warmup_fraction,
+            outer_attack_weight=outer_attack_weight,
+            outer_clean_weight=outer_clean_weight,
+            total_budget_rho=total_budget_rho,
+            n_steps_path=n_steps_path,
+        ),
+        "wdro_warmup_fraction": float(warmup_fraction),
+        "cdro_warmup_fraction": float(warmup_fraction),
+        "outer_attack_weight": float(outer_attack_weight),
+        "outer_clean_weight": float(outer_clean_weight),
+        "cdro_total_budget_rho": float(total_budget_rho),
+        "cdro_n_steps_path": int(n_steps_path),
+        "reuse_baseline_from": reuse_baseline_from,
+        "reuse_wdro_from": reuse_wdro_from,
+    }
+
+
+def _extend_case_library_for_targeted_followup() -> None:
+    warmup_fraction = 0.05
+    base_case_id = "targeted_warm05_base_rho0p01_n32"
+    external_baseline_runs_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_runs.csv",
+    )
+    external_baseline_aggregate_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        "baseline",
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_baseline_aggregate.csv",
+    )
+    external_wdro_raw_csv = os.path.join(
+        DEFAULT_WARM05_EXTENDED_OUTDIR,
+        f"{DEFAULT_WARM05_EXTENDED_PREFIX}_wdro_raw_seed_rows.csv",
+    )
+    external_cdro_n32_warmup_runs_csv = os.path.join(
+        DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_OUTDIR,
+        f"{DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_PREFIX}_runs.csv",
+    )
+    external_cdro_n32_warmup_aggregate_csv = os.path.join(
+        DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_OUTDIR,
+        f"{DEFAULT_WARM05_N32_EXTENDED_CDR0_WARMUP_PREFIX}_aggregate.csv",
+    )
+    targeted_cases = [
+        (base_case_id, 0.50, 1.0, 0.01, 32),
+        ("targeted_warm05_rho0p10_n32", 0.50, 1.0, 0.10, 32),
+        ("targeted_warm05_rho0p20_n32", 0.50, 1.0, 0.20, 32),
+        ("targeted_warm05_aw0p30_rho0p01_n32", 0.30, 1.0, 0.01, 32),
+        ("targeted_warm05_aw1p00_rho0p01_n32", 1.00, 1.0, 0.01, 32),
+        ("targeted_warm05_aw2p00_rho0p01_n32", 2.00, 1.0, 0.01, 32),
+        ("targeted_warm05_cw0p00_rho0p01_n32", 0.50, 0.0, 0.01, 32),
+        ("targeted_warm05_rho0p01_n4", 0.50, 1.0, 0.01, 4),
+        ("targeted_warm05_rho0p01_n8", 0.50, 1.0, 0.01, 8),
+        ("targeted_warm05_rho0p01_n48", 0.50, 1.0, 0.01, 48),
+        ("targeted_warm05_rho0p01_n64", 0.50, 1.0, 0.01, 64),
+    ]
+
+    for case_id, outer_attack_weight, outer_clean_weight, total_budget_rho, n_steps_path in targeted_cases:
+        _register_targeted_followup_case(
+            case_id=case_id,
+            warmup_fraction=warmup_fraction,
+            outer_attack_weight=outer_attack_weight,
+            outer_clean_weight=outer_clean_weight,
+            total_budget_rho=total_budget_rho,
+            n_steps_path=n_steps_path,
+            reuse_baseline_from=None,
+            reuse_wdro_from=None,
+        )
+        CASE_LIBRARY[case_id]["reuse_baseline_runs_csv"] = external_baseline_runs_csv
+        CASE_LIBRARY[case_id]["reuse_baseline_aggregate_csv"] = external_baseline_aggregate_csv
+        CASE_LIBRARY[case_id]["reuse_wdro_raw_csv"] = external_wdro_raw_csv
+        if case_id in {
+            "targeted_warm05_base_rho0p01_n32",
+            "targeted_warm05_rho0p10_n32",
+            "targeted_warm05_rho0p20_n32",
+        }:
+            CASE_LIBRARY[case_id]["reuse_cdro_warmup_runs_csv"] = external_cdro_n32_warmup_runs_csv
+            CASE_LIBRARY[case_id]["reuse_cdro_warmup_aggregate_csv"] = external_cdro_n32_warmup_aggregate_csv
+
+    PROFILE_CASES["targeted_followup"] = [case_id for case_id, *_ in targeted_cases]
+    SUMMARY_GROUPS.update(
+        {
+            "targeted_followup_rho": [
+                "targeted_warm05_base_rho0p01_n32",
+                "targeted_warm05_rho0p10_n32",
+                "targeted_warm05_rho0p20_n32",
+            ],
+            "targeted_followup_aw": [
+                "targeted_warm05_base_rho0p01_n32",
+                "targeted_warm05_aw0p30_rho0p01_n32",
+                "targeted_warm05_aw1p00_rho0p01_n32",
+                "targeted_warm05_aw2p00_rho0p01_n32",
+            ],
+            "targeted_followup_cw": [
+                "targeted_warm05_base_rho0p01_n32",
+                "targeted_warm05_cw0p00_rho0p01_n32",
+            ],
+            "targeted_followup_n": [
+                "targeted_warm05_rho0p01_n4",
+                "targeted_warm05_rho0p01_n8",
+                "targeted_warm05_base_rho0p01_n32",
+                "targeted_warm05_rho0p01_n48",
+                "targeted_warm05_rho0p01_n64",
+            ],
+        }
+    )
+
+
+_extend_case_library_for_targeted_followup()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -588,8 +732,19 @@ def _build_collector_cmd(*, args: argparse.Namespace, case_id: str, case_cfg: Di
     if args.skip_existing:
         cmd.append("--skip-existing")
 
+    explicit_baseline_runs_csv = str(case_cfg.get("reuse_baseline_runs_csv", "")).strip()
+    explicit_baseline_aggregate_csv = str(case_cfg.get("reuse_baseline_aggregate_csv", "")).strip()
     reuse_baseline_from = case_cfg.get("reuse_baseline_from")
-    if reuse_baseline_from:
+    if explicit_baseline_runs_csv:
+        cmd.extend(
+            [
+                "--reuse-baseline-runs-csv",
+                explicit_baseline_runs_csv,
+                "--reuse-baseline-aggregate-csv",
+                explicit_baseline_aggregate_csv,
+            ]
+        )
+    elif reuse_baseline_from:
         ref_paths = _case_artifact_paths(base_outdir=args.outdir, base_prefix=args.prefix, case_id=str(reuse_baseline_from))
         cmd.extend(
             [
@@ -600,10 +755,25 @@ def _build_collector_cmd(*, args: argparse.Namespace, case_id: str, case_cfg: Di
             ]
         )
 
+    explicit_wdro_raw_csv = str(case_cfg.get("reuse_wdro_raw_csv", "")).strip()
     reuse_wdro_from = case_cfg.get("reuse_wdro_from")
-    if reuse_wdro_from:
+    if explicit_wdro_raw_csv:
+        cmd.extend(["--reuse-wdro-raw-csv", explicit_wdro_raw_csv])
+    elif reuse_wdro_from:
         ref_paths = _case_artifact_paths(base_outdir=args.outdir, base_prefix=args.prefix, case_id=str(reuse_wdro_from))
         cmd.extend(["--reuse-wdro-raw-csv", ref_paths["wdro_raw_csv"]])
+
+    explicit_cdro_warmup_runs_csv = str(case_cfg.get("reuse_cdro_warmup_runs_csv", "")).strip()
+    explicit_cdro_warmup_aggregate_csv = str(case_cfg.get("reuse_cdro_warmup_aggregate_csv", "")).strip()
+    if explicit_cdro_warmup_runs_csv:
+        cmd.extend(
+            [
+                "--reuse-cdro-warmup-runs-csv",
+                explicit_cdro_warmup_runs_csv,
+                "--reuse-cdro-warmup-aggregate-csv",
+                explicit_cdro_warmup_aggregate_csv,
+            ]
+        )
 
     return cmd
 
