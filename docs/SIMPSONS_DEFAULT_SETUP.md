@@ -86,14 +86,15 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Seeds in the locked artifact: `0`
 - Shared grid template: `wdro_dense_41_relative`
 - Default FID-eval template: `weighted_balanced_20_relative`
+- Default baseline FID mode: `posthoc_from_checkpoints`
 - Default WDRO/CDRO FID mode: `posthoc_from_checkpoints`
 - Primary metric: `weighted_compute_units`
 - Secondary metric: `train_wall_clock_sec`
 - Shared weighted cap: `200000`
 - Dense checkpoints are still saved on the shared comparison grid, plus exact warmup-support checkpoints.
 - The launcher now computes FID only on the coarser balanced knot subset by default, with extra transition sentinels for WDRO/CDRO at the exact warmup-support checkpoint plus the first three robust checkpoints.
-- Baseline still evaluates FID during the checkpointed baseline sweep, but WDRO/CDRO now default to two-phase collection: save checkpoints first, then fill selected FIDs later from checkpoints.
-- Omit the new template flag to keep the old evaluate-every-comparison-knot behavior, and set `--robust-fid-mode in_run` to restore the old WDRO/CDRO in-run FID path.
+- The launcher now defaults all three methods to two-phase collection: save dense checkpoints first, then fill only the selected FIDs later from checkpoints.
+- Omit the new template flag to keep the old evaluate-every-comparison-knot behavior, set `--baseline-fid-mode in_run` to restore baseline in-run FID, and set `--robust-fid-mode in_run` to restore the old WDRO/CDRO in-run FID path.
 - Weighted-compute calibration:
   - `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
 
@@ -156,6 +157,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --log-every 200 \
   --n-steps-path 64 \
   --fid-eval-template balanced \
+  --baseline-fid-mode posthoc_from_checkpoints \
   --robust-fid-mode posthoc_from_checkpoints \
   --outer-attack-weight 0.3 \
   --outer-clean-weight 1.0 \

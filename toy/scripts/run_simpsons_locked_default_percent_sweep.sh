@@ -37,6 +37,7 @@ N_STEPS_PATH="${N_STEPS_PATH:-64}"
 
 GRID_TEMPLATE="${GRID_TEMPLATE:-denser}"
 FID_EVAL_TEMPLATE="${FID_EVAL_TEMPLATE:-balanced}"
+BASELINE_FID_MODE="${BASELINE_FID_MODE:-posthoc_from_checkpoints}"
 ROBUST_FID_MODE="${ROBUST_FID_MODE:-posthoc_from_checkpoints}"
 SHARED_WEIGHTED_CAP="${SHARED_WEIGHTED_CAP:-200000}"
 
@@ -127,6 +128,7 @@ for pct in ${PERCENTS}; do
     --n-steps-path "${N_STEPS_PATH}" \
     --grid-template "${GRID_TEMPLATE}" \
     --fid-eval-template "${FID_EVAL_TEMPLATE}" \
+    --baseline-fid-mode "${BASELINE_FID_MODE}" \
     --robust-fid-mode "${ROBUST_FID_MODE}" \
     --shared-weighted-cap "${SHARED_WEIGHTED_CAP}" \
     --inner-steps "${INNER_STEPS}" \

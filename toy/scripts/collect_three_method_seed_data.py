@@ -213,6 +213,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
     parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="all")
     parser.add_argument(
+        "--baseline-fid-mode",
+        type=str,
+        choices=["in_run", "posthoc_from_checkpoints"],
+        default="in_run",
+    )
+    parser.add_argument(
         "--robust-fid-mode",
         type=str,
         choices=["in_run", "posthoc_from_checkpoints"],
@@ -489,7 +495,11 @@ def _build_posthoc_reeval_cmd(
     *,
     args: argparse.Namespace,
     combined_csv: str,
+    methods: List[str],
 ) -> List[str]:
+    methods_text = ",".join(str(method).strip() for method in methods if str(method).strip())
+    if not methods_text:
+        raise ValueError("Expected at least one method for posthoc FID reevaluation.")
     return [
         args.python_bin,
         str(args.reeval_script),
@@ -544,7 +554,7 @@ def _build_posthoc_reeval_cmd(
         "--train-percent-label",
         str(args.train_percent_label),
         "--methods",
-        "wdro,cdro",
+        methods_text,
         "--only-missing-fid",
         "--respect-fid-selection",
         "--skip-plot",
@@ -1596,9 +1606,11 @@ def main() -> None:
     args = parse_args()
     if _APPLIED_PROCESS_TITLE is None:
         apply_process_title(build_process_title("wdiff", "collect", args.prefix))
+    baseline_fid_posthoc = str(args.baseline_fid_mode) == "posthoc_from_checkpoints"
     robust_fid_posthoc = str(args.robust_fid_mode) == "posthoc_from_checkpoints"
-    if robust_fid_posthoc and not os.path.isfile(str(args.reeval_script)):
-        raise FileNotFoundError(f"Missing reevaluation script for posthoc robust FID: {args.reeval_script}")
+    any_posthoc_fid = bool(baseline_fid_posthoc or robust_fid_posthoc)
+    if any_posthoc_fid and not os.path.isfile(str(args.reeval_script)):
+        raise FileNotFoundError(f"Missing reevaluation script for posthoc FID: {args.reeval_script}")
     seeds = parse_int_list(args.seeds)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
@@ -1744,6 +1756,7 @@ def main() -> None:
     )
     wdro_fid_eval_step_set = set(int(step) for step in wdro_fid_eval_steps)
     cdro_fid_eval_step_set = set(int(step) for step in cdro_fid_eval_steps)
+    baseline_fid_eval_step_set = set(int(step) for step in baseline_fid_eval_steps)
     baseline_run_steps = sorted({int(step) for step in baseline_curve_steps if int(step) > 0})
     baseline_trajectory_total_steps_max = max(baseline_run_steps) if baseline_run_steps else 0
 
@@ -1772,6 +1785,7 @@ def main() -> None:
         f"{fid_eval_schedule['template_key']} selected_targets={fid_eval_schedule['selected_targets']}",
         flush=True,
     )
+    print(f"[collect-weighted] baseline_fid_mode={args.baseline_fid_mode}", flush=True)
     print(f"[collect-weighted] robust_fid_mode={args.robust_fid_mode}", flush=True)
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
     print(f"[collect-weighted] baseline_fid_eval_steps={baseline_fid_eval_steps}", flush=True)
@@ -1810,7 +1824,7 @@ def main() -> None:
             prefix=baseline_prefix,
             seeds_text=args.seeds,
             steps=baseline_run_steps,
-            fid_eval_steps=baseline_fid_eval_steps,
+            fid_eval_steps=[] if baseline_fid_posthoc else baseline_fid_eval_steps,
         )
         if args.skip_existing and os.path.isfile(baseline_runs_csv) and os.path.isfile(baseline_agg_csv):
             print(f"[collect-weighted] reuse baseline outputs: {baseline_outdir}", flush=True)
@@ -1840,6 +1854,13 @@ def main() -> None:
             row["is_aux_warmup_support"] = False
             row["trajectory_total_steps_max"] = int(baseline_trajectory_total_steps_max)
             row["fixed_warmup_steps"] = 0
+            row.update(
+                _resolve_fid_annotation(
+                    fid_value=_optional_float(baseline_row.get("fid")),
+                    fid_selected=bool(int(total_steps) in baseline_fid_eval_step_set),
+                    source_if_evaluated=str(baseline_row.get("fid_source", "in_run_metrics") or "in_run_metrics"),
+                )
+            )
             baseline_target_rows.append(row)
     baseline_all_eval_rows = list(baseline_target_rows)
 
@@ -2111,17 +2132,23 @@ def main() -> None:
 
     posthoc_reeval_manifest_path = None
     posthoc_reeval_log_path = None
+    posthoc_methods: List[str] = []
+    if baseline_fid_posthoc:
+        posthoc_methods.append("baseline_edm")
     if robust_fid_posthoc:
+        posthoc_methods.extend(["wdro", "cdro"])
+    if posthoc_methods:
         reeval_cmd = _build_posthoc_reeval_cmd(
             args=args,
             combined_csv=combined_raw_csv,
+            methods=posthoc_methods,
         )
         if args.skip_existing:
             reeval_cmd.append("--skip-existing")
-        posthoc_reeval_log_path = os.path.join(logs_dir, f"{args.prefix}_posthoc_robust_fid.log")
+        posthoc_reeval_log_path = os.path.join(logs_dir, f"{args.prefix}_posthoc_fid.log")
         print(
-            "[collect-weighted] posthoc robust FID"
-            f" methods=wdro,cdro combined_csv={combined_raw_csv}",
+            "[collect-weighted] posthoc FID"
+            f" methods={','.join(posthoc_methods)} combined_csv={combined_raw_csv}",
             flush=True,
         )
         run_command(
@@ -2133,6 +2160,7 @@ def main() -> None:
         combined_raw = [_ensure_row_fid_fields(row) for row in load_csv_rows(combined_raw_csv)]
         combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
         baseline_target_rows = [row for row in combined_raw if str(row.get("method", "")) == "baseline_edm"]
+        baseline_all_eval_rows = list(baseline_target_rows)
         wdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "wdro"]
         cdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "cdro"]
         combined_by_key = {
@@ -2165,6 +2193,7 @@ def main() -> None:
                         checkpoint_entry["reeval_metrics_path"] = str(row.get("reeval_metrics_path"))
                     if row.get("reeval_log_path"):
                         checkpoint_entry["reeval_log_path"] = str(row.get("reeval_log_path"))
+        write_csv(baseline_all_eval_raw_csv, baseline_all_eval_rows)
         write_csv(baseline_raw_csv, baseline_target_rows)
         write_csv(wdro_raw_csv, wdro_rows)
         write_csv(cdro_raw_csv, cdro_rows)
@@ -2194,6 +2223,7 @@ def main() -> None:
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
             "baseline_auxiliary_eval_points_enabled": False,
             "method_local_warmup_support_checkpoints_enabled": True,
+            "baseline_fid_mode": str(args.baseline_fid_mode),
             "robust_fid_mode": str(args.robust_fid_mode),
             "fid_evaluation_schedule": {
                 "template_key": str(fid_eval_schedule["template_key"]),
