@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -716,9 +717,12 @@ def _safe_float(value) -> Optional[float]:
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(parsed):
+        return None
+    return float(parsed)
 
 
 def _parse_case_ids(args: argparse.Namespace) -> List[str]:
@@ -1045,10 +1049,10 @@ def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[
                 "cdro_outer_clean_weight": case_cfg.get("outer_clean_weight", 1.0),
                 "cdro_total_budget_rho": case_cfg["cdro_total_budget_rho"],
                 "cdro_n_steps_path": case_cfg["cdro_n_steps_path"],
-                "best_fid": None if best_row is None else float(best_row["fid"]),
+                "best_fid": None if best_row is None else _safe_float(best_row.get("fid")),
                 "best_fid_weighted_compute": None if best_row is None else float(best_row["weighted_compute_units"]),
                 "best_fid_train_wall_clock_sec": None if best_row is None else _safe_float(best_row.get("train_wall_clock_sec")),
-                "final_fid": None if final_row is None else float(final_row["fid"]),
+                "final_fid": None if final_row is None else _safe_float(final_row.get("fid")),
                 "final_weighted_compute": None if final_row is None else float(final_row["weighted_compute_units"]),
                 "final_train_wall_clock_sec": None if final_row is None else _safe_float(final_row.get("train_wall_clock_sec")),
                 "warmup_end_weighted_compute": (
@@ -1056,7 +1060,7 @@ def _summarize_case(*, case_id: str, case_cfg: Dict, combined_csv: str) -> List[
                     if first_robust_row is None
                     else _safe_float(first_robust_row.get("baseline_weighted_compute_units"))
                 ),
-                "best_robust_fid": None if best_robust_row is None else float(best_robust_row["fid"]),
+                "best_robust_fid": None if best_robust_row is None else _safe_float(best_robust_row.get("fid")),
                 "best_robust_fid_weighted_compute": (
                     None if best_robust_row is None else float(best_robust_row["weighted_compute_units"])
                 ),

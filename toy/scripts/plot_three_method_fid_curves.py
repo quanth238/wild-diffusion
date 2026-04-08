@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 from typing import Dict, List, Optional
 
@@ -41,9 +42,38 @@ def _safe_float(value):
     if value in (None, ""):
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _row_has_metric(row: Dict, key: str) -> bool:
+    return _safe_float(row.get(key)) is not None
+
+
+def _safe_bool(value) -> bool:
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _prefer_row_with_metric(current: Optional[Dict], candidate: Dict, *, key: str) -> Dict:
+    if current is None:
+        return candidate
+    current_has_metric = _row_has_metric(current, key)
+    candidate_has_metric = _row_has_metric(candidate, key)
+    if candidate_has_metric and not current_has_metric:
+        return candidate
+    if candidate_has_metric == current_has_metric:
+        current_selected = _safe_bool(current.get("fid_eval_selected"))
+        candidate_selected = _safe_bool(candidate.get("fid_eval_selected"))
+        if candidate_selected and not current_selected:
+            return candidate
+    return current
 
 
 def normalize_row(row: Dict) -> Dict:
@@ -63,6 +93,8 @@ def normalize_row(row: Dict) -> Dict:
         "fixed_warmup_steps",
     ):
         normalized[key] = _safe_float(row.get(key))
+    normalized["fid_eval_selected"] = _safe_bool(row.get("fid_eval_selected"))
+    normalized["fid_evaluated"] = _safe_bool(row.get("fid_evaluated"))
     return normalized
 
 
@@ -75,8 +107,11 @@ def load_three_method_rows(*, wdro_compare_csv: str, cdro_compare_csv: str) -> L
         if row.get("method") != "baseline_edm":
             continue
         step = int(row["step"])
-        if step not in baseline_by_step:
-            baseline_by_step[step] = row
+        baseline_by_step[step] = _prefer_row_with_metric(
+            baseline_by_step.get(step),
+            row,
+            key="fid",
+        )
 
     merged_rows = list(baseline_by_step.values())
     merged_rows.extend(row for row in wdro_rows if row.get("method") == "wdro")
@@ -392,6 +427,13 @@ def main() -> None:
     )
     summary = {
         "rows": rows,
+        "fid_coverage": {
+            method: {
+                "rows_total": sum(1 for row in rows if row.get("method") == method),
+                "rows_with_fid": sum(1 for row in rows if row.get("method") == method and _row_has_metric(row, "fid")),
+            }
+            for method in ("baseline_edm", "wdro", "cdro")
+        },
         "sources": {
             "combined_csv": None if not combined_csv_arg else os.path.abspath(combined_csv_arg),
             "wdro_compare_csv": None if not wdro_compare_csv_arg else os.path.abspath(wdro_compare_csv_arg),

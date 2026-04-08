@@ -118,6 +118,19 @@ def _safe_float(value: Any) -> float:
         return float("nan")
 
 
+def _coerce_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(default)
+
+
 def _fmt(value: float, ndigits: int = 4) -> str:
     if not math.isfinite(value):
         return "nan"
@@ -151,22 +164,22 @@ def _write_csv(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             writer.writerow(row)
 
 
-def _median(values: List[float]) -> float:
-    finite = [v for v in values if math.isfinite(v)]
+def _median(values: List[Any]) -> float:
+    finite = [fv for fv in (_safe_float(v) for v in values) if math.isfinite(fv)]
     if not finite:
         return float("nan")
     return float(statistics.median(finite))
 
 
-def _mean(values: List[float]) -> float:
-    finite = [v for v in values if math.isfinite(v)]
+def _mean(values: List[Any]) -> float:
+    finite = [fv for fv in (_safe_float(v) for v in values) if math.isfinite(fv)]
     if not finite:
         return float("nan")
     return float(statistics.fmean(finite))
 
 
-def _std(values: List[float]) -> float:
-    finite = [v for v in values if math.isfinite(v)]
+def _std(values: List[Any]) -> float:
+    finite = [fv for fv in (_safe_float(v) for v in values) if math.isfinite(fv)]
     if len(finite) < 2:
         return float("nan")
     return float(statistics.stdev(finite))
@@ -290,6 +303,7 @@ def _save_run_state(
     step: int,
     planned_max_step: int,
     checkpoint_steps: List[int],
+    fid_eval_steps: List[int],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     grad_scaler,
@@ -308,6 +322,7 @@ def _save_run_state(
         "step": int(step),
         "planned_max_step": int(planned_max_step),
         "checkpoint_steps": [int(v) for v in checkpoint_steps],
+        "fid_eval_steps": [int(v) for v in fid_eval_steps],
         "model_state_dict": _to_cpu_tree(model.state_dict()),
         "optimizer_state_dict": _to_cpu_tree(optimizer.state_dict()),
         "grad_scaler_state_dict": None if grad_scaler is None else _to_cpu_tree(grad_scaler.state_dict()),
@@ -531,7 +546,7 @@ class RunRow:
     checkpoint_path: str
     train_subset_size: int
     val_subset_size: int
-    baseline_fid: float
+    baseline_fid: Optional[float]
     baseline_loss_final: float
     baseline_loss_mean_last: float
     train_elapsed_sec: float
@@ -539,7 +554,11 @@ class RunRow:
     train_gpu_hours: float
     weighted_compute_units: float
     batch_equiv_denoiser_evals: float
-    fid_elapsed_sec: float
+    fid_elapsed_sec: Optional[float]
+    fid_eval_selected: bool
+    fid_evaluated: bool
+    fid_missing_reason: str
+    fid_source: str
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -561,6 +580,10 @@ class RunRow:
             "weighted_compute_units": self.weighted_compute_units,
             "batch_equiv_denoiser_evals": self.batch_equiv_denoiser_evals,
             "fid_elapsed_sec": self.fid_elapsed_sec,
+            "fid_eval_selected": bool(self.fid_eval_selected),
+            "fid_evaluated": bool(self.fid_evaluated),
+            "fid_missing_reason": str(self.fid_missing_reason),
+            "fid_source": str(self.fid_source),
         }
 
 
@@ -649,6 +672,10 @@ def _run_row_from_dict(
         "train_gpu_hours",
         float(train_elapsed) * float(max(int(train_accelerator_count), 0)) / 3600.0,
     )
+    baseline_fid = _safe_float(payload.get("baseline_fid"))
+    payload["baseline_fid"] = None if not math.isfinite(baseline_fid) else float(baseline_fid)
+    fid_elapsed = _safe_float(payload.get("fid_elapsed_sec"))
+    payload["fid_elapsed_sec"] = None if not math.isfinite(fid_elapsed) else float(fid_elapsed)
     if "weighted_compute_units" not in payload:
         weighted_units = weighted_compute_units(
             n_fwd=0.0,
@@ -658,6 +685,24 @@ def _run_row_from_dict(
         )
         payload["weighted_compute_units"] = float(weighted_units) if weighted_units is not None else float("nan")
     payload.setdefault("batch_equiv_denoiser_evals", float(step))
+    payload.setdefault("fid_eval_selected", _coerce_bool(payload.get("fid_eval_selected"), default=True))
+    payload.setdefault(
+        "fid_evaluated",
+        _coerce_bool(
+            payload.get("fid_evaluated"),
+            default=math.isfinite(_safe_float(payload.get("baseline_fid"))),
+        ),
+    )
+    payload.setdefault(
+        "fid_missing_reason",
+        ""
+        if payload["fid_evaluated"]
+        else ("not_selected_by_schedule" if not payload["fid_eval_selected"] else "missing_or_failed"),
+    )
+    payload.setdefault(
+        "fid_source",
+        "in_run_metrics" if payload["fid_evaluated"] else "not_evaluated",
+    )
     return RunRow(**payload)
 
 
@@ -852,6 +897,7 @@ def _run_combo(
     train_percent: float,
     seed: int,
     checkpoint_steps: List[int],
+    fid_eval_steps: List[int],
     detector_net,
     mu_ref: torch.Tensor,
     sigma_ref: torch.Tensor,
@@ -908,6 +954,7 @@ def _run_combo(
 
     rows: List[RunRow] = []
     checkpoint_set = set(int(step) for step in checkpoint_steps)
+    fid_eval_set = set(int(step) for step in fid_eval_steps)
     run_state_signature = _build_run_state_signature(cfg=cfg, dataset=dataset, train_percent=train_percent, seed=seed)
     start_step = 0
     combo_train_elapsed_offset_sec = 0.0
@@ -925,6 +972,22 @@ def _run_combo(
         if start_step < 0 or start_step > int(cfg.steps):
             raise RuntimeError(
                 f"Invalid saved step in run state: step={start_step} current_max={int(cfg.steps)} ({run_state_path})"
+            )
+        saved_checkpoint_steps = [int(v) for v in payload.get("checkpoint_steps", [])]
+        if saved_checkpoint_steps != [int(v) for v in checkpoint_steps]:
+            raise RuntimeError(
+                "Checkpoint-step schedule mismatch.\n"
+                f"run_state={run_state_path}\n"
+                f"current={checkpoint_steps}\n"
+                f"saved={saved_checkpoint_steps}"
+            )
+        saved_fid_eval_steps = [int(v) for v in payload.get("fid_eval_steps", saved_checkpoint_steps)]
+        if saved_fid_eval_steps != [int(v) for v in fid_eval_steps]:
+            raise RuntimeError(
+                "FID-eval schedule mismatch.\n"
+                f"run_state={run_state_path}\n"
+                f"current={fid_eval_steps}\n"
+                f"saved={saved_fid_eval_steps}"
             )
         baseline.load_state_dict(payload["model_state_dict"])
         optimizer.load_state_dict(payload["optimizer_state_dict"])
@@ -1002,30 +1065,43 @@ def _run_combo(
             n_fwd_parambackward=float(step),
             calibration=weighted_calibration,
         )
-
-        baseline_was_training = baseline.training
-        baseline.eval()
-        if ema_model is not None:
-            ema_model.eval()
-        t_fid = time.perf_counter()
-        fid_value = _run_with_scoped_seed(
-            eval_seed,
-            lambda: _compute_fid_for_model(
-                denoiser=eval_model,
-                sigma_levels=sigma_levels,
-                dataset=dataset,
-                detector_net=detector_net,
-                mu_ref=mu_ref,
-                sigma_ref=sigma_ref,
-                num_images=int(args.fid_samples),
-                gen_batch=int(args.gen_batch),
-                device=device,
-                amp_dtype=amp_dtype,
-            ),
-        )
-        fid_elapsed = float(time.perf_counter() - t_fid)
-        if baseline_was_training:
-            baseline.train()
+        fid_eval_selected = bool(step in fid_eval_set)
+        fid_value: Optional[float] = None
+        fid_elapsed: Optional[float] = None
+        fid_evaluated = False
+        fid_missing_reason = ""
+        fid_source = "not_evaluated"
+        if fid_eval_selected:
+            if detector_net is None or mu_ref is None or sigma_ref is None:
+                raise RuntimeError("FID evaluation requested but detector/ref stats were not initialized.")
+            baseline_was_training = baseline.training
+            baseline.eval()
+            if ema_model is not None:
+                ema_model.eval()
+            t_fid = time.perf_counter()
+            fid_value = _run_with_scoped_seed(
+                eval_seed,
+                lambda: _compute_fid_for_model(
+                    denoiser=eval_model,
+                    sigma_levels=sigma_levels,
+                    dataset=dataset,
+                    detector_net=detector_net,
+                    mu_ref=mu_ref,
+                    sigma_ref=sigma_ref,
+                    num_images=int(args.fid_samples),
+                    gen_batch=int(args.gen_batch),
+                    device=device,
+                    amp_dtype=amp_dtype,
+                ),
+            )
+            fid_elapsed = float(time.perf_counter() - t_fid)
+            fid_evaluated = math.isfinite(_safe_float(fid_value))
+            fid_missing_reason = "" if fid_evaluated else "selected_but_missing_or_failed"
+            fid_source = "in_run_metrics" if fid_evaluated else "missing_in_run_metrics"
+            if baseline_was_training:
+                baseline.train()
+        else:
+            fid_missing_reason = "not_selected_by_schedule"
 
         row = RunRow(
             train_percent=float(train_percent),
@@ -1037,7 +1113,7 @@ def _run_combo(
             checkpoint_path=str(ckpt_path),
             train_subset_size=int(dataset.metadata.get("train_subset_size_resolved") or 0),
             val_subset_size=int(dataset.metadata.get("val_subset_size_resolved") or 0),
-            baseline_fid=float(fid_value),
+            baseline_fid=None if fid_value is None else float(fid_value),
             baseline_loss_final=float(baseline_loss_final),
             baseline_loss_mean_last=float(baseline_loss_mean_last),
             train_elapsed_sec=train_elapsed,
@@ -1045,18 +1121,23 @@ def _run_combo(
             train_gpu_hours=float(train_gpu_hours),
             weighted_compute_units=float(weighted_units) if weighted_units is not None else float("nan"),
             batch_equiv_denoiser_evals=float(step),
-            fid_elapsed_sec=fid_elapsed,
+            fid_elapsed_sec=None if fid_elapsed is None else float(fid_elapsed),
+            fid_eval_selected=bool(fid_eval_selected),
+            fid_evaluated=bool(fid_evaluated),
+            fid_missing_reason=str(fid_missing_reason),
+            fid_source=str(fid_source),
         )
         rows.append(row)
         print(
             "[row]"
             f" pct={train_percent:g} seed={seed} step={step}"
             f" mimg={_fmt(row.images_shown_m, 3)}"
-            f" fid={_fmt(row.baseline_fid, 3)}"
+            f" fid={_fmt(_safe_float(row.baseline_fid), 3)}"
             f" loss={_fmt(row.baseline_loss_final, 5)}"
             f" train_elapsed={_fmt(row.train_elapsed_sec, 1)}s"
             f" weighted={_fmt(row.weighted_compute_units, 1)}"
-            f" fid_elapsed={_fmt(row.fid_elapsed_sec, 1)}s",
+            f" fid_selected={str(row.fid_eval_selected).lower()}"
+            f" fid_elapsed={_fmt(_safe_float(row.fid_elapsed_sec), 1)}s",
             flush=True,
         )
         _write_combo_rows_summary(
@@ -1139,6 +1220,7 @@ def _run_combo(
                 step=step,
                 planned_max_step=int(cfg.steps),
                 checkpoint_steps=checkpoint_steps,
+                fid_eval_steps=fid_eval_steps,
                 model=baseline,
                 optimizer=optimizer,
                 grad_scaler=grad_scaler,
@@ -1172,6 +1254,7 @@ def build_parser():
     parser.add_argument("--train-percents", type=str, default="5,10,20,50,100")
     parser.add_argument("--steps-list", type=str, default="1000,2000,4000,8000,12000,16000,20000")
     parser.add_argument("--mimg-list", type=str, default="")
+    parser.add_argument("--fid-eval-steps-list", type=str, default="")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--disable-resume", action="store_true")
     parser.add_argument("--state-save-every", type=int, default=500)
@@ -1239,6 +1322,19 @@ def main() -> None:
         args.steps_list = ",".join(str(step) for step in checkpoint_steps)
     else:
         checkpoint_steps = _parse_int_list(args.steps_list, allow_zero=True)
+    fid_eval_steps_arg = str(args.fid_eval_steps_list).strip().lower()
+    if fid_eval_steps_arg == "none":
+        fid_eval_steps = []
+    elif str(args.fid_eval_steps_list).strip():
+        fid_eval_steps = _parse_int_list(args.fid_eval_steps_list, allow_zero=True)
+    else:
+        fid_eval_steps = list(checkpoint_steps)
+    invalid_fid_eval_steps = sorted(set(int(step) for step in fid_eval_steps) - set(int(step) for step in checkpoint_steps))
+    if invalid_fid_eval_steps:
+        raise SystemExit(
+            "[ERROR] --fid-eval-steps-list must be a subset of --steps-list / resolved checkpoint steps. "
+            f"Invalid steps: {invalid_fid_eval_steps}"
+        )
     repo_root = _repo_root()
     outdir = args.outdir.resolve()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1310,10 +1406,15 @@ def main() -> None:
     )
     if str(args.mimg_list).strip():
         print(f"[runtime] target_mimg={str(args.mimg_list).strip()} -> checkpoint_steps={checkpoint_steps}", flush=True)
-    detector_net = _load_detector(device)
-    mu_ref_np, sigma_ref_np = _load_ref_stats(ref_npz)
-    mu_ref = torch.as_tensor(mu_ref_np, dtype=torch.float64, device=device)
-    sigma_ref = torch.as_tensor(sigma_ref_np, dtype=torch.float64, device=device)
+    print(f"[runtime] fid_eval_steps={fid_eval_steps}", flush=True)
+    detector_net = None
+    mu_ref = None
+    sigma_ref = None
+    if fid_eval_steps:
+        detector_net = _load_detector(device)
+        mu_ref_np, sigma_ref_np = _load_ref_stats(ref_npz)
+        mu_ref = torch.as_tensor(mu_ref_np, dtype=torch.float64, device=device)
+        sigma_ref = torch.as_tensor(sigma_ref_np, dtype=torch.float64, device=device)
 
     all_rows: List[RunRow] = []
     for train_percent in train_percents:
@@ -1323,6 +1424,7 @@ def main() -> None:
                 train_percent=train_percent,
                 seed=seed,
                 checkpoint_steps=checkpoint_steps,
+                fid_eval_steps=fid_eval_steps,
                 detector_net=detector_net,
                 mu_ref=mu_ref,
                 sigma_ref=sigma_ref,
@@ -1378,6 +1480,7 @@ def main() -> None:
             "seeds": seeds,
             "train_percents": train_percents,
             "steps_list": checkpoint_steps,
+            "fid_eval_steps_list": fid_eval_steps,
             "batch_size": int(args.batch_size),
             "image_size": int(args.image_size),
             "training_objective": str(args.training_objective),

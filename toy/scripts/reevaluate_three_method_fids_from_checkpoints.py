@@ -137,9 +137,12 @@ def _safe_int(value, default: int = 0) -> int:
 
 def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return default
+    if not np.isfinite(parsed):
+        return default
+    return float(parsed)
 
 
 def _load_json(path: str) -> Dict:
@@ -779,6 +782,9 @@ def main() -> None:
         updated["reeval_fid_samples"] = str(int(args.fid_samples))
         updated["reeval_fid_batch_size"] = str(max(int(args.fid_batch_size), 1))
         updated["reeval_mode"] = "direct_fid_only_in_memory"
+        updated["fid_evaluated"] = True
+        updated["fid_missing_reason"] = ""
+        updated["fid_source"] = "reevaluated_from_checkpoint"
         reevaluated_rows.append(updated)
 
     combined_out = os.path.join(args.outdir, f"{args.prefix}_all_methods_raw_seed_rows.csv")

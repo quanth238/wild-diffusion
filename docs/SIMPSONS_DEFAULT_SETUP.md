@@ -85,9 +85,12 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Protocol name: `three_method_single_trajectory_weighted_grid`
 - Seeds in the locked artifact: `0`
 - Shared grid template: `wdro_dense_41_relative`
+- Default FID-eval template: `weighted_balanced_20_relative`
 - Primary metric: `weighted_compute_units`
 - Secondary metric: `train_wall_clock_sec`
 - Shared weighted cap: `200000`
+- Dense checkpoints are still saved on the shared comparison grid, plus exact warmup-support checkpoints.
+- The launcher now computes FID only on the coarser balanced knot subset by default. Omit the new template flag to keep the old evaluate-every-comparison-knot behavior.
 - Weighted-compute calibration:
   - `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
 
@@ -149,6 +152,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --debug-terminal-step 20 \
   --log-every 200 \
   --n-steps-path 64 \
+  --fid-eval-template balanced \
   --outer-attack-weight 0.3 \
   --outer-clean-weight 1.0 \
   --wdro-warmup-fraction 0.05 \

@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -115,6 +116,29 @@ GRID_TEMPLATE_STEPS_DENSER = [
     73500,
     76970,
 ]
+FID_EVAL_TEMPLATE_STEPS_BALANCED = [
+    0,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    15000,
+    20000,
+    25000,
+    30000,
+    35000,
+    40000,
+    50000,
+    60000,
+    70000,
+    76970,
+]
 GRID_TEMPLATES = {
     "standard": {
         "name": "wdro_dense_25_relative",
@@ -125,10 +149,24 @@ GRID_TEMPLATES = {
         "steps": GRID_TEMPLATE_STEPS_DENSER,
     },
 }
+FID_EVAL_TEMPLATES = {
+    "all": {
+        "name": "every_comparison_knot",
+        "steps": None,
+    },
+    "balanced": {
+        "name": "weighted_balanced_20_relative",
+        "steps": FID_EVAL_TEMPLATE_STEPS_BALANCED,
+    },
+}
 
 
 def _grid_template_names() -> List[str]:
     return sorted(GRID_TEMPLATES.keys())
+
+
+def _fid_eval_template_names() -> List[str]:
+    return sorted(FID_EVAL_TEMPLATES.keys())
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-max", type=float, default=2.0)
     parser.add_argument("--shared-weighted-cap", type=float, default=200000.0)
     parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
+    parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="all")
     parser.add_argument("--baseline-max-steps", type=int, default=80000)
     parser.add_argument("--wdro-max-total-steps", type=int, default=76970)
     parser.add_argument("--skip-existing", action="store_true")
@@ -249,9 +288,73 @@ def _optional_float(value) -> Optional[float]:
     if value is None or value == "":
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _optional_bool(value, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _resolve_fid_annotation(
+    *,
+    fid_value: Optional[float],
+    fid_selected: bool,
+    source_if_evaluated: str = "in_run_metrics",
+) -> Dict:
+    fid_evaluated = fid_value is not None
+    if fid_evaluated:
+        missing_reason = ""
+        fid_source = str(source_if_evaluated)
+    elif fid_selected:
+        missing_reason = "selected_but_missing"
+        fid_source = "missing_in_run_metrics"
+    else:
+        missing_reason = "not_selected_by_schedule"
+        fid_source = "not_evaluated"
+    return {
+        "fid": None if fid_value is None else float(fid_value),
+        "fid_eval_selected": bool(fid_selected),
+        "fid_evaluated": bool(fid_evaluated),
+        "fid_missing_reason": str(missing_reason),
+        "fid_source": str(fid_source),
+    }
+
+
+def _ensure_row_fid_fields(row: Dict) -> Dict:
+    out = dict(row)
+    fid_value = _optional_float(out.get("fid"))
+    fid_selected = _optional_bool(out.get("fid_eval_selected"), default=(fid_value is not None))
+    fid_evaluated = _optional_bool(out.get("fid_evaluated"), default=(fid_value is not None))
+    fid_missing_reason = str(out.get("fid_missing_reason", "")).strip()
+    if not fid_missing_reason and not fid_evaluated:
+        fid_missing_reason = "not_selected_by_schedule" if not fid_selected else "selected_but_missing"
+    fid_source = str(out.get("fid_source", "")).strip()
+    if not fid_source:
+        fid_source = "in_run_metrics" if fid_evaluated else "not_evaluated"
+    out.update(
+        {
+            "fid": fid_value,
+            "fid_eval_selected": bool(fid_selected),
+            "fid_evaluated": bool(fid_evaluated),
+            "fid_missing_reason": str(fid_missing_reason),
+            "fid_source": str(fid_source),
+        }
+    )
+    return out
 
 
 def _summary_stat(series, stat_name: str) -> Optional[float]:
@@ -389,6 +492,65 @@ def realize_shared_weighted_grid(*, shared_weighted_cap: float, template_steps: 
     if out[-1] != cap:
         out[-1] = cap
     return out
+
+
+def _select_fid_eval_indices(
+    *,
+    checkpoint_targets: List[float],
+    fid_eval_template_key: str,
+    shared_weighted_cap: float,
+) -> Dict:
+    if not checkpoint_targets:
+        return {
+            "template_key": str(fid_eval_template_key),
+            "template_name": str(FID_EVAL_TEMPLATES[str(fid_eval_template_key)]["name"]),
+            "requested_relative_steps": [],
+            "requested_targets": [],
+            "selected_indices": [],
+            "selected_targets": [],
+            "selection_strategy": "empty_checkpoint_grid",
+        }
+    template = FID_EVAL_TEMPLATES[str(fid_eval_template_key)]
+    if template["steps"] is None:
+        selected_indices = list(range(len(checkpoint_targets)))
+        return {
+            "template_key": str(fid_eval_template_key),
+            "template_name": str(template["name"]),
+            "requested_relative_steps": [],
+            "requested_targets": [float(target) for target in checkpoint_targets],
+            "selected_indices": [int(idx) for idx in selected_indices],
+            "selected_targets": [float(target) for target in checkpoint_targets],
+            "selection_strategy": "all_comparison_knots",
+        }
+
+    requested_targets = [
+        float(target)
+        for target in realize_shared_weighted_grid(
+            shared_weighted_cap=float(shared_weighted_cap),
+            template_steps=list(template["steps"]),
+        )
+        if float(target) > 0.0
+    ]
+    selected_indices: List[int] = []
+    for target in requested_targets:
+        best_index = min(
+            range(len(checkpoint_targets)),
+            key=lambda idx: (abs(float(checkpoint_targets[idx]) - float(target)), idx),
+        )
+        if best_index not in selected_indices:
+            selected_indices.append(int(best_index))
+    if (len(checkpoint_targets) - 1) not in selected_indices:
+        selected_indices.append(len(checkpoint_targets) - 1)
+    selected_indices = sorted(set(int(idx) for idx in selected_indices))
+    return {
+        "template_key": str(fid_eval_template_key),
+        "template_name": str(template["name"]),
+        "requested_relative_steps": [int(step) for step in template["steps"]],
+        "requested_targets": [float(target) for target in requested_targets],
+        "selected_indices": [int(idx) for idx in selected_indices],
+        "selected_targets": [float(checkpoint_targets[idx]) for idx in selected_indices],
+        "selection_strategy": "nearest_shared_weighted_checkpoint_knot",
+    }
 
 
 def _baseline_step_weighted_units(calibration: Dict) -> float:
@@ -624,12 +786,21 @@ def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
     rows = load_csv_rows(runs_csv)
     out: List[Dict] = []
     for row in rows:
+        fid_value = _optional_float(row.get("baseline_fid"))
+        fid_selected = _optional_bool(row.get("fid_eval_selected"), default=(fid_value is not None))
+        fid_evaluated = _optional_bool(row.get("fid_evaluated"), default=(fid_value is not None))
+        fid_missing_reason = str(row.get("fid_missing_reason", "")).strip()
+        if not fid_missing_reason and not fid_evaluated:
+            fid_missing_reason = "not_selected_by_schedule" if not fid_selected else "selected_but_missing"
+        fid_source = str(row.get("fid_source", "")).strip()
+        if not fid_source:
+            fid_source = "in_run_metrics" if fid_evaluated else "not_evaluated"
         out.append(
             {
                 "method": "baseline_edm",
                 "seed": int(row["seed"]),
                 "step": int(row["step"]),
-                "fid": float(row["baseline_fid"]),
+                "fid": fid_value,
                 "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
                 "weighted_compute_units": float(row["weighted_compute_units"]),
                 "batch_equiv_denoiser_evals": float(row["batch_equiv_denoiser_evals"]),
@@ -642,6 +813,10 @@ def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
                 "exp_name": row["exp_name"],
                 "exp_dir": row["exp_dir"],
                 "checkpoint_path": row["checkpoint_path"],
+                "fid_eval_selected": bool(fid_selected),
+                "fid_evaluated": bool(fid_evaluated),
+                "fid_missing_reason": str(fid_missing_reason),
+                "fid_source": str(fid_source),
                 **_empty_objective_debug_fields(),
             }
         )
@@ -653,6 +828,7 @@ def _extract_wdro_row(
     metrics_path: str,
     calibration: Dict,
     train_accelerator_count: int,
+    fid_selected: bool,
 ) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
@@ -693,15 +869,11 @@ def _extract_wdro_row(
         total_images_shown_m_effective = float(effective_images_seen_total) / 1_000_000.0
     warmup_only = bool(robust_phase_steps <= 0)
     fid_value = (
-        float(sample_quality["baseline_fid"])
-        if warmup_only and sample_quality.get("baseline_fid") is not None
-        else (
-            float(sample_quality["robust_fid"])
-            if sample_quality.get("robust_fid") is not None
-            else float("nan")
-        )
+        _optional_float(sample_quality.get("baseline_fid"))
+        if warmup_only
+        else _optional_float(sample_quality.get("robust_fid"))
     )
-    return {
+    row = {
         "method": "wdro",
         "step": int(total_steps_requested),
         "compute_budget_be": float(total_compute_be_effective),
@@ -713,7 +885,6 @@ def _extract_wdro_row(
         ),
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
-        "fid": float(fid_value),
         "loss_kind": "robust_outer_loss",
         "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
         "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
@@ -745,6 +916,14 @@ def _extract_wdro_row(
         ),
         **_objective_debug_fields(objective=objective),
     }
+    row.update(
+        _resolve_fid_annotation(
+            fid_value=fid_value,
+            fid_selected=bool(fid_selected),
+            source_if_evaluated="in_run_metrics",
+        )
+    )
+    return row
 
 
 def _extract_cdro_row(
@@ -753,6 +932,7 @@ def _extract_cdro_row(
     baseline_ckpt_requested: Optional[str],
     calibration: Dict,
     train_accelerator_count: int,
+    fid_selected: bool,
 ) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
@@ -793,15 +973,11 @@ def _extract_cdro_row(
         total_images_shown_m_effective = float(effective_images_seen_total) / 1_000_000.0
     warmup_only = bool(robust_phase_steps <= 0)
     fid_value = (
-        float(sample_quality["baseline_fid"])
-        if warmup_only and sample_quality.get("baseline_fid") is not None
-        else (
-            float(sample_quality["robust_fid"])
-            if sample_quality.get("robust_fid") is not None
-            else float("nan")
-        )
+        _optional_float(sample_quality.get("baseline_fid"))
+        if warmup_only
+        else _optional_float(sample_quality.get("robust_fid"))
     )
-    return {
+    row = {
         "method": "cdro",
         "step": int(total_steps_requested),
         "compute_budget_be": float(total_compute_be_effective),
@@ -813,7 +989,6 @@ def _extract_cdro_row(
         ),
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
-        "fid": float(fid_value),
         "loss_kind": "robust_outer_loss",
         "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
         "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
@@ -841,6 +1016,14 @@ def _extract_cdro_row(
         ),
         **_objective_debug_fields(objective=objective),
     }
+    row.update(
+        _resolve_fid_annotation(
+            fid_value=fid_value,
+            fid_selected=bool(fid_selected),
+            source_if_evaluated="in_run_metrics",
+        )
+    )
+    return row
 
 
 def _normalize_method_metrics_row(
@@ -902,6 +1085,7 @@ def _build_baseline_sweep_cmd(
     prefix: str,
     seeds_text: str,
     steps: List[int],
+    fid_eval_steps: List[int],
 ) -> List[str]:
     cmd = [
         args.python_bin,
@@ -916,6 +1100,8 @@ def _build_baseline_sweep_cmd(
         "1",
         "--steps-list",
         format_steps_list(steps),
+        "--fid-eval-steps-list",
+        ("none" if not fid_eval_steps else format_steps_list(fid_eval_steps)),
         "--device",
         args.device,
         "--require-cuda",
@@ -974,6 +1160,7 @@ def _build_run_toy_cmd(
     resume_path: Optional[str],
     save_path: Optional[str],
     baseline_ckpt_path: Optional[str],
+    compute_fid: bool,
 ) -> List[str]:
     n_steps_path_value = int(_effective_cdro_n_steps_path(args)) if method_name == "cdro" else int(args.n_steps_path)
     cmd = [
@@ -1029,7 +1216,6 @@ def _build_run_toy_cmd(
         str(args.sigma_min),
         "--sigma-max",
         str(args.sigma_max),
-        "--compute-fid",
         "--fid-ref-path",
         args.fid_ref_path,
         "--method-version",
@@ -1039,6 +1225,8 @@ def _build_run_toy_cmd(
         "--weighted-compute-calibration-path",
         str(args.weighted_compute_calibration_path).strip(),
     ]
+    if compute_fid:
+        cmd.append("--compute-fid")
     if fixed_warmup_steps is not None and int(fixed_warmup_steps) > 0:
         cmd.extend(
             [
@@ -1127,20 +1315,41 @@ def _run_method_local_warmup_trajectory(
     seed: int,
     weighted_grid_targets: List[float],
     comparison_steps: List[int],
+    fid_eval_steps: List[int],
     fixed_warmup_steps: int,
     trajectory_total_steps_max: int,
     reuse_runs_csv: str = "",
     reuse_aggregate_csv: str = "",
 ) -> Tuple[List[Dict], Optional[str], Dict]:
-    warmup_eval_steps = sorted(
+    warmup_checkpoint_steps = sorted(
         {
             int(step)
             for step in list(comparison_steps) + [int(fixed_warmup_steps)]
             if int(step) > 0 and int(step) <= int(fixed_warmup_steps)
         }
     )
-    if not warmup_eval_steps:
-        return [], None, {"runs_csv": None, "warmup_eval_steps": [], "support_checkpoint_path": None}
+    if str(args.fid_eval_template) == "all":
+        warmup_fid_eval_steps = list(warmup_checkpoint_steps)
+    else:
+        warmup_fid_eval_steps = sorted(
+            {
+                int(step)
+                for step in fid_eval_steps
+                if int(step) > 0 and int(step) in set(warmup_checkpoint_steps)
+            }
+        )
+    if not warmup_checkpoint_steps:
+        return (
+            [],
+            None,
+            {
+                "runs_csv": None,
+                "warmup_eval_steps": [],
+                "warmup_checkpoint_steps": [],
+                "warmup_fid_eval_steps": [],
+                "support_checkpoint_path": None,
+            },
+        )
 
     seed_root = os.path.join(method_root, f"s{seed}")
     warmup_outdir = os.path.join(seed_root, "_warmup_baseline")
@@ -1154,7 +1363,8 @@ def _run_method_local_warmup_trajectory(
         outdir=warmup_outdir,
         prefix=warmup_prefix,
         seeds_text=str(int(seed)),
-        steps=warmup_eval_steps,
+        steps=warmup_checkpoint_steps,
+        fid_eval_steps=warmup_fid_eval_steps,
     )
     if str(reuse_runs_csv).strip():
         print(
@@ -1168,7 +1378,9 @@ def _run_method_local_warmup_trajectory(
         )
     else:
         print(
-            f"[collect-weighted] {method_name} warmup seed={seed} steps={warmup_eval_steps}",
+            f"[collect-weighted] {method_name} warmup seed={seed}"
+            f" checkpoint_steps={warmup_checkpoint_steps}"
+            f" fid_eval_steps={warmup_fid_eval_steps}",
             flush=True,
         )
         run_command(
@@ -1219,7 +1431,9 @@ def _run_method_local_warmup_trajectory(
         "outdir": warmup_outdir,
         "runs_csv": warmup_runs_csv,
         "aggregate_csv": warmup_agg_csv,
-        "warmup_eval_steps": [int(step) for step in warmup_eval_steps],
+        "warmup_eval_steps": [int(step) for step in warmup_checkpoint_steps],
+        "warmup_checkpoint_steps": [int(step) for step in warmup_checkpoint_steps],
+        "warmup_fid_eval_steps": [int(step) for step in warmup_fid_eval_steps],
         "support_checkpoint_step": int(fixed_warmup_steps),
         "support_checkpoint_path": support_checkpoint_path,
         "reused_runs_csv": str(reuse_runs_csv).strip() or None,
@@ -1338,6 +1552,35 @@ def main() -> None:
         )
         for target in weighted_grid_targets
     ]
+    fid_eval_schedule = _select_fid_eval_indices(
+        checkpoint_targets=weighted_grid_targets,
+        fid_eval_template_key=str(args.fid_eval_template),
+        shared_weighted_cap=float(shared_weighted_cap),
+    )
+    fid_eval_indices = [int(idx) for idx in fid_eval_schedule["selected_indices"]]
+    baseline_fid_eval_steps = sorted(
+        {
+            int(baseline_curve_steps[idx])
+            for idx in fid_eval_indices
+            if 0 <= int(idx) < len(baseline_curve_steps) and int(baseline_curve_steps[idx]) > 0
+        }
+    )
+    wdro_fid_eval_steps = sorted(
+        {
+            int(wdro_curve_steps[idx])
+            for idx in fid_eval_indices
+            if 0 <= int(idx) < len(wdro_curve_steps) and int(wdro_curve_steps[idx]) > 0
+        }
+    )
+    cdro_fid_eval_steps = sorted(
+        {
+            int(cdro_curve_steps[idx])
+            for idx in fid_eval_indices
+            if 0 <= int(idx) < len(cdro_curve_steps) and int(cdro_curve_steps[idx]) > 0
+        }
+    )
+    wdro_fid_eval_step_set = set(int(step) for step in wdro_fid_eval_steps)
+    cdro_fid_eval_step_set = set(int(step) for step in cdro_fid_eval_steps)
     baseline_run_steps = sorted({int(step) for step in baseline_curve_steps if int(step) > 0})
     baseline_trajectory_total_steps_max = max(baseline_run_steps) if baseline_run_steps else 0
 
@@ -1361,9 +1604,17 @@ def main() -> None:
         flush=True,
     )
     print(f"[collect-weighted] weighted_targets={weighted_grid_targets}", flush=True)
+    print(
+        "[collect-weighted] fid_eval_schedule="
+        f"{fid_eval_schedule['template_key']} selected_targets={fid_eval_schedule['selected_targets']}",
+        flush=True,
+    )
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
+    print(f"[collect-weighted] baseline_fid_eval_steps={baseline_fid_eval_steps}", flush=True)
     print(f"[collect-weighted] wdro_steps={wdro_curve_steps}", flush=True)
+    print(f"[collect-weighted] wdro_fid_eval_steps={wdro_fid_eval_steps}", flush=True)
     print(f"[collect-weighted] cdro_steps={cdro_curve_steps}", flush=True)
+    print(f"[collect-weighted] cdro_fid_eval_steps={cdro_fid_eval_steps}", flush=True)
 
     reused_baseline_runs_csv = str(args.reuse_baseline_runs_csv).strip()
     reused_baseline_aggregate_csv = str(args.reuse_baseline_aggregate_csv).strip()
@@ -1395,6 +1646,7 @@ def main() -> None:
             prefix=baseline_prefix,
             seeds_text=args.seeds,
             steps=baseline_run_steps,
+            fid_eval_steps=baseline_fid_eval_steps,
         )
         if args.skip_existing and os.path.isfile(baseline_runs_csv) and os.path.isfile(baseline_agg_csv):
             print(f"[collect-weighted] reuse baseline outputs: {baseline_outdir}", flush=True)
@@ -1436,7 +1688,7 @@ def main() -> None:
         if not os.path.isfile(reused_wdro_raw_csv):
             raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
         reused_rows = [
-            row
+            _ensure_row_fid_fields(row)
             for row in load_csv_rows(reused_wdro_raw_csv)
             if str(row.get("method", "")) == "wdro" and int(row["seed"]) in seeds
         ]
@@ -1464,6 +1716,7 @@ def main() -> None:
                 seed=int(seed),
                 weighted_grid_targets=weighted_grid_targets,
                 comparison_steps=wdro_curve_steps,
+                fid_eval_steps=wdro_fid_eval_steps,
                 fixed_warmup_steps=int(wdro_fixed_warmup_steps),
                 trajectory_total_steps_max=int(wdro_max_total_steps),
             )
@@ -1479,6 +1732,7 @@ def main() -> None:
             for target_weighted, total_steps in zip(weighted_grid_targets, wdro_curve_steps):
                 if int(total_steps) <= int(wdro_fixed_warmup_steps):
                     continue
+                fid_selected = bool(int(total_steps) in wdro_fid_eval_step_set)
                 checkpoint_path = _trajectory_checkpoint_path(
                     trajectory_dir=wdro_outdir,
                     method_name="wdro",
@@ -1499,7 +1753,8 @@ def main() -> None:
                         f"[collect-weighted] wdro seed={seed} step={total_steps} "
                         f"target_weighted={target_weighted:.4f} fixed_warmup_steps={int(wdro_fixed_warmup_steps)} "
                         f"baseline_ckpt={'yes' if baseline_ckpt_requested else 'no'} "
-                        f"resume_ckpt={'yes' if wdro_resume_checkpoint else 'no'}",
+                        f"resume_ckpt={'yes' if wdro_resume_checkpoint else 'no'} "
+                        f"fid={'yes' if fid_selected else 'no'}",
                         flush=True,
                     )
                     cmd = _build_run_toy_cmd(
@@ -1513,6 +1768,7 @@ def main() -> None:
                         resume_path=wdro_resume_checkpoint,
                         save_path=checkpoint_path,
                         baseline_ckpt_path=baseline_ckpt_requested,
+                        compute_fid=bool(fid_selected),
                     )
                     run_command(
                         cmd=cmd,
@@ -1523,6 +1779,7 @@ def main() -> None:
                     metrics_path=metrics_path,
                     calibration=calibration,
                     train_accelerator_count=int(args.train_accelerator_count),
+                    fid_selected=bool(fid_selected),
                 )
                 row["checkpoint_path"] = checkpoint_path
                 row["baseline_ckpt_requested"] = baseline_ckpt_requested
@@ -1547,6 +1804,9 @@ def main() -> None:
                         "row_origin": "trajectory_robust_phase",
                         "metrics_path": metrics_path,
                         "checkpoint_path": checkpoint_path,
+                        "fid_eval_selected": bool(fid_selected),
+                        "fid_evaluated": bool(row.get("fid_evaluated", False)),
+                        "fid_source": str(row.get("fid_source", "")),
                         "baseline_ckpt_path": baseline_ckpt_requested,
                         "resume_ckpt_path": wdro_resume_checkpoint,
                     }
@@ -1563,6 +1823,7 @@ def main() -> None:
             seed=int(seed),
             weighted_grid_targets=weighted_grid_targets,
             comparison_steps=cdro_curve_steps,
+            fid_eval_steps=cdro_fid_eval_steps,
             fixed_warmup_steps=int(cdro_fixed_warmup_steps),
             trajectory_total_steps_max=int(cdro_max_total_steps),
             reuse_runs_csv=str(args.reuse_cdro_warmup_runs_csv).strip(),
@@ -1580,6 +1841,7 @@ def main() -> None:
         for target_weighted, total_steps in zip(weighted_grid_targets, cdro_curve_steps):
             if int(total_steps) <= int(cdro_fixed_warmup_steps):
                 continue
+            fid_selected = bool(int(total_steps) in cdro_fid_eval_step_set)
             checkpoint_path = _trajectory_checkpoint_path(
                 trajectory_dir=cdro_outdir,
                 method_name="cdro",
@@ -1600,7 +1862,8 @@ def main() -> None:
                     f"[collect-weighted] cdro seed={seed} step={total_steps} "
                     f"target_weighted={target_weighted:.4f} fixed_warmup_steps={int(cdro_fixed_warmup_steps)} "
                     f"baseline_ckpt={'yes' if baseline_ckpt_requested else 'no'} "
-                    f"resume_ckpt={'yes' if cdro_resume_checkpoint else 'no'}",
+                    f"resume_ckpt={'yes' if cdro_resume_checkpoint else 'no'} "
+                    f"fid={'yes' if fid_selected else 'no'}",
                     flush=True,
                 )
                 cmd = _build_run_toy_cmd(
@@ -1614,6 +1877,7 @@ def main() -> None:
                     resume_path=cdro_resume_checkpoint,
                     save_path=checkpoint_path,
                     baseline_ckpt_path=baseline_ckpt_requested,
+                    compute_fid=bool(fid_selected),
                 )
                 run_command(
                     cmd=cmd,
@@ -1625,6 +1889,7 @@ def main() -> None:
                 baseline_ckpt_requested=baseline_ckpt_requested,
                 calibration=calibration,
                 train_accelerator_count=int(args.train_accelerator_count),
+                fid_selected=bool(fid_selected),
             )
             row["checkpoint_path"] = checkpoint_path
             row["robust_resume_ckpt_requested"] = cdro_resume_checkpoint
@@ -1648,6 +1913,9 @@ def main() -> None:
                     "row_origin": "trajectory_robust_phase",
                     "metrics_path": metrics_path,
                     "checkpoint_path": checkpoint_path,
+                    "fid_eval_selected": bool(fid_selected),
+                    "fid_evaluated": bool(row.get("fid_evaluated", False)),
+                    "fid_source": str(row.get("fid_source", "")),
                     "baseline_ckpt_path": baseline_ckpt_requested,
                     "resume_ckpt_path": cdro_resume_checkpoint,
                 }
@@ -1657,6 +1925,10 @@ def main() -> None:
 
     wdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
     cdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
+    baseline_all_eval_rows = [_ensure_row_fid_fields(row) for row in baseline_all_eval_rows]
+    baseline_target_rows = [_ensure_row_fid_fields(row) for row in baseline_target_rows]
+    wdro_rows = [_ensure_row_fid_fields(row) for row in wdro_rows]
+    cdro_rows = [_ensure_row_fid_fields(row) for row in cdro_rows]
     combined_raw = baseline_target_rows + wdro_rows + cdro_rows
     combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
 
@@ -1679,8 +1951,9 @@ def main() -> None:
                 "checkpointed trajectory. WDRO and CDRO each use one same-seed same-method trajectory: a "
                 "method-local checkpointed warmup baseline trajectory up to a fixed warmup checkpoint, then a "
                 "continued robust trajectory resumed only from that method's own checkpoints. Comparison rows are "
-                "emitted only at shared weighted-grid checkpoints; exact warmup checkpoints are auxiliary support "
-                "artifacts. Aggregation is intentionally deferred to later analysis."
+                "emitted only at shared weighted-grid checkpoints, while FID evaluation may run on a coarser "
+                "schedule over those saved checkpoints; exact warmup checkpoints are auxiliary support artifacts. "
+                "Aggregation is intentionally deferred to later analysis."
             ),
             "seeds": seeds,
             "shared_grid_template_name": str(grid_template["name"]),
@@ -1694,7 +1967,15 @@ def main() -> None:
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
             "baseline_auxiliary_eval_points_enabled": False,
             "method_local_warmup_support_checkpoints_enabled": True,
-            "fid_evaluation_schedule": "every_comparison_checkpoint",
+            "fid_evaluation_schedule": {
+                "template_key": str(fid_eval_schedule["template_key"]),
+                "template_name": str(fid_eval_schedule["template_name"]),
+                "selection_strategy": str(fid_eval_schedule["selection_strategy"]),
+                "requested_relative_steps": list(fid_eval_schedule["requested_relative_steps"]),
+                "requested_weighted_targets": list(fid_eval_schedule["requested_targets"]),
+                "selected_comparison_indices": list(fid_eval_schedule["selected_indices"]),
+                "selected_weighted_targets": list(fid_eval_schedule["selected_targets"]),
+            },
             "checkpoint_schedule": "every_comparison_checkpoint_plus_exact_warmup_support",
             "implicit_outdir_baseline_cache_reuse": False,
             "cross_seed_checkpoint_reuse": False,
@@ -1719,6 +2000,7 @@ def main() -> None:
                 "max_total_steps": int(baseline_trajectory_total_steps_max),
                 "comparison_steps": baseline_curve_steps,
                 "checkpoint_steps": baseline_run_steps,
+                "fid_eval_steps": baseline_fid_eval_steps,
             },
             "wdro": {
                 "max_total_steps": int(wdro_max_total_steps),
@@ -1726,6 +2008,7 @@ def main() -> None:
                 "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
                 "warmup_support_steps": [int(wdro_fixed_warmup_steps)] if int(wdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": wdro_curve_steps,
+                "fid_eval_steps": wdro_fid_eval_steps,
             },
             "cdro": {
                 "max_total_steps": int(cdro_max_total_steps),
@@ -1733,6 +2016,7 @@ def main() -> None:
                 "fixed_warmup_steps": int(cdro_fixed_warmup_steps),
                 "warmup_support_steps": [int(cdro_fixed_warmup_steps)] if int(cdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": cdro_curve_steps,
+                "fid_eval_steps": cdro_fid_eval_steps,
             },
         },
         "artifacts": {
