@@ -2,14 +2,24 @@
 
 This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 
-## Locked Default Case
+## Current Code Default
+
+- Label: `warm=5%, aw=0.30, cw=1.00, rho=4.00, N=64`
+- Source of truth:
+  - `toy/config.py`
+  - `toy/scripts/run_simpsons_locked_default_percent_sweep.sh`
+- This is the current code default used by the Simpsons percent sweep launcher.
+- Historical note:
+  - Older Simpsons artifacts in `toy_outputs/` used `rho=0.01`.
+  - Those artifacts are still useful as historical references, but they are not the current code default.
+
+## Historical Reference Artifact
 
 - Case id: `default_warm05_aw0p30_cw1p00_rho0p01_n64`
-- Label: `warm=5%, aw=0.30, cw=1.00, rho=0.01, N=64`
-- Family summary:
+- Historical family summary:
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/summary/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407_summary.json`
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/summary/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407_case_method_summary.csv`
-- Canonical manifest:
+- Historical manifest:
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/default_warm05_aw0p30_cw1p00_rho0p01_n64/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407_default_warm05_aw0p30_cw1p00_rho0p01_n64_manifest.json`
 
 ## Dataset
@@ -22,7 +32,11 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Full population:
   - train: `8000`
   - test: `2000`
-- Active resolved subset in the locked default run:
+- Current percent-sweep convention:
+  - train pool is derived from the full train population of `8000`
+  - val pool: `2000`
+  - split seed: `0`
+- Historical 1% artifact subset:
   - train pool: `80`
   - val pool: `2000`
   - train fraction resolved: `0.01`
@@ -52,7 +66,7 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 ## CDRO Knobs
 
 - `cdro_step_size=0.02`
-- `cdro_total_budget_rho=0.01`
+- `cdro_total_budget_rho=4.0`
 - `cdro_time_horizon=1.0`
 - `cdro_warmup_fraction=0.05`
 - `n_steps_path=64`
@@ -69,13 +83,13 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Weighted-compute calibration:
   - `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
 
-## Current Default Artifact Pointers
+## Historical Artifact Pointers
 
-- Default family summary:
+- Historical family summary:
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/summary/`
 - Targeted follow-up family summary:
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_targeted_followup_ckptreuse_20260406/summary/`
-- Example default-case metrics file:
+- Example historical metrics file:
   - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/default_warm05_aw0p30_cw1p00_rho0p01_n64/cdro/s0/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407_default_warm05_aw0p30_cw1p00_rho0p01_n64_cdro_s0_st3142/metrics.json`
 
 ## Canonical Commands
@@ -123,7 +137,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --outer-clean-weight 1.0 \
   --wdro-warmup-fraction 0.05 \
   --cdro-step-size 0.02 \
-  --cdro-total-budget-rho 0.01 \
+  --cdro-total-budget-rho 4.0 \
   --cdro-time-horizon 1.0 \
   --cdro-warmup-fraction 0.05 \
   --cdro-n-steps-path 64 \
@@ -132,6 +146,6 @@ python toy/scripts/collect_three_method_seed_data.py \
 
 ## Notes
 
-- The locked default is a Simpsons-only working context.
-- If a narrative doc disagrees with a manifest or `metrics.json`, trust the artifact file.
-- The next validation step after this locked default is multi-seed reruns on the same setup.
+- The current code default is a Simpsons-only working context.
+- Historical Simpsons artifacts in `toy_outputs/` may disagree with the current code default.
+- If a narrative doc disagrees with a run artifact, trust the artifact for that run.
