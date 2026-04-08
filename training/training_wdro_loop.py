@@ -24,6 +24,13 @@ from training.wdro_utils import (
 
 #----------------------------------------------------------------------------
 
+def _next_absolute_boundary(cur_nimg, interval_nimg):
+    if interval_nimg is None:
+        return None
+    return ((cur_nimg // interval_nimg) + 1) * interval_nimg
+
+#----------------------------------------------------------------------------
+
 def training_loop(
     run_dir             = '.',      # Output directory.
     dataset_kwargs      = {},       # Options for training set.
@@ -76,8 +83,11 @@ def training_loop(
     batch_gpu_total = batch_size // dist.get_world_size()
     if batch_gpu is None or batch_gpu > batch_gpu_total:
         batch_gpu = batch_gpu_total
+    if batch_gpu_total % batch_gpu != 0:
+        raise ValueError(
+            f"batch_size/world_size ({batch_gpu_total}) must be divisible by batch_gpu ({batch_gpu})."
+        )
     num_accumulation_rounds = batch_gpu_total // batch_gpu
-    # assert batch_size == batch_gpu * num_accumulation_rounds * dist.get_world_size()
 
     # Load dataset.
     dist.print0('Loading dataset...')
@@ -109,9 +119,12 @@ def training_loop(
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
     optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device],find_unused_parameters=True)
-    # ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device])
-    # ddp._set_static_graph()
+    # Avoid DDP overhead on single-GPU runs; for multi-GPU, keep the leaner
+    # default path unless a future model actually needs unused-parameter scans.
+    if dist.get_world_size() > 1:
+        ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], find_unused_parameters=False)
+    else:
+        ddp = net
     ema = copy.deepcopy(net).eval().requires_grad_(False)
 
     # Resume training from previous snapshot.
@@ -144,6 +157,12 @@ def training_loop(
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
+    tick_interval_nimg = max(int(kimg_per_tick * 1000), 1) if kimg_per_tick is not None else None
+    snapshot_interval_nimg = max(int(kimg_per_tick * snapshot_ticks * 1000), 1) if snapshot_ticks is not None else None
+    state_dump_interval_nimg = max(int(kimg_per_tick * state_dump_ticks * 1000), 1) if state_dump_ticks is not None else None
+    next_tick_nimg = _next_absolute_boundary(cur_nimg, tick_interval_nimg)
+    next_snapshot_nimg = _next_absolute_boundary(cur_nimg, snapshot_interval_nimg)
+    next_state_dump_nimg = _next_absolute_boundary(cur_nimg, state_dump_interval_nimg)
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
     debug_eval_state = dict(
@@ -344,7 +363,10 @@ def training_loop(
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
         done = (cur_nimg >= total_kimg * 1000)
-        if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+        reached_tick_boundary = next_tick_nimg is not None and cur_nimg >= next_tick_nimg
+        reached_snapshot_boundary = next_snapshot_nimg is not None and cur_nimg >= next_snapshot_nimg
+        reached_state_dump_boundary = next_state_dump_nimg is not None and cur_nimg >= next_state_dump_nimg
+        if (not done) and (cur_tick != 0) and not (reached_tick_boundary or reached_snapshot_boundary or reached_state_dump_boundary):
             continue
 
         # Print status line, accumulating the same information in training_stats.
@@ -369,7 +391,10 @@ def training_loop(
             dist.print0('Aborting...')
 
         # Save network snapshot.
-        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+        save_snapshot = False
+        if snapshot_ticks is not None:
+            save_snapshot = done or reached_snapshot_boundary
+        if save_snapshot:
             data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
             for key, value in data.items():
                 if isinstance(value, torch.nn.Module):
@@ -381,9 +406,14 @@ def training_loop(
                 with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
                     pickle.dump(data, f)
             del data # conserve memory
+            while next_snapshot_nimg is not None and cur_nimg >= next_snapshot_nimg:
+                next_snapshot_nimg += snapshot_interval_nimg
 
         # Save full dump of the training state.
-        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
+        save_state_dump = False
+        if state_dump_ticks is not None and cur_tick != 0:
+            save_state_dump = done or reached_state_dump_boundary
+        if save_state_dump and dist.get_rank() == 0:
             torch.save(
                 dict(
                     net=net,
@@ -392,6 +422,8 @@ def training_loop(
                 ),
                 os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt')
             )
+        while next_state_dump_nimg is not None and cur_nimg >= next_state_dump_nimg:
+            next_state_dump_nimg += state_dump_interval_nimg
 
         # Update logs.
         training_stats.default_collector.update()
@@ -401,6 +433,8 @@ def training_loop(
             stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
             stats_jsonl.flush()
         dist.update_progress(cur_nimg // 1000, total_kimg)
+        while next_tick_nimg is not None and cur_nimg >= next_tick_nimg:
+            next_tick_nimg += tick_interval_nimg
 
         # Update state.
         cur_tick += 1

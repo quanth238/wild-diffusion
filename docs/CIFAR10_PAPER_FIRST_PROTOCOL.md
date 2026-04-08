@@ -32,6 +32,7 @@ These settings are fixed for the first baseline reproduction.
 - Backbone: `DDPM++` (`--arch=ddpmpp`)
 - Training duration: `200 Mimg`
 - Minibatch size: `1024`
+- Single-GPU execution detail: use gradient accumulation with `batch_gpu=128`
 - Learning rate: `1e-5`
 - FID sample count: `50,000`
 - FID reference: the full CIFAR-10 training set reference statistics
@@ -92,6 +93,7 @@ torchrun --standalone --nproc_per_node=1 train.py \
   --precond=wdroedm \
   --duration=200 \
   --batch=1024 \
+  --batch-gpu=128 \
   --lr=1e-5 \
   --ema=0.5 \
   --dropout=0.13 \
@@ -135,6 +137,25 @@ torchrun --standalone --nproc_per_node=1 fid.py calc \
   --seed=0 \
   --batch=64
 ```
+
+## Trajectory Run Defaults
+
+For the longer `200 Mimg` trajectory runs that will feed the fairness plots, keep the paper-facing training setup fixed but make checkpointing denser and evaluation post-hoc.
+
+- Keep the global batch fixed at `1024` across `baseline`, `wdro`, and later `cdro`
+- Use the same GPU type and count for all compared runs
+- Record training wall-clock only during training; evaluate checkpoints later with one shared FID pipeline
+- Recommended training print cadence: `50 kimg`
+- Recommended network snapshot cadence: every `1 Mimg`
+- Recommended resumable state dump cadence: every `10 Mimg`
+
+The train wrapper now accepts `TICK_MIMG`, `SNAP_MIMG`, and `DUMP_MIMG` in addition to the lower-level tick counters. For the long CIFAR-10 trajectory runs, the intended launch profile is:
+
+```bash
+TICK_KIMG=50 SNAP_MIMG=1 DUMP_MIMG=10
+```
+
+These cadences are now anchored to absolute image-count thresholds rather than drifting relative to the previous tick. For plots, use the logged actual checkpoint metadata (`kimg`, wall-clock, and later weighted compute), not just the nominal target interval label.
 
 ## Notes
 

@@ -34,7 +34,7 @@ OUTDIR="${OUTDIR:-${DEFAULT_OUTDIR}}"
 # You can still override any value via env vars.
 DURATION_MIMG="${DURATION_MIMG:-200}"
 BATCH="${BATCH:-1024}"
-BATCH_GPU="${BATCH_GPU:-1024}"
+BATCH_GPU="${BATCH_GPU:-128}"
 LR="${LR:-1e-5}"
 WORKERS="${WORKERS:-16}"
 AUGMENT="${AUGMENT:-0.12}"
@@ -61,8 +61,11 @@ DEBUG_ADV_VISUAL="${DEBUG_ADV_VISUAL:-16}"
 SEED="${SEED:-}"
 DESC="${DESC:-}"
 TICK_KIMG="${TICK_KIMG:-}"
+TICK_MIMG="${TICK_MIMG:-}"
 SNAP_TICKS="${SNAP_TICKS:-}"
+SNAP_MIMG="${SNAP_MIMG:-}"
 DUMP_TICKS="${DUMP_TICKS:-}"
+DUMP_MIMG="${DUMP_MIMG:-}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 # Limited-data setting: use only 20% of CIFAR-10 by default (10,000 images).
 CIFAR_TRAIN_PERCENT="${CIFAR_TRAIN_PERCENT:-20}"  # 1..100
@@ -122,7 +125,88 @@ if "${SEED}":
         int("${SEED}")
     except Exception:
         raise SystemExit("[ERROR] SEED must be an integer when provided.")
+try:
+    batch = int("${BATCH}")
+    batch_gpu = int("${BATCH_GPU}") if "${BATCH_GPU}" else None
+except Exception:
+    raise SystemExit("[ERROR] BATCH and BATCH_GPU must be integers when provided.")
+if batch_gpu is not None and batch % batch_gpu != 0:
+    raise SystemExit(f"[ERROR] BATCH={batch} must be divisible by BATCH_GPU={batch_gpu}.")
 PY
+
+eval "$(python - <<PY
+import math
+
+tick_kimg_raw = ${TICK_KIMG@Q}
+tick_mimg_raw = ${TICK_MIMG@Q}
+snap_ticks_raw = ${SNAP_TICKS@Q}
+snap_mimg_raw = ${SNAP_MIMG@Q}
+dump_ticks_raw = ${DUMP_TICKS@Q}
+dump_mimg_raw = ${DUMP_MIMG@Q}
+
+def parse_positive_int(name, raw):
+    if raw == "":
+        return None
+    try:
+        value = int(raw)
+    except Exception:
+        raise SystemExit(f"[ERROR] {name} must be a positive integer.")
+    if value <= 0:
+        raise SystemExit(f"[ERROR] {name} must be a positive integer.")
+    return value
+
+def parse_positive_float(name, raw):
+    if raw == "":
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        raise SystemExit(f"[ERROR] {name} must be a positive number.")
+    if value <= 0:
+        raise SystemExit(f"[ERROR] {name} must be a positive number.")
+    return value
+
+tick_kimg = parse_positive_int("TICK_KIMG", tick_kimg_raw)
+tick_mimg = parse_positive_float("TICK_MIMG", tick_mimg_raw)
+snap_ticks = parse_positive_int("SNAP_TICKS", snap_ticks_raw)
+snap_mimg = parse_positive_float("SNAP_MIMG", snap_mimg_raw)
+dump_ticks = parse_positive_int("DUMP_TICKS", dump_ticks_raw)
+dump_mimg = parse_positive_float("DUMP_MIMG", dump_mimg_raw)
+
+if tick_kimg is not None and tick_mimg is not None:
+    raise SystemExit("[ERROR] Set only one of TICK_KIMG or TICK_MIMG.")
+if snap_ticks is not None and snap_mimg is not None:
+    raise SystemExit("[ERROR] Set only one of SNAP_TICKS or SNAP_MIMG.")
+if dump_ticks is not None and dump_mimg is not None:
+    raise SystemExit("[ERROR] Set only one of DUMP_TICKS or DUMP_MIMG.")
+
+effective_tick_kimg = tick_kimg
+if effective_tick_kimg is None:
+    if tick_mimg is not None:
+        effective_tick_kimg = max(int(round(tick_mimg * 1000.0)), 1)
+    else:
+        effective_tick_kimg = 50
+
+resolved_tick_kimg = tick_kimg if tick_kimg is not None else (
+    max(int(round(tick_mimg * 1000.0)), 1) if tick_mimg is not None else None
+)
+resolved_snap_ticks = snap_ticks if snap_ticks is not None else (
+    max(int(math.ceil((snap_mimg * 1000.0) / effective_tick_kimg)), 1)
+    if snap_mimg is not None else None
+)
+resolved_dump_ticks = dump_ticks if dump_ticks is not None else (
+    max(int(math.ceil((dump_mimg * 1000.0) / effective_tick_kimg)), 1)
+    if dump_mimg is not None else None
+)
+
+if resolved_tick_kimg is not None:
+    print(f"export TICK_KIMG={resolved_tick_kimg}")
+if resolved_snap_ticks is not None:
+    print(f"export SNAP_TICKS={resolved_snap_ticks}")
+if resolved_dump_ticks is not None:
+    print(f"export DUMP_TICKS={resolved_dump_ticks}")
+PY
+)"
 
 if [[ -z "${TRAIN_CIFAR_DIR}" ]]; then
   if [[ "${CIFAR_TRAIN_PERCENT}" == "100" ]]; then
