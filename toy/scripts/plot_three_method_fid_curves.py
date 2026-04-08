@@ -170,57 +170,28 @@ def _draw_phase_boundaries(*, ax, rows: List[Dict], x_key: str) -> None:
         )
 
 
-def _phase_name(row: Dict) -> str:
-    row_origin = str(row.get("row_origin", ""))
-    if row_origin == "trajectory_warmup_phase":
-        return "warmup"
-    if row_origin == "trajectory_robust_phase":
-        return "robust"
-    return "other"
-
-
-def _segment_group_key(*, row: Dict, method: str, y_key: str):
-    if method == "baseline_edm":
-        return ("baseline",)
-    phase_name = _phase_name(row)
-    if y_key.startswith("loss_"):
-        return (phase_name, str(row.get("loss_kind", "")))
-    return (phase_name,)
-
-
-def _segment_style(*, method: str, segment_key) -> Dict[str, object]:
-    phase_name = segment_key[0] if segment_key else "other"
-    if method == "baseline_edm":
-        return {"linestyle": "-", "alpha": 1.0}
-    if phase_name == "warmup":
-        return {"linestyle": "--", "alpha": 0.75}
-    return {"linestyle": "-", "alpha": 1.0}
-
-
-def _series_segments(*, rows: List[Dict], method: str, x_key: str, y_key: str) -> List[Dict]:
+def _series_segments(*, rows: List[Dict], method: str, x_key: str, y_key: str) -> List[List[tuple]]:
     points = [
-        (
-            float(row[x_key]),
-            float(row[y_key]),
-            _segment_group_key(row=row, method=method, y_key=y_key),
-        )
+        (float(row[x_key]), float(row[y_key]), str(row.get("loss_kind", "")))
         for row in rows
         if row.get("method") == method and row.get(x_key) is not None and row.get(y_key) is not None
     ]
     if not points:
         return []
     points.sort(key=lambda point: float(point[0]))
-    segments: List[Dict] = []
+    if not y_key.startswith("loss_") or method == "baseline_edm":
+        return [[(x_value, y_value) for x_value, y_value, _ in points]]
+    segments: List[List[tuple]] = []
     current_segment: List[tuple] = []
-    previous_group_key = None
-    for x_value, y_value, group_key in points:
-        if previous_group_key is not None and group_key != previous_group_key and current_segment:
-            segments.append({"points": list(current_segment), "segment_key": previous_group_key})
+    previous_loss_kind: Optional[str] = None
+    for x_value, y_value, loss_kind in points:
+        if previous_loss_kind is not None and loss_kind != previous_loss_kind and current_segment:
+            segments.append(list(current_segment))
             current_segment = []
         current_segment.append((x_value, y_value))
-        previous_group_key = group_key
+        previous_loss_kind = loss_kind
     if current_segment:
-        segments.append({"points": list(current_segment), "segment_key": previous_group_key})
+        segments.append(list(current_segment))
     return segments
 
 
@@ -243,15 +214,12 @@ def make_plot(
         if not segments:
             continue
         for segment_index, segment in enumerate(segments):
-            segment_style = _segment_style(method=method, segment_key=segment["segment_key"])
             ax.plot(
-                [value for value, _ in segment["points"]],
-                [value for _, value in segment["points"]],
+                [value for value, _ in segment],
+                [value for _, value in segment],
                 marker=STYLE_BY_METHOD[method]["marker"],
                 linewidth=2.0,
                 color=STYLE_BY_METHOD[method]["color"],
-                linestyle=str(segment_style["linestyle"]),
-                alpha=float(segment_style["alpha"]),
                 label=STYLE_BY_METHOD[method]["label"] if segment_index == 0 else "_nolegend_",
             )
     _draw_phase_boundaries(ax=ax, rows=rows, x_key=x_key)
@@ -285,15 +253,12 @@ def make_dual_plot(
             if not segments:
                 continue
             for segment_index, segment in enumerate(segments):
-                segment_style = _segment_style(method=method, segment_key=segment["segment_key"])
                 ax.plot(
-                    [value for value, _ in segment["points"]],
-                    [value for _, value in segment["points"]],
+                    [value for value, _ in segment],
+                    [value for _, value in segment],
                     marker=STYLE_BY_METHOD[method]["marker"],
                     linewidth=2.0,
                     color=STYLE_BY_METHOD[method]["color"],
-                    linestyle=str(segment_style["linestyle"]),
-                    alpha=float(segment_style["alpha"]),
                     label=STYLE_BY_METHOD[method]["label"] if segment_index == 0 else "_nolegend_",
                 )
         _draw_phase_boundaries(ax=ax, rows=rows, x_key=x_key)
