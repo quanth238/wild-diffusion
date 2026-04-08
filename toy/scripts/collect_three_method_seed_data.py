@@ -163,6 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
+    parser.add_argument("--fid-gen-batch", type=int, default=2048)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
     parser.add_argument("--debug-terminal-step", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=200)
@@ -942,6 +943,8 @@ def _build_baseline_sweep_cmd(
         args.fid_ref_path,
         "--fid-samples",
         str(args.fid_samples),
+        "--gen-batch",
+        str(args.fid_gen_batch),
         "--weighted-compute-calibration-path",
         str(args.weighted_compute_calibration_path).strip(),
         "--train-accelerator-count",

@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
-import scipy.linalg
 import torch
 
 if __package__ is None or __package__ == "":

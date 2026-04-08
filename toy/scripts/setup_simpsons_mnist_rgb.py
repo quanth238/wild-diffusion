@@ -7,6 +7,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -43,7 +44,7 @@ def _replace_symlink(path: Path, target: Path) -> None:
 
 def _build_fid_ref(repo_root: Path, data_dir: Path, dest_path: Path) -> None:
     cmd = [
-        str(repo_root / ".venv" / "bin" / "python"),
+        sys.executable,
         str(repo_root / "fid.py"),
         "ref",
         "--data",
