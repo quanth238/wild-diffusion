@@ -77,9 +77,12 @@ Good first places:
 
 ### `docs/`
 
-Project notes, protocol docs, and experiment writeups.
+Active docs are intentionally minimal and Simpsons-focused.
 
-These are useful for context, but not the implementation entrypoint.
+- `docs/README.md`: active docs index
+- `docs/SIMPSONS_DEFAULT_SETUP.md`: locked Simpsons default setup
+
+For experiment truth, prefer manifests and `metrics.json` files under `toy_outputs/`.
 
 ### `datasets/`
 

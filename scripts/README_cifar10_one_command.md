@@ -203,9 +203,9 @@ This repo requires NVIDIA CUDA (the training code forces NCCL/CUDA in distribute
 
 ## Few-shot Transfer
 
-For Section 4.3-style few-shot transfer (pretrained backbone + fine-tune/adapt, FID 5k protocol), see:
+No maintained few-shot transfer doc is kept in the active docs set.
 
-- `docs/FEWSHOT_TRANSFER_REPRO_GUIDE.md`
+Treat older transfer writeups as stale unless they are revalidated and reintroduced.
 
 ## Evaluation Pipeline
 

@@ -1,6 +1,6 @@
 # Wild Diffusion
 
-Start with [docs/CODEBASE_MAP.md](/root/wild-diffusion/docs/CODEBASE_MAP.md).
+Start with [docs/README.md](/root/wild-diffusion/docs/README.md).
 
 Canonical entrypoints:
 
