@@ -212,6 +212,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shared-weighted-cap", type=float, default=200000.0)
     parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
     parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="all")
+    parser.add_argument(
+        "--robust-fid-mode",
+        type=str,
+        choices=["in_run", "posthoc_from_checkpoints"],
+        default="in_run",
+    )
+    parser.add_argument(
+        "--reeval-script",
+        type=str,
+        default=os.path.join(ROOT_DIR, "toy", "scripts", "reevaluate_three_method_fids_from_checkpoints.py"),
+    )
+    parser.add_argument("--posthoc-fid-batch-size", type=int, default=512)
     parser.add_argument("--baseline-max-steps", type=int, default=80000)
     parser.add_argument("--wdro-max-total-steps", type=int, default=76970)
     parser.add_argument("--skip-existing", action="store_true")
@@ -471,6 +483,72 @@ def run_command(*, cmd: List[str], log_path: str, proc_title: Optional[str] = No
             stderr=subprocess.STDOUT,
             env=child_process_env(proc_title=proc_title),
         )
+
+
+def _build_posthoc_reeval_cmd(
+    *,
+    args: argparse.Namespace,
+    combined_csv: str,
+) -> List[str]:
+    return [
+        args.python_bin,
+        str(args.reeval_script),
+        "--combined-csv",
+        combined_csv,
+        "--outdir",
+        args.outdir,
+        "--prefix",
+        args.prefix,
+        "--python-bin",
+        args.python_bin,
+        "--device",
+        args.device,
+        "--dataset-path",
+        args.dataset_path,
+        "--dataset-val-path",
+        args.dataset_val_path,
+        "--fid-ref-path",
+        args.fid_ref_path,
+        "--image-size",
+        str(args.image_size),
+        "--image-channels",
+        str(args.image_channels),
+        "--image-train-size",
+        str(args.image_train_size),
+        "--image-val-size",
+        str(args.image_val_size),
+        "--image-split-seed",
+        str(args.image_split_seed),
+        "--batch-size",
+        str(args.batch_size),
+        "--hidden-dim",
+        str(args.hidden_dim),
+        "--eval-samples",
+        str(args.eval_samples),
+        "--fid-samples",
+        str(args.fid_samples),
+        "--fid-batch-size",
+        str(max(int(args.posthoc_fid_batch_size), 1)),
+        "--debug-eval-batch",
+        str(args.debug_eval_batch),
+        "--debug-terminal-step",
+        str(args.debug_terminal_step),
+        "--log-every",
+        str(args.log_every),
+        "--n-steps-path-default",
+        str(args.n_steps_path),
+        "--sigma-min",
+        str(args.sigma_min),
+        "--sigma-max",
+        str(args.sigma_max),
+        "--train-percent-label",
+        str(args.train_percent_label),
+        "--methods",
+        "wdro,cdro",
+        "--only-missing-fid",
+        "--respect-fid-selection",
+        "--skip-plot",
+    ]
 
 
 def realize_shared_weighted_grid(*, shared_weighted_cap: float, template_steps: List[int]) -> List[float]:
@@ -1078,6 +1156,7 @@ def _transfer_baseline_row_to_method(
     baseline_row: Dict,
     method_name: str,
     weighted_grid_target: float,
+    fid_selected: bool,
     trajectory_total_steps_max: int,
     fixed_warmup_steps: int,
     row_origin: str = "trajectory_warmup_phase",
@@ -1097,6 +1176,13 @@ def _transfer_baseline_row_to_method(
     row["baseline_ckpt_loaded"] = False
     row["robust_resume_loaded"] = False
     row["phase_step_split_mode"] = "single_trajectory_warmup_phase"
+    row.update(
+        _resolve_fid_annotation(
+            fid_value=_optional_float(baseline_row.get("fid")),
+            fid_selected=bool(fid_selected),
+            source_if_evaluated=str(baseline_row.get("fid_source", "in_run_metrics") or "in_run_metrics"),
+        )
+    )
     return row
 
 
@@ -1110,7 +1196,7 @@ def _transfer_baseline_row_to_aux_warmup_support(
     row = dict(baseline_row)
     row["method"] = str(method_name)
     row["row_origin"] = "trajectory_warmup_phase"
-    weighted_compute_units = _safe_float(baseline_row.get("weighted_compute_units"))
+    weighted_compute_units = _optional_float(baseline_row.get("weighted_compute_units"))
     row["weighted_grid_target"] = 0.0 if weighted_compute_units is None else float(weighted_compute_units)
     row["comparison_weighted_targets"] = ""
     row["warmup_support_methods"] = str(method_name)
@@ -1364,6 +1450,7 @@ def _run_method_local_warmup_trajectory(
     weighted_grid_targets: List[float],
     comparison_steps: List[int],
     fid_eval_steps: List[int],
+    skip_fid_eval: bool,
     fixed_warmup_steps: int,
     trajectory_total_steps_max: int,
     reuse_runs_csv: str = "",
@@ -1376,7 +1463,9 @@ def _run_method_local_warmup_trajectory(
             if int(step) > 0 and int(step) <= int(fixed_warmup_steps)
         }
     )
-    if str(args.fid_eval_template) == "all":
+    if bool(skip_fid_eval):
+        warmup_fid_eval_steps = []
+    elif str(args.fid_eval_template) == "all":
         warmup_fid_eval_steps = list(warmup_checkpoint_steps)
     else:
         warmup_fid_eval_steps = sorted(
@@ -1456,6 +1545,7 @@ def _run_method_local_warmup_trajectory(
         )
 
     comparison_rows: List[Dict] = []
+    warmup_fid_eval_step_set = set(int(step) for step in fid_eval_steps)
     for target_weighted, total_steps in zip(weighted_grid_targets, comparison_steps):
         if int(total_steps) <= 0 or int(total_steps) > int(fixed_warmup_steps):
             continue
@@ -1464,11 +1554,13 @@ def _run_method_local_warmup_trajectory(
             raise RuntimeError(
                 f"Missing {method_name} warmup comparison row for seed={seed} step={total_steps} in {warmup_runs_csv}"
             )
+        fid_selected = bool(int(total_steps) in warmup_fid_eval_step_set)
         comparison_rows.append(
             _transfer_baseline_row_to_method(
                 baseline_row=baseline_row,
                 method_name=method_name,
                 weighted_grid_target=float(target_weighted),
+                fid_selected=bool(fid_selected),
                 trajectory_total_steps_max=int(trajectory_total_steps_max),
                 fixed_warmup_steps=int(fixed_warmup_steps),
                 row_origin="trajectory_warmup_phase",
@@ -1504,6 +1596,9 @@ def main() -> None:
     args = parse_args()
     if _APPLIED_PROCESS_TITLE is None:
         apply_process_title(build_process_title("wdiff", "collect", args.prefix))
+    robust_fid_posthoc = str(args.robust_fid_mode) == "posthoc_from_checkpoints"
+    if robust_fid_posthoc and not os.path.isfile(str(args.reeval_script)):
+        raise FileNotFoundError(f"Missing reevaluation script for posthoc robust FID: {args.reeval_script}")
     seeds = parse_int_list(args.seeds)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
@@ -1677,6 +1772,7 @@ def main() -> None:
         f"{fid_eval_schedule['template_key']} selected_targets={fid_eval_schedule['selected_targets']}",
         flush=True,
     )
+    print(f"[collect-weighted] robust_fid_mode={args.robust_fid_mode}", flush=True)
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
     print(f"[collect-weighted] baseline_fid_eval_steps={baseline_fid_eval_steps}", flush=True)
     print(f"[collect-weighted] wdro_steps={wdro_curve_steps}", flush=True)
@@ -1785,6 +1881,7 @@ def main() -> None:
                 weighted_grid_targets=weighted_grid_targets,
                 comparison_steps=wdro_curve_steps,
                 fid_eval_steps=wdro_fid_eval_steps,
+                skip_fid_eval=bool(robust_fid_posthoc),
                 fixed_warmup_steps=int(wdro_fixed_warmup_steps),
                 trajectory_total_steps_max=int(wdro_max_total_steps),
             )
@@ -1836,7 +1933,7 @@ def main() -> None:
                         resume_path=wdro_resume_checkpoint,
                         save_path=checkpoint_path,
                         baseline_ckpt_path=baseline_ckpt_requested,
-                        compute_fid=bool(fid_selected),
+                        compute_fid=(bool(fid_selected) and not bool(robust_fid_posthoc)),
                     )
                     run_command(
                         cmd=cmd,
@@ -1892,6 +1989,7 @@ def main() -> None:
             weighted_grid_targets=weighted_grid_targets,
             comparison_steps=cdro_curve_steps,
             fid_eval_steps=cdro_fid_eval_steps,
+            skip_fid_eval=bool(robust_fid_posthoc),
             fixed_warmup_steps=int(cdro_fixed_warmup_steps),
             trajectory_total_steps_max=int(cdro_max_total_steps),
             reuse_runs_csv=str(args.reuse_cdro_warmup_runs_csv).strip(),
@@ -1945,7 +2043,7 @@ def main() -> None:
                     resume_path=cdro_resume_checkpoint,
                     save_path=checkpoint_path,
                     baseline_ckpt_path=baseline_ckpt_requested,
-                    compute_fid=bool(fid_selected),
+                    compute_fid=(bool(fid_selected) and not bool(robust_fid_posthoc)),
                 )
                 run_command(
                     cmd=cmd,
@@ -2011,6 +2109,67 @@ def main() -> None:
     write_csv(cdro_raw_csv, cdro_rows)
     write_csv(combined_raw_csv, combined_raw)
 
+    posthoc_reeval_manifest_path = None
+    posthoc_reeval_log_path = None
+    if robust_fid_posthoc:
+        reeval_cmd = _build_posthoc_reeval_cmd(
+            args=args,
+            combined_csv=combined_raw_csv,
+        )
+        if args.skip_existing:
+            reeval_cmd.append("--skip-existing")
+        posthoc_reeval_log_path = os.path.join(logs_dir, f"{args.prefix}_posthoc_robust_fid.log")
+        print(
+            "[collect-weighted] posthoc robust FID"
+            f" methods=wdro,cdro combined_csv={combined_raw_csv}",
+            flush=True,
+        )
+        run_command(
+            cmd=reeval_cmd,
+            log_path=posthoc_reeval_log_path,
+            proc_title=build_process_title("wdiff", "reeval", args.prefix),
+        )
+        posthoc_reeval_manifest_path = os.path.join(args.outdir, f"{args.prefix}_reeval_manifest.json")
+        combined_raw = [_ensure_row_fid_fields(row) for row in load_csv_rows(combined_raw_csv)]
+        combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
+        baseline_target_rows = [row for row in combined_raw if str(row.get("method", "")) == "baseline_edm"]
+        wdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "wdro"]
+        cdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "cdro"]
+        combined_by_key = {
+            (
+                str(row.get("method", "")),
+                int(row.get("seed", 0)),
+                int(row.get("step", 0)),
+                str(row.get("row_origin", "")),
+            ): row
+            for row in combined_raw
+        }
+        for method_name, seed_manifests in (("wdro", wdro_seed_manifests), ("cdro", cdro_seed_manifests)):
+            for seed_manifest in seed_manifests:
+                for checkpoint_entry in seed_manifest.get("robust_checkpoints", []):
+                    row = combined_by_key.get(
+                        (
+                            str(method_name),
+                            int(checkpoint_entry.get("seed", 0)),
+                            int(checkpoint_entry.get("step", 0)),
+                            "trajectory_robust_phase",
+                        )
+                    )
+                    if row is None:
+                        continue
+                    checkpoint_entry["fid_eval_selected"] = bool(_optional_bool(row.get("fid_eval_selected")))
+                    checkpoint_entry["fid_evaluated"] = bool(_optional_bool(row.get("fid_evaluated")))
+                    checkpoint_entry["fid_missing_reason"] = str(row.get("fid_missing_reason", ""))
+                    checkpoint_entry["fid_source"] = str(row.get("fid_source", ""))
+                    if row.get("reeval_metrics_path"):
+                        checkpoint_entry["reeval_metrics_path"] = str(row.get("reeval_metrics_path"))
+                    if row.get("reeval_log_path"):
+                        checkpoint_entry["reeval_log_path"] = str(row.get("reeval_log_path"))
+        write_csv(baseline_raw_csv, baseline_target_rows)
+        write_csv(wdro_raw_csv, wdro_rows)
+        write_csv(cdro_raw_csv, cdro_rows)
+        write_csv(combined_raw_csv, combined_raw)
+
     manifest = {
         "protocol": {
             "name": "three_method_single_trajectory_weighted_grid",
@@ -2035,6 +2194,7 @@ def main() -> None:
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
             "baseline_auxiliary_eval_points_enabled": False,
             "method_local_warmup_support_checkpoints_enabled": True,
+            "robust_fid_mode": str(args.robust_fid_mode),
             "fid_evaluation_schedule": {
                 "template_key": str(fid_eval_schedule["template_key"]),
                 "template_name": str(fid_eval_schedule["template_name"]),
@@ -2101,6 +2261,8 @@ def main() -> None:
             "wdro_raw_csv": wdro_raw_csv,
             "cdro_raw_csv": cdro_raw_csv,
             "combined_raw_csv": combined_raw_csv,
+            "posthoc_reeval_manifest": posthoc_reeval_manifest_path,
+            "posthoc_reeval_log": posthoc_reeval_log_path,
         },
         "per_seed_runs": {
             "wdro": wdro_seed_manifests,

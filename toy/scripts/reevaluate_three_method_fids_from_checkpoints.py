@@ -105,6 +105,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-max", type=float, default=2.0)
     parser.add_argument("--metrics-eval-seed-offset", type=int, default=ToyConfig.eval_seed_offset_metrics)
     parser.add_argument("--train-percent-label", type=str, default="1%")
+    parser.add_argument("--methods", type=str, default="")
+    parser.add_argument("--only-missing-fid", action="store_true")
+    parser.add_argument("--respect-fid-selection", action="store_true")
+    parser.add_argument("--skip-plot", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
@@ -143,6 +147,24 @@ def _safe_float(value, default: Optional[float] = None) -> Optional[float]:
     if not np.isfinite(parsed):
         return default
     return float(parsed)
+
+
+def _safe_bool(value, *, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _parse_method_filter(text: str) -> Optional[set]:
+    methods = {token.strip() for token in str(text).split(",") if token.strip()}
+    return None if not methods else methods
 
 
 def _load_json(path: str) -> Dict:
@@ -710,6 +732,16 @@ def _run_plot_command(
         )
 
 
+def _row_matches_filters(args: argparse.Namespace, row: Dict[str, str], methods_filter: Optional[set]) -> bool:
+    if methods_filter is not None and str(row.get("method", "")).strip() not in methods_filter:
+        return False
+    if bool(args.respect_fid_selection) and not _safe_bool(row.get("fid_eval_selected"), default=True):
+        return False
+    if bool(args.only_missing_fid) and _safe_float(row.get("fid")) is not None:
+        return False
+    return True
+
+
 def main() -> None:
     args = parse_args()
     args.combined_csv = _resolve_repo_path(args.combined_csv)
@@ -734,17 +766,33 @@ def main() -> None:
     if not input_rows:
         raise RuntimeError(f"No rows found in combined CSV: {args.combined_csv}")
 
+    methods_filter = _parse_method_filter(args.methods)
+    eligible_row_indices = [
+        row_index
+        for row_index, row in enumerate(input_rows)
+        if _row_matches_filters(args, row, methods_filter)
+    ]
+    eligible_row_index_set = set(int(row_index) for row_index in eligible_row_indices)
+    eligible_rows = [input_rows[row_index] for row_index in eligible_row_indices]
+
     device = pick_device(args.device)
-    detector_net = _load_detector(device)
-    mu_ref, sigma_ref = _load_ref_stats(args.fid_ref_path)
-    mu_ref = mu_ref.to(device=device)
-    sigma_ref = sigma_ref.to(device=device)
+    detector_net = None
+    mu_ref = None
+    sigma_ref = None
+    if eligible_rows:
+        detector_net = _load_detector(device)
+        mu_ref, sigma_ref = _load_ref_stats(args.fid_ref_path)
+        mu_ref = mu_ref.to(device=device)
+        sigma_ref = sigma_ref.to(device=device)
 
     reevaluated_rows: List[Dict[str, str]] = []
     cache: Dict[Tuple[str, str], Dict[str, str]] = {}
     context_cache: Dict[Tuple[object, ...], EvalContext] = {}
 
     for row_index, row in enumerate(input_rows):
+        if row_index not in eligible_row_index_set:
+            reevaluated_rows.append(dict(row))
+            continue
         cache_key = _reeval_cache_key(row)
         cached = cache.get(cache_key)
         if cached is None:
@@ -790,13 +838,15 @@ def main() -> None:
     combined_out = os.path.join(args.outdir, f"{args.prefix}_all_methods_raw_seed_rows.csv")
     write_csv(combined_out, reevaluated_rows)
 
-    plot_log = os.path.join(logs_dir, f"{args.prefix}_plot.log")
-    _run_plot_command(
-        args=args,
-        combined_out=combined_out,
-        plots_dir=plots_dir,
-        plot_log=plot_log,
-    )
+    plot_log = None
+    if not bool(args.skip_plot):
+        plot_log = os.path.join(logs_dir, f"{args.prefix}_plot.log")
+        _run_plot_command(
+            args=args,
+            combined_out=combined_out,
+            plots_dir=plots_dir,
+            plot_log=plot_log,
+        )
 
     manifest = {
         "combined_csv_in": args.combined_csv,
@@ -806,7 +856,11 @@ def main() -> None:
         "reeval_mode": "direct_fid_only_in_memory",
         "device": str(device),
         "fid_ref_path": args.fid_ref_path,
-        "plots_dir": plots_dir,
+        "methods_filter": None if methods_filter is None else sorted(methods_filter),
+        "respect_fid_selection": bool(args.respect_fid_selection),
+        "only_missing_fid": bool(args.only_missing_fid),
+        "eligible_rows": len(eligible_rows),
+        "plots_dir": None if bool(args.skip_plot) else plots_dir,
         "plot_log": plot_log,
         "unique_reevaluations": len(cache),
         "unique_contexts": len(context_cache),
@@ -816,7 +870,8 @@ def main() -> None:
 
     print(f"[reeval] wrote {combined_out}", flush=True)
     print(
-        f"[reeval] unique_reevaluations={len(cache)} fid_samples={int(args.fid_samples)} "
+        f"[reeval] eligible_rows={len(eligible_rows)} unique_reevaluations={len(cache)} "
+        f"fid_samples={int(args.fid_samples)} "
         f"fid_batch_size={max(int(args.fid_batch_size), 1)}",
         flush=True,
     )
