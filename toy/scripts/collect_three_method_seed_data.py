@@ -159,6 +159,7 @@ FID_EVAL_TEMPLATES = {
         "steps": FID_EVAL_TEMPLATE_STEPS_BALANCED,
     },
 }
+TRANSITION_SENTINEL_ROBUST_COUNT = 3
 
 
 def _grid_template_names() -> List[str]:
@@ -551,6 +552,27 @@ def _select_fid_eval_indices(
         "selected_targets": [float(checkpoint_targets[idx]) for idx in selected_indices],
         "selection_strategy": "nearest_shared_weighted_checkpoint_knot",
     }
+
+
+def _augment_fid_eval_steps_with_transition_sentinels(
+    *,
+    comparison_steps: List[int],
+    fid_eval_steps: List[int],
+    fixed_warmup_steps: int,
+    robust_sentinel_count: int = TRANSITION_SENTINEL_ROBUST_COUNT,
+) -> List[int]:
+    selected = {int(step) for step in fid_eval_steps if int(step) > 0}
+    warmup_support_step = int(fixed_warmup_steps)
+    if warmup_support_step > 0:
+        selected.add(warmup_support_step)
+    robust_steps = [
+        int(step)
+        for step in comparison_steps
+        if int(step) > warmup_support_step
+    ]
+    for step in robust_steps[: max(int(robust_sentinel_count), 0)]:
+        selected.add(int(step))
+    return sorted(selected)
 
 
 def _baseline_step_weighted_units(calibration: Dict) -> float:
@@ -1078,6 +1100,32 @@ def _transfer_baseline_row_to_method(
     return row
 
 
+def _transfer_baseline_row_to_aux_warmup_support(
+    *,
+    baseline_row: Dict,
+    method_name: str,
+    trajectory_total_steps_max: int,
+    fixed_warmup_steps: int,
+) -> Dict:
+    row = dict(baseline_row)
+    row["method"] = str(method_name)
+    row["row_origin"] = "trajectory_warmup_phase"
+    weighted_compute_units = _safe_float(baseline_row.get("weighted_compute_units"))
+    row["weighted_grid_target"] = 0.0 if weighted_compute_units is None else float(weighted_compute_units)
+    row["comparison_weighted_targets"] = ""
+    row["warmup_support_methods"] = str(method_name)
+    row["row_role"] = _row_role_label(is_comparison_knot=False, is_aux_warmup_support=True)
+    row["is_comparison_knot"] = False
+    row["is_aux_warmup_support"] = True
+    row["trajectory_total_steps_max"] = int(trajectory_total_steps_max)
+    row["fixed_warmup_steps"] = int(fixed_warmup_steps)
+    row["warmup_only"] = True
+    row["baseline_ckpt_loaded"] = False
+    row["robust_resume_loaded"] = False
+    row["phase_step_split_mode"] = "single_trajectory_warmup_phase"
+    return row
+
+
 def _build_baseline_sweep_cmd(
     *,
     args: argparse.Namespace,
@@ -1426,6 +1474,16 @@ def _run_method_local_warmup_trajectory(
                 row_origin="trajectory_warmup_phase",
             )
         )
+    if int(fixed_warmup_steps) not in {int(row["step"]) for row in comparison_rows}:
+        comparison_rows.append(
+            _transfer_baseline_row_to_aux_warmup_support(
+                baseline_row=support_row,
+                method_name=method_name,
+                trajectory_total_steps_max=int(trajectory_total_steps_max),
+                fixed_warmup_steps=int(fixed_warmup_steps),
+            )
+        )
+        comparison_rows.sort(key=lambda row: int(row["step"]))
 
     manifest_entry = {
         "outdir": warmup_outdir,
@@ -1578,6 +1636,16 @@ def main() -> None:
             for idx in fid_eval_indices
             if 0 <= int(idx) < len(cdro_curve_steps) and int(cdro_curve_steps[idx]) > 0
         }
+    )
+    wdro_fid_eval_steps = _augment_fid_eval_steps_with_transition_sentinels(
+        comparison_steps=wdro_curve_steps,
+        fid_eval_steps=wdro_fid_eval_steps,
+        fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+    )
+    cdro_fid_eval_steps = _augment_fid_eval_steps_with_transition_sentinels(
+        comparison_steps=cdro_curve_steps,
+        fid_eval_steps=cdro_fid_eval_steps,
+        fixed_warmup_steps=int(cdro_fixed_warmup_steps),
     )
     wdro_fid_eval_step_set = set(int(step) for step in wdro_fid_eval_steps)
     cdro_fid_eval_step_set = set(int(step) for step in cdro_fid_eval_steps)
@@ -1975,6 +2043,9 @@ def main() -> None:
                 "requested_weighted_targets": list(fid_eval_schedule["requested_targets"]),
                 "selected_comparison_indices": list(fid_eval_schedule["selected_indices"]),
                 "selected_weighted_targets": list(fid_eval_schedule["selected_targets"]),
+                "transition_sentinels_enabled": True,
+                "transition_sentinel_support_checkpoint_enabled": True,
+                "transition_sentinel_robust_checkpoints_per_method": int(TRANSITION_SENTINEL_ROBUST_COUNT),
             },
             "checkpoint_schedule": "every_comparison_checkpoint_plus_exact_warmup_support",
             "implicit_outdir_baseline_cache_reuse": False,

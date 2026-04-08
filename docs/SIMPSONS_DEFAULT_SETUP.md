@@ -90,7 +90,7 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Secondary metric: `train_wall_clock_sec`
 - Shared weighted cap: `200000`
 - Dense checkpoints are still saved on the shared comparison grid, plus exact warmup-support checkpoints.
-- The launcher now computes FID only on the coarser balanced knot subset by default. Omit the new template flag to keep the old evaluate-every-comparison-knot behavior.
+- The launcher now computes FID only on the coarser balanced knot subset by default, with extra transition sentinels for WDRO/CDRO at the exact warmup-support checkpoint plus the first three robust checkpoints. Omit the new template flag to keep the old evaluate-every-comparison-knot behavior.
 - Weighted-compute calibration:
   - `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
 
