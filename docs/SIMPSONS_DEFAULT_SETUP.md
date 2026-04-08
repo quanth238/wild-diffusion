@@ -2,16 +2,20 @@
 
 This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 
-## Current Code Default
+## Locked Simpsons Default
 
 - Label: `warm=5%, aw=0.30, cw=1.00, rho=4.00, N=64`
 - Source of truth:
-  - `toy/config.py`
+  - `toy/scripts/run_simpsons_mnist_once.sh`
+  - `toy/scripts/collect_three_method_seed_data.py`
   - `toy/scripts/run_simpsons_locked_default_percent_sweep.sh`
-- This is the current code default used by the Simpsons percent sweep launcher.
+- Shared knob defaults live in `toy/config.py`, but the active Simpsons method choice is locked by the Simpsons-specific wrappers and collectors.
+- This is the locked Simpsons configuration used by the active percent sweep launcher.
+- The generic toy CLI still carries older method defaults for historical workflows.
+- Simpsons wrappers and collectors should pass `method_version=cdro` explicitly.
 - Historical note:
   - Older Simpsons artifacts in `toy_outputs/` used `rho=0.01`.
-  - Those artifacts are still useful as historical references, but they are not the current code default.
+  - Those artifacts are still useful as historical references, but they are not the current locked Simpsons defaults.
 
 ## Historical Reference Artifact
 
@@ -49,6 +53,10 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 ## Model And Training
 
 - `method_version=cdro`
+- Canonical path for this choice:
+  - `toy/scripts/run_simpsons_mnist_once.sh`
+  - `toy/scripts/collect_three_method_seed_data.py`
+  - `toy/scripts/run_simpsons_locked_default_percent_sweep.sh`
 - `dataset_kind=image_folder`
 - `model_kind=image_conv`
 - `diagnostics_kind=image_basic`
@@ -106,6 +114,14 @@ Run one smoke experiment:
 toy/scripts/run_simpsons_mnist_once.sh
 ```
 
+The smoke wrapper now defaults to `RUN_MODE=robust` and `METHOD_VERSION=cdro`. Override only if you intentionally want baseline-only or a historical method:
+
+```bash
+METHOD_VERSION=cdro toy/scripts/run_simpsons_mnist_once.sh
+```
+
+The smoke wrapper is intentionally smaller than the full protocol. It keeps the locked CDRO method knobs, but uses smoke-scale training length and eval size.
+
 Run the locked three-method default family:
 
 ```bash
@@ -146,6 +162,7 @@ python toy/scripts/collect_three_method_seed_data.py \
 
 ## Notes
 
-- The current code default is a Simpsons-only working context.
-- Historical Simpsons artifacts in `toy_outputs/` may disagree with the current code default.
+- The locked Simpsons default is `cdro`, but not every generic toy wrapper uses that unless it passes `--method-version` explicitly.
+- Historical Simpsons artifacts in `toy_outputs/` may disagree with the current locked Simpsons defaults.
+- Root `run_image_once.sh` and `run_toy_once.sh` are compatibility shims only. Prefer the `toy/scripts/` paths.
 - If a narrative doc disagrees with a run artifact, trust the artifact for that run.

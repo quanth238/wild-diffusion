@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_MODE="${RUN_MODE:-robust}"   # robust|baseline
+METHOD_VERSION="${METHOD_VERSION:-}"
 EXP_NAME="${EXP_NAME:-toy_once}"
 OUTDIR="${OUTDIR:-toy_outputs}"
 DEVICE="${DEVICE:-auto}"         # auto|cpu|cuda
@@ -43,6 +44,10 @@ args=(
   "--batch-size" "${BATCH_SIZE}"
   "--log-every" "${LOG_EVERY}"
 )
+
+if [[ -n "${METHOD_VERSION}" ]]; then
+  args+=("--method-version" "${METHOD_VERSION}")
+fi
 
 if [[ "${RUN_MODE}" == "baseline" ]]; then
   args+=("--baseline-only")

@@ -31,8 +31,9 @@ if [[ ! -f "${FID_REF_PATH}" ]]; then
   exit 1
 fi
 
-RUN_MODE="${RUN_MODE:-baseline}"   # baseline|robust
-EXP_NAME="${EXP_NAME:-simpsons_mnist_rgb_smoke}"
+RUN_MODE="${RUN_MODE:-robust}"   # baseline|robust
+METHOD_VERSION="${METHOD_VERSION:-cdro}"
+EXP_NAME="${EXP_NAME:-simpsons_mnist_rgb_cdro_smoke}"
 OUTDIR="${OUTDIR:-toy_outputs/simpsons_mnist_rgb_runs}"
 DEVICE="${DEVICE:-cuda}"
 SEED="${SEED:-0}"
@@ -46,15 +47,19 @@ HIDDEN_DIM="${HIDDEN_DIM:-64}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-256}"
 DEBUG_EVAL_BATCH="${DEBUG_EVAL_BATCH:-64}"
 LOG_EVERY="${LOG_EVERY:-25}"
+N_STEPS_PATH="${N_STEPS_PATH:-64}"
+OUTER_ATTACK_WEIGHT="${OUTER_ATTACK_WEIGHT:-0.3}"
+OUTER_CLEAN_WEIGHT="${OUTER_CLEAN_WEIGHT:-1.0}"
 
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-EXTRA_ARGS="--compute-fid --fid-ref-path ${FID_REF_PATH} ${EXTRA_ARGS}"
+EXTRA_ARGS="--compute-fid --fid-ref-path ${FID_REF_PATH} --cdro-step-size 0.02 --cdro-total-budget-rho 4.0 --cdro-time-horizon 1.0 --cdro-warmup-fraction 0.05 ${EXTRA_ARGS}"
 
-export PYTHON_BIN RUN_MODE EXP_NAME OUTDIR DEVICE SEED
+export PYTHON_BIN RUN_MODE METHOD_VERSION EXP_NAME OUTDIR DEVICE SEED
 export DATASET_PATH="${TRAIN_ROOT}"
 export DATASET_VAL_PATH="${TEST_ROOT}"
 export IMAGE_SIZE IMAGE_CHANNELS IMAGE_TRAIN_SIZE IMAGE_VAL_SIZE
 export STEPS BATCH_SIZE HIDDEN_DIM EVAL_SAMPLES DEBUG_EVAL_BATCH LOG_EVERY
+export N_STEPS_PATH OUTER_ATTACK_WEIGHT OUTER_CLEAN_WEIGHT
 export EXTRA_ARGS
 
 bash "${ROOT_DIR}/toy/scripts/run_image_once.sh"

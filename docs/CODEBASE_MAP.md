@@ -2,6 +2,17 @@
 
 This is the shortest reliable map of the repo.
 
+## Active Lane
+
+If you are working on the current Simpsons-MNIST RGB setup, start here:
+
+- [docs/SIMPSONS_DEFAULT_SETUP.md](/root/wild-diffusion/docs/SIMPSONS_DEFAULT_SETUP.md): locked Simpsons defaults
+- [toy/README.md](/root/wild-diffusion/toy/README.md): current toy-side status
+- [toy/scripts/README.md](/root/wild-diffusion/toy/scripts/README.md): active vs historical scripts
+- [toy/scripts/run_simpsons_mnist_once.sh](/root/wild-diffusion/toy/scripts/run_simpsons_mnist_once.sh): single-run smoke wrapper
+- [toy/scripts/run_simpsons_locked_default_percent_sweep.sh](/root/wild-diffusion/toy/scripts/run_simpsons_locked_default_percent_sweep.sh): locked sweep launcher
+- [toy/scripts/collect_three_method_seed_data.py](/root/wild-diffusion/toy/scripts/collect_three_method_seed_data.py): shared weighted-grid collector for baseline/WDRO/CDRO
+
 ## Start Here
 
 If you are doing toy/MNIST/pathwise-method work, start in:
@@ -34,7 +45,7 @@ Canonical toy research stack.
 - [toy/diagnostics_backends/provider.py](/root/wild-diffusion/toy/diagnostics_backends/provider.py): plots and diagnostics
 - [toy/shared/](/root/wild-diffusion/toy/shared): version-agnostic utilities
 - [toy/versions/](/root/wild-diffusion/toy/versions): method-specific implementations
-- [toy/scripts/](/root/wild-diffusion/toy/scripts): sweeps, comparison scripts, one-command runners
+- [toy/scripts/](/root/wild-diffusion/toy/scripts): canonical scripts, sweeps, and one-command runners
 
 ### `toy/versions/`
 
@@ -75,12 +86,16 @@ Good first places:
 - [scripts/run_budget40k_user_protocol.sh](/root/wild-diffusion/scripts/run_budget40k_user_protocol.sh): heavier comparison protocol
 - [scripts/slurm_baseline_v11_v2_v21_panel.sh](/root/wild-diffusion/scripts/slurm_baseline_v11_v2_v21_panel.sh): panel generation workflow
 
+If you are in the active Simpsons lane, prefer [toy/scripts/](/root/wild-diffusion/toy/scripts) first. Many files under `scripts/` are older protocol helpers.
+
 ### `docs/`
 
 Active docs are intentionally minimal and Simpsons-focused.
 
 - `docs/README.md`: active docs index
 - `docs/SIMPSONS_DEFAULT_SETUP.md`: locked Simpsons default setup
+- `toy/README.md`: current toy-side status
+- `toy/scripts/README.md`: script inventory
 
 For experiment truth, prefer manifests and `metrics.json` files under `toy_outputs/`.
 
@@ -168,6 +183,8 @@ Also: the root-level toy-named files
 - [registry.py](/root/wild-diffusion/registry.py)
 
 do not appear to be the main path used by the current scripts, which consistently invoke [toy/run_toy.py](/root/wild-diffusion/toy/run_toy.py). Treat those root-level copies as legacy or duplicate until proven otherwise.
+
+Also: root [run_toy_once.sh](/root/wild-diffusion/run_toy_once.sh) and [run_image_once.sh](/root/wild-diffusion/run_image_once.sh) are compatibility shims. The canonical implementations live under [toy/scripts/](/root/wild-diffusion/toy/scripts).
 
 ## Suggested Working Rule
 

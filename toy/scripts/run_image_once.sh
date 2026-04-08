@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RUN_MODE="${RUN_MODE:-robust}"   # robust|baseline
+METHOD_VERSION="${METHOD_VERSION:-}"
 EXP_NAME="${EXP_NAME:-image_once}"
 OUTDIR="${OUTDIR:-toy_outputs}"
 DEVICE="${DEVICE:-auto}"         # auto|cpu|cuda
@@ -74,6 +75,10 @@ args=(
   "--image-val-size" "${IMAGE_VAL_SIZE}"
   "--image-split-seed" "${IMAGE_SPLIT_SEED}"
 )
+
+if [[ -n "${METHOD_VERSION}" ]]; then
+  args+=("--method-version" "${METHOD_VERSION}")
+fi
 
 if [[ -n "${DATASET_VAL_PATH}" ]]; then
   args+=("--dataset-val-path" "${DATASET_VAL_PATH}")
