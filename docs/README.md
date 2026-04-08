@@ -4,6 +4,10 @@ This docs folder is intentionally limited to the active Simpsons-MNIST RGB workf
 
 Older CIFAR, transfer, toy-stage diagnostic, and WDRO paper-alignment writeups were removed on 2026-04-08 because they are stale and no longer represent the current working context.
 
+One fresh exception now exists for the next image-scale step:
+
+- `docs/CIFAR10_PAPER_FIRST_PROTOCOL.md`: paper-first CIFAR-10 baseline protocol for reproducing the first unconditional DDPM++ row from the WILD-Diffusion ICLR paper
+
 The active Simpsons decision is:
 
 - Locked Simpsons method: `method_version=cdro`

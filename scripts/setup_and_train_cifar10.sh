@@ -20,7 +20,7 @@ if [[ -d "${SERVER_STORAGE_ROOT}" && -w "${SERVER_STORAGE_ROOT}" ]]; then
   DEFAULT_DATA_ROOT="${SERVER_STORAGE_ROOT}/datasets"
   DEFAULT_OUTDIR="${SERVER_STORAGE_ROOT}/experiments/wild-diffusion"
 else
-  DEFAULT_VENV_DIR="${ROOT_DIR}/.venv"
+  DEFAULT_VENV_DIR="${HOME}/.venvs/wild-diffusion-h100"
   DEFAULT_DATA_ROOT="${ROOT_DIR}/datasets"
   DEFAULT_OUTDIR="${ROOT_DIR}/training-runs"
 fi
@@ -40,7 +40,8 @@ WORKERS="${WORKERS:-16}"
 AUGMENT="${AUGMENT:-0.12}"
 ARCH="${ARCH:-ddpmpp}"
 PRECOND="${PRECOND:-wdroedm}"
-FP16="${FP16:-1}"
+COND="${COND:-0}"
+FP16="${FP16:-0}"
 RESUME="${RESUME:-}"
 TRANSFER_PKL="${TRANSFER_PKL:-}"
 WDRO_WARMUP_RATIO="${WDRO_WARMUP_RATIO:-0.2}"
@@ -317,70 +318,17 @@ else:
     print(f"[INFO] Wrote {len(labels)} images and labels to: {out_dir}")
 PY
 
-python - <<'PY'
-import json
-import os
-import random
-import shutil
-from pathlib import Path
-
-src_dir = Path(os.environ["CIFAR_DIR"])
-dst_dir = Path(os.environ["TRAIN_CIFAR_DIR"])
-pct = int(os.environ["CIFAR_TRAIN_PERCENT"])
-seed = int(os.environ["CIFAR_TRAIN_SEED"])
-
-src_labels_path = src_dir / "dataset.json"
-if not src_labels_path.exists():
-    raise SystemExit(f"[ERROR] Missing source dataset.json: {src_labels_path}")
-
-with open(src_labels_path, "r", encoding="utf-8") as f:
-    src_labels = json.load(f).get("labels", [])
-
-if not src_labels:
-    raise SystemExit(f"[ERROR] Source dataset has no labels: {src_labels_path}")
-
-if pct >= 100:
-    print(f"[INFO] CIFAR_TRAIN_PERCENT=100 -> using full dataset: {src_dir}")
-    print(f"[INFO] TRAIN_CIFAR_DIR={src_dir}")
-    raise SystemExit(0)
-
-target_count = max(1, int(len(src_labels) * pct / 100))
-dst_labels_path = dst_dir / "dataset.json"
-dst_png_count = sum(1 for _ in dst_dir.rglob("*.png")) if dst_dir.exists() else 0
-
-if dst_labels_path.exists() and dst_png_count == target_count:
-    print(f"[INFO] Reusing limited dataset: {dst_dir} ({dst_png_count} images)")
-    print(f"[INFO] TRAIN_CIFAR_DIR={dst_dir}")
-    raise SystemExit(0)
-
-if dst_dir.exists():
-    shutil.rmtree(dst_dir)
-dst_dir.mkdir(parents=True, exist_ok=True)
-
-rng = random.Random(seed)
-indices = list(range(len(src_labels)))
-rng.shuffle(indices)
-keep_set = set(indices[:target_count])
-
-subset_labels = []
-for idx, (rel_path, label) in enumerate(src_labels):
-    if idx not in keep_set:
-        continue
-    src_img = src_dir / rel_path
-    dst_img = dst_dir / rel_path
-    dst_img.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src_img, dst_img)
-    subset_labels.append([rel_path, int(label)])
-
-with open(dst_labels_path, "w", encoding="utf-8") as f:
-    json.dump({"labels": subset_labels}, f)
-
-print(
-    f"[INFO] Built limited CIFAR-10 subset: {dst_dir} "
-    f"({len(subset_labels)} / {len(src_labels)} images, pct={pct}, seed={seed})"
-)
-print(f"[INFO] TRAIN_CIFAR_DIR={dst_dir}")
-PY
+if [[ "${CIFAR_TRAIN_PERCENT}" == "100" ]]; then
+  echo "[INFO] CIFAR_TRAIN_PERCENT=100 -> using full dataset: ${CIFAR_DIR}"
+  echo "[INFO] TRAIN_CIFAR_DIR=${CIFAR_DIR}"
+else
+  python scripts/build_cifar_subset.py \
+    --src "${CIFAR_DIR}" \
+    --dst "${TRAIN_CIFAR_DIR}" \
+    --percent "${CIFAR_TRAIN_PERCENT}" \
+    --seed "${CIFAR_TRAIN_SEED}"
+  echo "[INFO] TRAIN_CIFAR_DIR=${TRAIN_CIFAR_DIR}"
+fi
 
 if [[ "${DATASET_ONLY}" == "1" ]]; then
   echo "[INFO] DATASET_ONLY=1, CIFAR dataset preparation completed. Exiting before training."
@@ -405,7 +353,7 @@ train_cmd=(
   torchrun --standalone --nproc_per_node=1 train.py
   "--outdir=${OUTDIR}"
   "--data=${TRAIN_CIFAR_DIR}"
-  "--cond=1"
+  "--cond=${COND}"
   "--arch=${ARCH}"
   "--precond=${PRECOND}"
   "--duration=${DURATION_MIMG}"

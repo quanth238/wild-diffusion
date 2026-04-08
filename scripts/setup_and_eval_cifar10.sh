@@ -11,7 +11,7 @@ if [[ -d "${SERVER_STORAGE_ROOT}" && -w "${SERVER_STORAGE_ROOT}" ]]; then
   DEFAULT_VENV_DIR="${SERVER_STORAGE_ROOT}/venvs/wild-diffusion"
   DEFAULT_DATA_ROOT="${SERVER_STORAGE_ROOT}/datasets"
 else
-  DEFAULT_VENV_DIR="${ROOT_DIR}/.venv"
+  DEFAULT_VENV_DIR="${HOME}/.venvs/wild-diffusion-h100"
   DEFAULT_DATA_ROOT="${ROOT_DIR}/datasets"
 fi
 
@@ -44,7 +44,7 @@ NUM_IMAGES="${NUM_IMAGES:-50000}"
 SEED_START="${SEED_START:-0}"
 GEN_BATCH="${GEN_BATCH:-128}"
 FID_BATCH="${FID_BATCH:-64}"
-GEN_STEPS="${GEN_STEPS:-35}"
+GEN_STEPS="${GEN_STEPS:-18}"
 CLASS_IDX="${CLASS_IDX:-}" # optional
 
 REF_MODE="${REF_MODE:-auto}" # auto|compute|url|path
