@@ -469,6 +469,7 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
         source_cfg = payload.get("config", {})
         if isinstance(source_cfg, dict):
             _apply_cfg_overrides(cfg, source_cfg)
+    cfg.amp_dtype = args.amp_dtype
     cfg.outdir = args.outdir
     cfg.exp_name = args.prefix
     cfg.dataset_path = _resolve_repo_path(cfg.dataset_path)

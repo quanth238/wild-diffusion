@@ -184,6 +184,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python-bin", type=str, default=os.path.join(ROOT_DIR, ".venv", "bin", "python"))
     parser.add_argument("--seeds", type=str, default="0,1,2")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "bfloat16", "float16", "bf16", "fp16", "half"],
+    )
     parser.add_argument("--dataset-path", type=str, default=DEFAULT_TRAIN_ROOT)
     parser.add_argument("--dataset-val-path", type=str, default=DEFAULT_VAL_ROOT)
     parser.add_argument("--fid-ref-path", type=str, default=DEFAULT_FID_REF)
@@ -256,6 +262,17 @@ def parse_args() -> argparse.Namespace:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def _canonical_amp_dtype(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode in {"auto", "off", "bfloat16", "float16"}:
+        return mode
+    if mode == "bf16":
+        return "bfloat16"
+    if mode in {"fp16", "half"}:
+        return "float16"
+    raise ValueError(f"Unsupported amp dtype: {value}")
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -512,6 +529,8 @@ def _build_posthoc_reeval_cmd(
         args.python_bin,
         "--device",
         args.device,
+        "--amp-dtype",
+        _canonical_amp_dtype(args.amp_dtype),
         "--dataset-path",
         args.dataset_path,
         "--dataset-val-path",
@@ -1247,6 +1266,8 @@ def _build_baseline_sweep_cmd(
         ("none" if not fid_eval_steps else format_steps_list(fid_eval_steps)),
         "--device",
         args.device,
+        "--amp-dtype",
+        _canonical_amp_dtype(args.amp_dtype),
         "--require-cuda",
         "--dataset-kind",
         "image_folder",
@@ -1315,6 +1336,8 @@ def _build_run_toy_cmd(
         outdir,
         "--device",
         args.device,
+        "--amp-dtype",
+        _canonical_amp_dtype(args.amp_dtype),
         "--seed",
         str(seed),
         "--steps",
