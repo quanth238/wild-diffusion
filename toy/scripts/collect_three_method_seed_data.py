@@ -21,7 +21,6 @@ from toy.compute_accounting import (  # noqa: E402
     solve_warmup_steps_for_target_compute_fraction,
     wdro_robust_step_weighted_compute_units,
 )
-from toy.config import ToyConfig  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
 
 
@@ -247,18 +246,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inner-steps", type=int, default=1)
     parser.add_argument("--outer-attack-weight", type=float, default=0.3)
     parser.add_argument("--outer-clean-weight", type=float, default=1.0)
-    parser.add_argument("--warmup-clean-steps", type=int, default=ToyConfig.warmup_clean_steps)
-    parser.add_argument("--warmup-ramp-steps", type=int, default=ToyConfig.warmup_ramp_steps)
-    parser.add_argument(
-        "--warmup-attack-weight-start",
-        type=float,
-        default=ToyConfig.warmup_attack_weight_start,
-    )
-    parser.add_argument(
-        "--warmup-phi-lr-scale-start",
-        type=float,
-        default=ToyConfig.warmup_phi_lr_scale_start,
-    )
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
@@ -1441,14 +1428,6 @@ def _build_run_toy_cmd(
                 str(args.outer_attack_weight),
                 "--outer-clean-weight",
                 str(args.outer_clean_weight),
-                "--warmup-clean-steps",
-                str(args.warmup_clean_steps),
-                "--warmup-ramp-steps",
-                str(args.warmup_ramp_steps),
-                "--warmup-attack-weight-start",
-                str(args.warmup_attack_weight_start),
-                "--warmup-phi-lr-scale-start",
-                str(args.warmup_phi_lr_scale_start),
                 "--cdro-step-size",
                 str(args.cdro_step_size),
                 "--cdro-total-budget-rho",
@@ -2264,10 +2243,6 @@ def main() -> None:
             "cross_method_baseline_cache_reuse": False,
             "cross_knot_robust_resume_reuse": "same_seed_same_method_only",
             "cdro_collapse_diagnostics_disabled": True,
-            "cdro_warmup_clean_steps": int(args.warmup_clean_steps),
-            "cdro_warmup_ramp_steps": int(args.warmup_ramp_steps),
-            "cdro_warmup_attack_weight_start": float(args.warmup_attack_weight_start),
-            "cdro_warmup_phi_lr_scale_start": float(args.warmup_phi_lr_scale_start),
             "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
         },

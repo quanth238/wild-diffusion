@@ -7,7 +7,7 @@ from ...models import set_requires_grad
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
-from ...shared.train_utils import pathwise_l2, robust_schedule, sample_train_batch
+from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
 from ..v1_1.trainer import (
     _path_average_training_loss,
@@ -214,7 +214,10 @@ def train_trajectory_robust_cdro(
         else:
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
 
-        clean_weight, attack_weight, phi_lr_scale, control_updates_enabled = robust_schedule(step, cfg)
+        clean_weight = float(cfg.outer_clean_weight)
+        attack_weight = float(cfg.outer_attack_weight)
+        phi_lr_scale = 1.0 if attack_weight > 0.0 else 0.0
+        control_updates_enabled = attack_weight > 0.0
         attack_enabled = bool(control_updates_enabled and attack_weight > 0.0 and cfg.inner_steps > 0)
         attack_construction_units = 0.0
 
