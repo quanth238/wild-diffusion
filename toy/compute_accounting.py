@@ -100,6 +100,17 @@ def weighted_compute_units(
     )
 
 
+def estimate_wall_clock_sec_from_batch_equiv(
+    *,
+    batch_equiv_denoiser_evals: float,
+    batch_size: int,
+    sec_per_kimg: float,
+) -> float:
+    """Convert batch-equivalent denoiser evals into wall-clock using a fixed sec/kimg calibration."""
+
+    return float(batch_equiv_denoiser_evals) * float(batch_size) * float(sec_per_kimg) / 1000.0
+
+
 def ensure_denoiser_op_count_history(history: Dict[str, Any]) -> None:
     """Ensure a history dict has the direct denoiser-op accounting schema."""
 

@@ -90,11 +90,14 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Default WDRO/CDRO FID mode: `posthoc_from_checkpoints`
 - Primary metric: `weighted_compute_units`
 - Secondary metric: `train_wall_clock_sec`
+- Default wall-clock accounting: normalize batch-equivalent training compute to the current optimized baseline speed with `--wall-clock-mode current_sec_per_kimg`
+- Current normalized wall-clock calibration: `0.629646 sec/kimg`
 - Shared weighted cap: `200000`
 - Dense checkpoints are still saved on the shared comparison grid, plus exact warmup-support checkpoints.
 - The launcher now computes FID only on the coarser balanced knot subset by default, with extra transition sentinels for WDRO/CDRO at the exact warmup-support checkpoint plus the first three robust checkpoints.
 - The launcher now defaults all three methods to two-phase collection: save dense checkpoints first, then fill only the selected FIDs later from checkpoints.
 - Omit the new template flag to keep the old evaluate-every-comparison-knot behavior, set `--baseline-fid-mode in_run` to restore baseline in-run FID, and set `--robust-fid-mode in_run` to restore the old WDRO/CDRO in-run FID path.
+- Use `--wall-clock-mode observed` if you explicitly want the old run-time-measured wall-clock instead of the normalized current-speed estimate.
 - Weighted-compute calibration:
   - `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
 
@@ -152,6 +155,8 @@ python toy/scripts/collect_three_method_seed_data.py \
   --hidden-dim 64 \
   --eval-samples 2000 \
   --fid-samples 2000 \
+  --wall-clock-mode current_sec_per_kimg \
+  --wall-clock-sec-per-kimg 0.629646 \
   --debug-eval-batch 64 \
   --debug-terminal-step 20 \
   --log-every 200 \

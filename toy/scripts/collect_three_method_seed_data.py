@@ -17,6 +17,7 @@ if ROOT_DIR not in sys.path:
 from toy.compute_accounting import (  # noqa: E402
     baseline_weighted_compute_units_for_steps,
     cdro_robust_step_weighted_compute_units,
+    estimate_wall_clock_sec_from_batch_equiv,
     load_weighted_compute_calibration,
     solve_warmup_steps_for_target_compute_fraction,
     wdro_robust_step_weighted_compute_units,
@@ -159,6 +160,8 @@ FID_EVAL_TEMPLATES = {
     },
 }
 TRANSITION_SENTINEL_ROBUST_COUNT = 3
+DEFAULT_WALL_CLOCK_MODE = "current_sec_per_kimg"
+DEFAULT_WALL_CLOCK_SEC_PER_KIMG = 0.629646
 
 
 def _grid_template_names() -> List[str]:
@@ -197,6 +200,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
     parser.add_argument("--weighted-parambackward-beta", type=float, default=0.0)
     parser.add_argument("--train-accelerator-count", type=int, default=1)
+    parser.add_argument(
+        "--wall-clock-mode",
+        type=str,
+        choices=["observed", "current_sec_per_kimg"],
+        default=DEFAULT_WALL_CLOCK_MODE,
+    )
+    parser.add_argument("--wall-clock-sec-per-kimg", type=float, default=DEFAULT_WALL_CLOCK_SEC_PER_KIMG)
     parser.add_argument("--image-size", type=int, default=28)
     parser.add_argument("--image-channels", type=int, default=3)
     parser.add_argument("--image-train-size", type=int, default=80)
@@ -342,6 +352,83 @@ def _optional_bool(value, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off", ""}:
         return False
     return bool(default)
+
+
+def _validate_wall_clock_args(args: argparse.Namespace) -> None:
+    if str(args.wall_clock_mode) == "current_sec_per_kimg" and float(args.wall_clock_sec_per_kimg) <= 0.0:
+        raise ValueError("--wall-clock-sec-per-kimg must be positive when --wall-clock-mode=current_sec_per_kimg")
+
+
+def _wall_clock_source_label(args: argparse.Namespace) -> str:
+    if str(args.wall_clock_mode) == "current_sec_per_kimg":
+        return f"current_sec_per_kimg:{float(args.wall_clock_sec_per_kimg):.6f}"
+    return "observed_train_runtime"
+
+
+def _batch_equiv_wall_clock_sec(
+    *,
+    batch_equiv_denoiser_evals,
+    args: argparse.Namespace,
+) -> Optional[float]:
+    batch_equiv_value = _optional_float(batch_equiv_denoiser_evals)
+    if batch_equiv_value is None:
+        return None
+    if str(args.wall_clock_mode) != "current_sec_per_kimg":
+        return None
+    return float(
+        estimate_wall_clock_sec_from_batch_equiv(
+            batch_equiv_denoiser_evals=float(batch_equiv_value),
+            batch_size=int(args.batch_size),
+            sec_per_kimg=float(args.wall_clock_sec_per_kimg),
+        )
+    )
+
+
+def _apply_wall_clock_accounting(*, row: Dict, args: argparse.Namespace) -> Dict:
+    out = dict(row)
+    source_label = _wall_clock_source_label(args)
+    if str(args.wall_clock_mode) != "current_sec_per_kimg":
+        if not str(out.get("train_wall_clock_source", "")).strip():
+            out["train_wall_clock_source"] = source_label
+        if (
+            _optional_float(out.get("baseline_train_wall_clock_sec_effective")) is not None
+            and not str(out.get("baseline_train_wall_clock_source", "")).strip()
+        ):
+            out["baseline_train_wall_clock_source"] = source_label
+        return out
+
+    total_batch_equiv = _optional_float(out.get("compute_budget_be", out.get("batch_equiv_denoiser_evals")))
+    total_wall_clock_sec = _batch_equiv_wall_clock_sec(batch_equiv_denoiser_evals=total_batch_equiv, args=args)
+    if total_wall_clock_sec is None:
+        if not str(out.get("train_wall_clock_source", "")).strip():
+            out["train_wall_clock_source"] = source_label
+        return out
+
+    baseline_wall_clock_sec = _batch_equiv_wall_clock_sec(
+        batch_equiv_denoiser_evals=out.get("baseline_compute_be"),
+        args=args,
+    )
+    robust_wall_clock_sec = _batch_equiv_wall_clock_sec(
+        batch_equiv_denoiser_evals=out.get("robust_compute_be"),
+        args=args,
+    )
+    out["train_wall_clock_sec"] = float(total_wall_clock_sec)
+    out["train_elapsed_sec"] = float(total_wall_clock_sec)
+    out["train_gpu_hours"] = (
+        float(total_wall_clock_sec) * float(max(int(args.train_accelerator_count), 0)) / 3600.0
+    )
+    out["train_wall_clock_complete"] = True
+    out["train_wall_clock_source"] = source_label
+    if "baseline_compute_be" in out or baseline_wall_clock_sec is not None:
+        out["baseline_train_wall_clock_sec_effective"] = (
+            None if baseline_wall_clock_sec is None else float(baseline_wall_clock_sec)
+        )
+        out["baseline_train_wall_clock_source"] = source_label
+    if "robust_compute_be" in out or robust_wall_clock_sec is not None:
+        out["robust_train_wall_clock_sec_effective"] = (
+            None if robust_wall_clock_sec is None else float(robust_wall_clock_sec)
+        )
+    return out
 
 
 def _resolve_fid_annotation(
@@ -910,7 +997,7 @@ def _solve_cdro_total_steps_for_shared_cap(
     return int(total_steps), int(warmup_steps), float(weighted_total)
 
 
-def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
+def _normalize_baseline_runs(*, runs_csv: str, args: argparse.Namespace) -> List[Dict]:
     rows = load_csv_rows(runs_csv)
     out: List[Dict] = []
     for row in rows:
@@ -924,29 +1011,32 @@ def _normalize_baseline_runs(*, runs_csv: str) -> List[Dict]:
         if not fid_source:
             fid_source = "in_run_metrics" if fid_evaluated else "not_evaluated"
         out.append(
-            {
-                "method": "baseline_edm",
-                "seed": int(row["seed"]),
-                "step": int(row["step"]),
-                "fid": fid_value,
-                "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
-                "weighted_compute_units": float(row["weighted_compute_units"]),
-                "batch_equiv_denoiser_evals": float(row["batch_equiv_denoiser_evals"]),
-                "loss_kind": "baseline_loss",
-                "loss_final": float(row["baseline_loss_final"]),
-                "loss_mean_last": float(row["baseline_loss_mean_last"]),
-                "images_shown_m": float(row["images_shown_m"]),
-                "row_origin": "baseline_seed_run",
-                "source_csv": runs_csv,
-                "exp_name": row["exp_name"],
-                "exp_dir": row["exp_dir"],
-                "checkpoint_path": row["checkpoint_path"],
-                "fid_eval_selected": bool(fid_selected),
-                "fid_evaluated": bool(fid_evaluated),
-                "fid_missing_reason": str(fid_missing_reason),
-                "fid_source": str(fid_source),
-                **_empty_objective_debug_fields(),
-            }
+            _apply_wall_clock_accounting(
+                row={
+                    "method": "baseline_edm",
+                    "seed": int(row["seed"]),
+                    "step": int(row["step"]),
+                    "fid": fid_value,
+                    "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
+                    "weighted_compute_units": float(row["weighted_compute_units"]),
+                    "batch_equiv_denoiser_evals": float(row["batch_equiv_denoiser_evals"]),
+                    "loss_kind": "baseline_loss",
+                    "loss_final": float(row["baseline_loss_final"]),
+                    "loss_mean_last": float(row["baseline_loss_mean_last"]),
+                    "images_shown_m": float(row["images_shown_m"]),
+                    "row_origin": "baseline_seed_run",
+                    "source_csv": runs_csv,
+                    "exp_name": row["exp_name"],
+                    "exp_dir": row["exp_dir"],
+                    "checkpoint_path": row["checkpoint_path"],
+                    "fid_eval_selected": bool(fid_selected),
+                    "fid_evaluated": bool(fid_evaluated),
+                    "fid_missing_reason": str(fid_missing_reason),
+                    "fid_source": str(fid_source),
+                    **_empty_objective_debug_fields(),
+                },
+                args=args,
+            )
         )
     return out
 
@@ -957,6 +1047,7 @@ def _extract_wdro_row(
     calibration: Dict,
     train_accelerator_count: int,
     fid_selected: bool,
+    args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
@@ -1051,7 +1142,7 @@ def _extract_wdro_row(
             source_if_evaluated="in_run_metrics",
         )
     )
-    return row
+    return _apply_wall_clock_accounting(row=row, args=args)
 
 
 def _extract_cdro_row(
@@ -1061,6 +1152,7 @@ def _extract_cdro_row(
     calibration: Dict,
     train_accelerator_count: int,
     fid_selected: bool,
+    args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
     metrics = payload["metrics"]
@@ -1151,7 +1243,7 @@ def _extract_cdro_row(
             source_if_evaluated="in_run_metrics",
         )
     )
-    return row
+    return _apply_wall_clock_accounting(row=row, args=args)
 
 
 def _normalize_method_metrics_row(
@@ -1558,7 +1650,7 @@ def _run_method_local_warmup_trajectory(
             proc_title=build_process_title("wdiff", "warmup", method_name, f"s{int(seed)}"),
         )
 
-    warmup_rows = _normalize_baseline_runs(runs_csv=warmup_runs_csv)
+    warmup_rows = _normalize_baseline_runs(runs_csv=warmup_runs_csv, args=args)
     warmup_by_step = {(int(row["seed"]), int(row["step"])): row for row in warmup_rows}
     support_row = warmup_by_step.get((int(seed), int(fixed_warmup_steps)))
     if support_row is None:
@@ -1626,6 +1718,7 @@ def _run_method_local_warmup_trajectory(
 
 def main() -> None:
     args = parse_args()
+    _validate_wall_clock_args(args)
     if _APPLIED_PROCESS_TITLE is None:
         apply_process_title(build_process_title("wdiff", "collect", args.prefix))
     baseline_fid_posthoc = str(args.baseline_fid_mode) == "posthoc_from_checkpoints"
@@ -1809,6 +1902,11 @@ def main() -> None:
     )
     print(f"[collect-weighted] baseline_fid_mode={args.baseline_fid_mode}", flush=True)
     print(f"[collect-weighted] robust_fid_mode={args.robust_fid_mode}", flush=True)
+    print(
+        "[collect-weighted] wall_clock_mode="
+        f"{args.wall_clock_mode} source={_wall_clock_source_label(args)}",
+        flush=True,
+    )
     print(f"[collect-weighted] baseline_steps={baseline_curve_steps}", flush=True)
     print(f"[collect-weighted] baseline_fid_eval_steps={baseline_fid_eval_steps}", flush=True)
     print(f"[collect-weighted] wdro_steps={wdro_curve_steps}", flush=True)
@@ -1858,7 +1956,7 @@ def main() -> None:
                 proc_title=build_process_title("wdiff", "baseline", args.prefix),
             )
 
-    baseline_raw = _normalize_baseline_runs(runs_csv=baseline_runs_csv)
+    baseline_raw = _normalize_baseline_runs(runs_csv=baseline_runs_csv, args=args)
     baseline_raw.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
     baseline_by_seed_step = {(int(row["seed"]), int(row["step"])): row for row in baseline_raw}
     baseline_target_rows: List[Dict] = []
@@ -1895,7 +1993,7 @@ def main() -> None:
         if not os.path.isfile(reused_wdro_raw_csv):
             raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
         reused_rows = [
-            _ensure_row_fid_fields(row)
+            _apply_wall_clock_accounting(row=_ensure_row_fid_fields(row), args=args)
             for row in load_csv_rows(reused_wdro_raw_csv)
             if str(row.get("method", "")) == "wdro" and int(row["seed"]) in seeds
         ]
@@ -1988,6 +2086,7 @@ def main() -> None:
                     calibration=calibration,
                     train_accelerator_count=int(args.train_accelerator_count),
                     fid_selected=bool(fid_selected),
+                    args=args,
                 )
                 row["checkpoint_path"] = checkpoint_path
                 row["baseline_ckpt_requested"] = baseline_ckpt_requested
@@ -2099,6 +2198,7 @@ def main() -> None:
                 calibration=calibration,
                 train_accelerator_count=int(args.train_accelerator_count),
                 fid_selected=bool(fid_selected),
+                args=args,
             )
             row["checkpoint_path"] = checkpoint_path
             row["robust_resume_ckpt_requested"] = cdro_resume_checkpoint
@@ -2242,6 +2342,13 @@ def main() -> None:
             "primary_metric": "weighted_compute_units",
             "secondary_metric": "train_wall_clock_sec",
             "legacy_metric": "batch_equiv_denoiser_evals",
+            "wall_clock_accounting_mode": str(args.wall_clock_mode),
+            "wall_clock_accounting_source": _wall_clock_source_label(args),
+            "wall_clock_sec_per_kimg": (
+                None
+                if str(args.wall_clock_mode) != "current_sec_per_kimg"
+                else float(args.wall_clock_sec_per_kimg)
+            ),
             "baseline_aggregate_role": "summary_only_not_used_for_wdro_cdro_raw_collection",
             "baseline_auxiliary_eval_points_enabled": False,
             "method_local_warmup_support_checkpoints_enabled": True,
