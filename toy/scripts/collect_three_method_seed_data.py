@@ -228,6 +228,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
     parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="all")
     parser.add_argument(
+        "--transition-sentinel-robust-count",
+        type=int,
+        default=TRANSITION_SENTINEL_ROBUST_COUNT,
+    )
+    parser.add_argument(
         "--baseline-fid-mode",
         type=str,
         choices=["in_run", "posthoc_from_checkpoints"],
@@ -752,7 +757,7 @@ def _augment_fid_eval_steps_with_transition_sentinels(
     comparison_steps: List[int],
     fid_eval_steps: List[int],
     fixed_warmup_steps: int,
-    robust_sentinel_count: int = TRANSITION_SENTINEL_ROBUST_COUNT,
+    robust_sentinel_count: int,
 ) -> List[int]:
     selected = {int(step) for step in fid_eval_steps if int(step) > 0}
     warmup_support_step = int(fixed_warmup_steps)
@@ -1863,11 +1868,13 @@ def main() -> None:
         comparison_steps=wdro_curve_steps,
         fid_eval_steps=wdro_fid_eval_steps,
         fixed_warmup_steps=int(wdro_fixed_warmup_steps),
+        robust_sentinel_count=int(args.transition_sentinel_robust_count),
     )
     cdro_fid_eval_steps = _augment_fid_eval_steps_with_transition_sentinels(
         comparison_steps=cdro_curve_steps,
         fid_eval_steps=cdro_fid_eval_steps,
         fixed_warmup_steps=int(cdro_fixed_warmup_steps),
+        robust_sentinel_count=int(args.transition_sentinel_robust_count),
     )
     wdro_fid_eval_step_set = set(int(step) for step in wdro_fid_eval_steps)
     cdro_fid_eval_step_set = set(int(step) for step in cdro_fid_eval_steps)
@@ -2364,7 +2371,7 @@ def main() -> None:
                 "selected_weighted_targets": list(fid_eval_schedule["selected_targets"]),
                 "transition_sentinels_enabled": True,
                 "transition_sentinel_support_checkpoint_enabled": True,
-                "transition_sentinel_robust_checkpoints_per_method": int(TRANSITION_SENTINEL_ROBUST_COUNT),
+                "transition_sentinel_robust_checkpoints_per_method": int(args.transition_sentinel_robust_count),
             },
             "checkpoint_schedule": "every_comparison_checkpoint_plus_exact_warmup_support",
             "implicit_outdir_baseline_cache_reuse": False,
