@@ -1,7 +1,7 @@
 """Backward-compatible trainer exports.
 
 Common trainer logic is in toy/shared/trainer_common.py.
-Current robust implementation lives in toy/versions/v1_1/trainer.py.
+Current robust implementation lives in method-specific trainers under toy/versions/.
 """
 
 from .shared.reverse import (
@@ -11,7 +11,11 @@ from .shared.reverse import (
     sample_reverse_paths,
 )
 from .shared.trainer_common import sample_with_denoiser, train_baseline
-from .versions.v1_1.trainer import train_trajectory_robust_constrained, train_trajectory_robust_energy
+from .versions.cdro.trainer import train_trajectory_robust_energy
+
+# Preserve the legacy symbol for older imports that still expect a constrained
+# robust trainer entrypoint at the top level.
+train_trajectory_robust_constrained = train_trajectory_robust_energy
 
 __all__ = [
     "_reverse_posterior_mean",

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -5,7 +6,6 @@ import torch
 
 from ...shared.objective import compute_training_loss
 from ...shared.runtime import autocast_context, resolve_amp_dtype
-from ..v1_1.diffusion import build_kappa_schedule
 
 
 @dataclass
@@ -29,6 +29,40 @@ def project_l2_ball(delta_raw: torch.Tensor, radius: torch.Tensor, eps: float = 
         radius = radius[:, None]
     scale = torch.minimum(torch.ones_like(norm), radius / norm)
     return (flat * scale).reshape_as(delta_raw)
+
+
+def build_kappa_schedule(
+    sigma_levels: torch.Tensor,
+    base_kappa: float,
+    use_time_dependent: bool = False,
+    low_multiplier: float = 1.0,
+    mid_multiplier: float = 1.0,
+    high_multiplier: float = 1.0,
+    preserve_l2_budget: bool = True,
+) -> torch.Tensor:
+    """Return per-transition control radius multipliers kappa_k for k->k+1."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    if n_steps <= 0:
+        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+
+    kappa = torch.full((n_steps,), float(base_kappa), device=sigma_levels.device, dtype=sigma_levels.dtype)
+    if not use_time_dependent:
+        return kappa
+
+    raw = torch.empty_like(kappa)
+    one_third = max(n_steps // 3, 1)
+    two_third = min(2 * one_third, n_steps)
+    raw[:one_third] = float(low_multiplier)
+    raw[one_third:two_third] = float(mid_multiplier)
+    raw[two_third:] = float(high_multiplier)
+
+    if preserve_l2_budget:
+        denom = raw.square().sum().clamp_min(1e-12)
+        scale = math.sqrt(float(n_steps) / float(denom.item()))
+        raw = raw * scale
+
+    return kappa * raw
 
 
 def build_time_deltas(

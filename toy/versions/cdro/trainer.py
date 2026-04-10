@@ -10,11 +10,6 @@ from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
-from ..v1_1.trainer import (
-    _path_average_training_loss,
-    _path_batch_equiv_denoiser_evals,
-    _path_outer_loss_backward,
-)
 from .diffusion import build_constraint_radii, rollout_controlled_ve, rollout_path_heuristic_attack
 
 
@@ -23,6 +18,114 @@ def _beta_transport_cost(beta_path: torch.Tensor) -> torch.Tensor:
 
     flat = beta_path.reshape(beta_path.shape[0], beta_path.shape[1], -1)
     return flat.pow(2).sum(dim=2).sum(dim=1).mean()
+
+
+def _path_average_training_loss(
+    cfg,
+    denoiser,
+    states: torch.Tensor,
+    x0: torch.Tensor,
+    sigma_levels: torch.Tensor,
+) -> torch.Tensor:
+    """Average weighted denoise loss over all rollout timesteps k=1..N."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    if states.shape[1] != n_steps + 1:
+        raise ValueError(f"states step dim must be {n_steps + 1}, got {states.shape[1]}")
+
+    total_loss = None
+    for step_idx in range(n_steps):
+        sigma = torch.full(
+            (x0.shape[0],),
+            float(sigma_levels[step_idx + 1].item()),
+            device=x0.device,
+            dtype=x0.dtype,
+        )
+        loss_step = compute_training_loss(cfg, denoiser, states[:, step_idx + 1], x0, sigma)
+        total_loss = loss_step if total_loss is None else (total_loss + loss_step)
+    return total_loss / float(n_steps)
+
+
+def _path_outer_loss_backward(
+    *,
+    cfg,
+    denoiser,
+    states_ctrl: torch.Tensor,
+    states_ref: torch.Tensor,
+    x0: torch.Tensor,
+    sigma_levels: torch.Tensor,
+    attack_weight: float,
+    clean_weight: float,
+    amp_dtype,
+) -> tuple[float, float, float]:
+    """Accumulate exact path-mean outer loss with per-timestep backward passes."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    if states_ctrl.shape[1] != n_steps + 1:
+        raise ValueError(f"states_ctrl step dim must be {n_steps + 1}, got {states_ctrl.shape[1]}")
+    if states_ref.shape[1] != n_steps + 1:
+        raise ValueError(f"states_ref step dim must be {n_steps + 1}, got {states_ref.shape[1]}")
+
+    attack_loss_total = 0.0
+    clean_loss_total = 0.0
+    outer_loss_total = 0.0
+
+    for step_idx in range(n_steps):
+        sigma = torch.full(
+            (x0.shape[0],),
+            float(sigma_levels[step_idx + 1].item()),
+            device=x0.device,
+            dtype=x0.dtype,
+        )
+        with autocast_context(sigma_levels.device, amp_dtype):
+            if attack_weight > 0.0:
+                attack_loss_step = compute_training_loss(
+                    cfg,
+                    denoiser,
+                    states_ctrl[:, step_idx + 1],
+                    x0,
+                    sigma,
+                )
+            else:
+                with torch.no_grad():
+                    attack_loss_step = compute_training_loss(
+                        cfg,
+                        denoiser,
+                        states_ctrl[:, step_idx + 1],
+                        x0,
+                        sigma,
+                    )
+
+            if clean_weight > 0.0:
+                clean_loss_step = compute_training_loss(
+                    cfg,
+                    denoiser,
+                    states_ref[:, step_idx + 1],
+                    x0,
+                    sigma,
+                )
+            else:
+                clean_loss_step = torch.zeros((), device=x0.device, dtype=x0.dtype)
+
+            chunk_outer = attack_weight * attack_loss_step + clean_weight * clean_loss_step
+            chunk_outer = chunk_outer / float(n_steps)
+
+        if has_nan_or_inf(chunk_outer):
+            raise RuntimeError("NaN/Inf detected in cdro outer loss.")
+        if chunk_outer.requires_grad:
+            chunk_outer.backward()
+
+        attack_loss_total += scalarize(attack_loss_step) / float(n_steps)
+        clean_loss_total += scalarize(clean_loss_step) / float(n_steps)
+        outer_loss_total += scalarize(chunk_outer)
+
+    return attack_loss_total, clean_loss_total, outer_loss_total
+
+
+def _path_batch_equiv_denoiser_evals(sigma_levels: torch.Tensor) -> float:
+    """Count one denoiser eval over `B*T` path states as `T` batch-equivalent evals."""
+
+    return float(max(int(sigma_levels.numel()) - 1, 0))
 
 
 def _rollout_delta_diagnostics(roll, radius_by_step: torch.Tensor):
