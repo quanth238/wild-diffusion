@@ -5,6 +5,7 @@ import torch
 
 from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...models import set_requires_grad
+from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
@@ -314,12 +315,7 @@ def train_trajectory_robust_cdro(
         else 0.0
     )
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
-    ema_model = None
-    if cfg.use_ema_eval:
-        ema_model = copy.deepcopy(denoiser).eval()
-        set_requires_grad(ema_model, False)
-        if ema_state_dict is not None:
-            ema_model.load_state_dict(ema_state_dict, strict=True)
+    ema_model = init_ema_model(denoiser, cfg, ema_state_dict=ema_state_dict)
     radius_by_step = build_constraint_radii_for_objective(
         cfg=cfg,
         sigma_levels=sigma_levels,
@@ -481,10 +477,13 @@ def train_trajectory_robust_cdro(
             attack_eval_units = path_batch_equiv_evals * 2.0 * rollout_multiplier
             clean_eval_units = path_batch_equiv_evals * rollout_multiplier if clean_weight > 0.0 else 0.0
         optimizer_theta.step()
-        if ema_model is not None:
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), denoiser.parameters()):
-                    p_ema.mul_(cfg.ema_decay).add_(p, alpha=1.0 - cfg.ema_decay)
+        update_ema_model(
+            ema_model,
+            denoiser,
+            cfg,
+            cur_nimg=float((step - 1) * int(cfg.batch_size)),
+            batch_size=int(cfg.batch_size),
+        )
         outer_loss_attack_val = sum(outer_loss_attack_vals) / len(outer_loss_attack_vals)
         outer_loss_clean_val = sum(outer_loss_clean_vals) / len(outer_loss_clean_vals)
         outer_loss_val = sum(outer_loss_vals) / len(outer_loss_vals)

@@ -1,10 +1,9 @@
-import copy
 from typing import Callable, Optional
 
 import torch
 
 from ..compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
-from ..models import set_requires_grad
+from .ema import init_ema_model, update_ema_model
 from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
 from .objective import build_training_state, compute_training_loss, weighted_denoise_loss
@@ -31,10 +30,7 @@ def train_baseline(
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
 
-    ema_model = None
-    if cfg.use_ema_eval:
-        ema_model = copy.deepcopy(denoiser).eval()
-        set_requires_grad(ema_model, False)
+    ema_model = init_ema_model(denoiser, cfg)
 
     for step in range(1, cfg.steps + 1):
         x0 = sample_train_batch(
@@ -69,10 +65,13 @@ def train_baseline(
             raise RuntimeError("NaN/Inf detected in baseline loss.")
         loss.backward()
         optimizer.step()
-        if ema_model is not None:
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), denoiser.parameters()):
-                    p_ema.mul_(cfg.ema_decay).add_(p, alpha=1.0 - cfg.ema_decay)
+        update_ema_model(
+            ema_model,
+            denoiser,
+            cfg,
+            cur_nimg=float((step - 1) * int(cfg.batch_size)),
+            batch_size=int(cfg.batch_size),
+        )
         history["loss"].append(scalarize(loss))
         if str(getattr(cfg, "training_objective", "edm")).lower() == "edm":
             proxy_loss = loss

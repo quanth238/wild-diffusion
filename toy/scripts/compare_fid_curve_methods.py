@@ -42,8 +42,10 @@ import torch
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from toy.shared.ema import append_ema_cli_args
 else:
     from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from ..shared.ema import append_ema_cli_args
 
 
 def _repo_root() -> Path:
@@ -596,7 +598,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma-max", type=float, default=80.0)
     p.add_argument("--auto-log-normal-params", action="store_true")
     p.add_argument("--use-ema-eval", action="store_true")
+    p.add_argument("--ema-mode", type=str, default="official", choices=["official", "fixed"])
     p.add_argument("--ema-decay", type=float, default=0.999)
+    p.add_argument("--ema-halflife-kimg", type=float, default=500.0)
+    p.add_argument("--ema-rampup-ratio", type=float, default=0.05)
+    p.add_argument("--disable-ema-rampup", action="store_true")
     p.add_argument("--eval-samples", type=int, default=2000)
     p.add_argument("--fid-samples", type=int, default=2000)
     p.add_argument("--fid-ref-split", type=str, default="test", choices=["train", "test"])
@@ -831,8 +837,7 @@ def main() -> None:
                 ]
                 if args.auto_log_normal_params:
                     cmd.append("--auto-log-normal-params")
-                if args.use_ema_eval:
-                    cmd.extend(["--use-ema-eval", "--ema-decay", str(args.ema_decay)])
+                append_ema_cli_args(cmd, args)
                 if disable_strict_meta:
                     cmd.append("--disable-baseline-ckpt-strict-meta")
                 if can_chain_resume:

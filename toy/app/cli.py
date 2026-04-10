@@ -281,7 +281,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-eval-shared-reverse-noise", action="store_true")
     parser.add_argument("--use-ema-eval", action="store_true", default=ToyConfig.use_ema_eval)
     parser.add_argument("--disable-ema-eval", action="store_true")
+    parser.add_argument("--ema-mode", type=str, default=ToyConfig.ema_mode, choices=["official", "fixed"])
     parser.add_argument("--ema-decay", type=float, default=ToyConfig.ema_decay)
+    parser.add_argument("--ema-halflife-kimg", type=float, default=ToyConfig.ema_halflife_kimg)
+    parser.add_argument("--ema-rampup-ratio", type=float, default=ToyConfig.ema_rampup_ratio)
+    parser.add_argument("--disable-ema-rampup", action="store_true")
     parser.add_argument("--disable-baseline-ckpt", action="store_true")
     parser.add_argument("--baseline-ckpt-path", type=str, default=ToyConfig.baseline_ckpt_path)
     parser.add_argument("--baseline-ckpt-force-retrain", action="store_true", default=ToyConfig.baseline_ckpt_force_retrain)
@@ -451,6 +455,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_eval_shared_reverse_noise = bool(args_dict.pop("disable_eval_shared_reverse_noise"))
     force_det_plot = bool(args_dict.pop("plot_deterministic_backward"))
     disable_ema_eval = bool(args_dict.pop("disable_ema_eval"))
+    disable_ema_rampup = bool(args_dict.pop("disable_ema_rampup"))
     disable_cdro_antithetic_rollouts = bool(args_dict.pop("disable_cdro_antithetic_rollouts"))
     disable_limited_data = bool(args_dict.pop("disable_limited_data"))
     disable_mnist_percent_split = bool(args_dict.pop("disable_mnist_percent_split"))
@@ -486,6 +491,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.plot_stochastic_backward = False
     if disable_ema_eval:
         cfg.use_ema_eval = False
+    if disable_ema_rampup:
+        cfg.ema_rampup_ratio = None
     if disable_cdro_antithetic_rollouts:
         cfg.cdro_antithetic_rollouts = False
     if disable_limited_data:

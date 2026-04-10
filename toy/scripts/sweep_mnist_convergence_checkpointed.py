@@ -40,6 +40,7 @@ if __package__ is None or __package__ == "":
     from toy.model_backends.provider import build_model_bundle
     from toy.models import set_requires_grad
     from toy.process_title import apply_process_title, build_process_title
+    from toy.shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from toy.shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from toy.shared.reverse import sample_reverse_paths
     from toy.shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
@@ -53,6 +54,7 @@ else:
     from ..model_backends.provider import build_model_bundle
     from ..models import set_requires_grad
     from ..process_title import apply_process_title, build_process_title
+    from ..shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from ..shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from ..shared.reverse import sample_reverse_paths
     from ..shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
@@ -303,8 +305,7 @@ def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float,
         "use_log_normal_sigma_sampling": bool(cfg.use_log_normal_sigma_sampling),
         "p_mean": float(cfg.p_mean),
         "p_std": float(cfg.p_std),
-        "use_ema_eval": bool(cfg.use_ema_eval),
-        "ema_decay": float(cfg.ema_decay),
+        **ema_config_dict(cfg),
     }
 
 
@@ -867,7 +868,10 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.sigma_min = float(args.sigma_min)
     cfg.sigma_max = float(args.sigma_max)
     cfg.use_ema_eval = bool(args.use_ema_eval)
+    cfg.ema_mode = str(args.ema_mode)
     cfg.ema_decay = float(args.ema_decay)
+    cfg.ema_halflife_kimg = float(args.ema_halflife_kimg)
+    cfg.ema_rampup_ratio = None if bool(args.disable_ema_rampup) else float(args.ema_rampup_ratio)
     cfg.auto_log_normal_params = bool(args.auto_log_normal_params)
     cfg.log_every = int(args.log_every)
     cfg.limited_data_enabled = True
@@ -968,10 +972,7 @@ def _run_combo(
         grad_scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
     history: Dict[str, List[float]] = {"loss": [], "proxy_weighted_denoise_loss": []}
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
-    ema_model = None
-    if cfg.use_ema_eval:
-        ema_model = copy.deepcopy(baseline).eval()
-        set_requires_grad(ema_model, False)
+    ema_model = init_ema_model(baseline, cfg)
 
     rows: List[RunRow] = []
     checkpoint_set = set(int(step) for step in checkpoint_steps)
@@ -1212,10 +1213,13 @@ def _run_combo(
             loss.backward()
             optimizer.step()
 
-        if ema_model is not None:
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), baseline.parameters()):
-                    p_ema.mul_(cfg.ema_decay).add_(p, alpha=1.0 - cfg.ema_decay)
+        update_ema_model(
+            ema_model,
+            baseline,
+            cfg,
+            cur_nimg=float((step - 1) * int(cfg.batch_size)),
+            batch_size=int(cfg.batch_size),
+        )
 
         history["loss"].append(scalarize(loss))
         if str(cfg.training_objective).lower() == "edm":
@@ -1306,7 +1310,11 @@ def build_parser():
     parser.add_argument("--sigma-max", type=float, default=80.0)
     parser.add_argument("--auto-log-normal-params", action="store_true")
     parser.add_argument("--use-ema-eval", action="store_true")
+    parser.add_argument("--ema-mode", type=str, default=ToyConfig.ema_mode, choices=["official", "fixed"])
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--ema-halflife-kimg", type=float, default=ToyConfig.ema_halflife_kimg)
+    parser.add_argument("--ema-rampup-ratio", type=float, default=ToyConfig.ema_rampup_ratio)
+    parser.add_argument("--disable-ema-rampup", action="store_true")
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--image-split-seed-offset", type=int, default=0)
     parser.add_argument("--eval-seed-offset-metrics", type=int, default=20000)
@@ -1524,8 +1532,7 @@ def main() -> None:
             "sigma_min": float(args.sigma_min),
             "sigma_max": float(args.sigma_max),
             "auto_log_normal_params": bool(args.auto_log_normal_params),
-            "use_ema_eval": bool(args.use_ema_eval),
-            "ema_decay": float(args.ema_decay),
+            **ema_config_dict(args),
             "fid_samples": int(args.fid_samples),
             "gen_batch": int(args.gen_batch),
             "fid_reference": fid_ref_meta,

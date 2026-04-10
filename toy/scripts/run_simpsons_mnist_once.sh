@@ -51,13 +51,27 @@ N_STEPS_PATH="${N_STEPS_PATH:-64}"
 OUTER_ATTACK_WEIGHT="${OUTER_ATTACK_WEIGHT:-0.3}"
 OUTER_CLEAN_WEIGHT="${OUTER_CLEAN_WEIGHT:-1.0}"
 USE_EMA_EVAL="${USE_EMA_EVAL:-0}"
+EMA_MODE="${EMA_MODE:-official}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
+EMA_HALFLIFE_KIMG="${EMA_HALFLIFE_KIMG:-500}"
+EMA_RAMPUP_RATIO="${EMA_RAMPUP_RATIO:-0.05}"
+DISABLE_EMA_RAMPUP="${DISABLE_EMA_RAMPUP:-0}"
 CDRO_ANTITHETIC_ROLLOUTS="${CDRO_ANTITHETIC_ROLLOUTS:-0}"
 
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_ARGS="--compute-fid --fid-ref-path ${FID_REF_PATH} --cdro-step-size 0.02 --cdro-total-budget-rho 4.0 --cdro-time-horizon 1.0 --cdro-warmup-fraction 0.05 ${EXTRA_ARGS}"
 if [[ "${USE_EMA_EVAL}" == "1" ]]; then
-  EXTRA_ARGS="--use-ema-eval --ema-decay ${EMA_DECAY} ${EXTRA_ARGS}"
+  EXTRA_ARGS="--use-ema-eval --ema-mode ${EMA_MODE} ${EXTRA_ARGS}"
+  if [[ "${EMA_MODE}" == "fixed" ]]; then
+    EXTRA_ARGS="--ema-decay ${EMA_DECAY} ${EXTRA_ARGS}"
+  else
+    EXTRA_ARGS="--ema-halflife-kimg ${EMA_HALFLIFE_KIMG} ${EXTRA_ARGS}"
+    if [[ "${DISABLE_EMA_RAMPUP}" == "1" ]]; then
+      EXTRA_ARGS="--disable-ema-rampup ${EXTRA_ARGS}"
+    else
+      EXTRA_ARGS="--ema-rampup-ratio ${EMA_RAMPUP_RATIO} ${EXTRA_ARGS}"
+    fi
+  fi
 fi
 if [[ "${CDRO_ANTITHETIC_ROLLOUTS}" == "1" ]]; then
   EXTRA_ARGS="--cdro-antithetic-rollouts ${EXTRA_ARGS}"

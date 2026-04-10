@@ -23,6 +23,7 @@ from toy.compute_accounting import (  # noqa: E402
     wdro_robust_step_weighted_compute_units,
 )
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
+from toy.shared.ema import append_ema_cli_args, ema_config_dict  # noqa: E402
 
 
 _APPLIED_PROCESS_TITLE = apply_process_title()
@@ -194,7 +195,11 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "off", "bfloat16", "float16", "bf16", "fp16", "half"],
     )
     parser.add_argument("--use-ema-eval", action="store_true")
-    parser.add_argument("--ema-decay", type=float, default=0.995)
+    parser.add_argument("--ema-mode", type=str, default="official", choices=["official", "fixed"])
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--ema-halflife-kimg", type=float, default=500.0)
+    parser.add_argument("--ema-rampup-ratio", type=float, default=0.05)
+    parser.add_argument("--disable-ema-rampup", action="store_true")
     parser.add_argument("--dataset-path", type=str, default=DEFAULT_TRAIN_ROOT)
     parser.add_argument("--dataset-val-path", type=str, default=DEFAULT_VAL_ROOT)
     parser.add_argument("--fid-ref-path", type=str, default=DEFAULT_FID_REF)
@@ -1486,14 +1491,7 @@ def _build_baseline_sweep_cmd(
         "--train-accelerator-count",
         str(args.train_accelerator_count),
     ]
-    if bool(args.use_ema_eval):
-        cmd.extend(
-            [
-                "--use-ema-eval",
-                "--ema-decay",
-                str(args.ema_decay),
-            ]
-        )
+    append_ema_cli_args(cmd, args)
     if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
         cmd.extend(
             [
@@ -1589,14 +1587,7 @@ def _build_run_toy_cmd(
     ]
     if compute_fid:
         cmd.append("--compute-fid")
-    if bool(args.use_ema_eval):
-        cmd.extend(
-            [
-                "--use-ema-eval",
-                "--ema-decay",
-                str(args.ema_decay),
-            ]
-        )
+    append_ema_cli_args(cmd, args)
     if fixed_warmup_steps is not None and int(fixed_warmup_steps) > 0:
         cmd.extend(
             [
@@ -2497,8 +2488,7 @@ def main() -> None:
             "cross_method_baseline_cache_reuse": False,
             "cross_knot_robust_resume_reuse": "same_seed_same_method_only",
             "cdro_collapse_diagnostics_disabled": True,
-            "use_ema_eval": bool(args.use_ema_eval),
-            "ema_decay": float(args.ema_decay),
+            **ema_config_dict(args),
             "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
         },

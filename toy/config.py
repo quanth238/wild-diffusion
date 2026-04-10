@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -41,7 +42,10 @@ class ToyConfig:
     plot_stochastic_backward: bool = False
     baseline_only: bool = False
     use_ema_eval: bool = False
-    ema_decay: float = 0.995
+    ema_mode: str = "official"  # official|fixed
+    ema_decay: float = 0.999  # only used when ema_mode='fixed'
+    ema_halflife_kimg: float = 500.0
+    ema_rampup_ratio: Optional[float] = 0.05
     fid_ref_path: str = ""
     fid_ref_policy: str = "auto"
     weighted_compute_calibration_path: str = ""

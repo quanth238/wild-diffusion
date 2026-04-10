@@ -25,6 +25,7 @@ from ..compute_accounting import (
 )
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
+from ..shared.ema import ema_config_dict
 from ..shared.sigma import build_sigma_levels, sample_target_indices
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
 from ..model_backends.provider import build_model_bundle
@@ -461,8 +462,7 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
         "use_log_normal_sigma_sampling": bool(cfg.use_log_normal_sigma_sampling),
         "p_mean": float(cfg.p_mean),
         "p_std": float(cfg.p_std),
-        "use_ema_eval": bool(cfg.use_ema_eval),
-        "ema_decay": float(cfg.ema_decay),
+        **ema_config_dict(cfg),
     }
 
 

@@ -29,8 +29,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
     from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from toy.shared.ema import append_ema_cli_args, ema_config_dict
 else:
     from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from ..shared.ema import append_ema_cli_args, ema_config_dict
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -424,7 +426,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sigma-max", type=float, default=80.0)
     parser.add_argument("--auto-log-normal-params", action="store_true")
     parser.add_argument("--use-ema-eval", action="store_true")
+    parser.add_argument("--ema-mode", type=str, default="official", choices=["official", "fixed"])
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--ema-halflife-kimg", type=float, default=500.0)
+    parser.add_argument("--ema-rampup-ratio", type=float, default=0.05)
+    parser.add_argument("--disable-ema-rampup", action="store_true")
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--fid-ref-split", type=str, default="test", choices=["train", "test"])
@@ -568,8 +574,7 @@ def main() -> None:
                     ]
                     if args.auto_log_normal_params:
                         cmd.append("--auto-log-normal-params")
-                    if args.use_ema_eval:
-                        cmd.extend(["--use-ema-eval", "--ema-decay", str(args.ema_decay)])
+                    append_ema_cli_args(cmd, args)
                     _run(cmd, cwd=repo_root, dry_run=args.dry_run)
 
                 if args.dry_run:
@@ -651,8 +656,7 @@ def main() -> None:
             "sigma_min": float(args.sigma_min),
             "sigma_max": float(args.sigma_max),
             "auto_log_normal_params": bool(args.auto_log_normal_params),
-            "use_ema_eval": bool(args.use_ema_eval),
-            "ema_decay": float(args.ema_decay),
+            **ema_config_dict(args),
             "force_ref_refresh": bool(args.force_ref_refresh),
             "fid_reference": fid_ref_meta,
             "threshold_pct": float(args.threshold_pct),

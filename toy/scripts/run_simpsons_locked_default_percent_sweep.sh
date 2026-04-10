@@ -35,7 +35,11 @@ DEBUG_TERMINAL_STEP="${DEBUG_TERMINAL_STEP:-20}"
 LOG_EVERY="${LOG_EVERY:-200}"
 N_STEPS_PATH="${N_STEPS_PATH:-64}"
 USE_EMA_EVAL="${USE_EMA_EVAL:-0}"
+EMA_MODE="${EMA_MODE:-official}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
+EMA_HALFLIFE_KIMG="${EMA_HALFLIFE_KIMG:-500}"
+EMA_RAMPUP_RATIO="${EMA_RAMPUP_RATIO:-0.05}"
+DISABLE_EMA_RAMPUP="${DISABLE_EMA_RAMPUP:-0}"
 
 GRID_TEMPLATE="${GRID_TEMPLATE:-denser}"
 FID_EVAL_TEMPLATE="${FID_EVAL_TEMPLATE:-balanced}"
@@ -103,7 +107,17 @@ for pct in ${PERCENTS}; do
   run_prefix="${PREFIX_ROOT}_${pct_tag}pct"
   extra_args=()
   if [[ "${USE_EMA_EVAL}" == "1" ]]; then
-    extra_args+=(--use-ema-eval --ema-decay "${EMA_DECAY}")
+    extra_args+=(--use-ema-eval --ema-mode "${EMA_MODE}")
+    if [[ "${EMA_MODE}" == "fixed" ]]; then
+      extra_args+=(--ema-decay "${EMA_DECAY}")
+    else
+      extra_args+=(--ema-halflife-kimg "${EMA_HALFLIFE_KIMG}")
+      if [[ "${DISABLE_EMA_RAMPUP}" == "1" ]]; then
+        extra_args+=(--disable-ema-rampup)
+      else
+        extra_args+=(--ema-rampup-ratio "${EMA_RAMPUP_RATIO}")
+      fi
+    fi
   fi
   if [[ "${CDRO_ANTITHETIC_ROLLOUTS}" == "1" ]]; then
     extra_args+=(--cdro-antithetic-rollouts)
