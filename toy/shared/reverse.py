@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 
+from .objective import predict_velocity, rf_time_levels_from_sigma_levels
 from ..utils import batch_scalar_like
 
 
@@ -27,6 +28,40 @@ def reverse_posterior_std(sigma: torch.Tensor, sigma_prev: torch.Tensor) -> torc
     return torch.sqrt(var.clamp_min(0.0))
 
 
+def _is_rectified_flow_model(denoiser) -> bool:
+    return str(getattr(denoiser, "generative_family", "")).lower() == "rectified_flow"
+
+
+@torch.no_grad()
+def _sample_rectified_flow_paths_from_terminal(
+    denoiser,
+    x_terminal: torch.Tensor,
+    sigma_levels: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic reverse-time RF integration from terminal noise to x0."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    x = x_terminal.clone()
+    states = [None for _ in range(n_steps + 1)]
+    states[n_steps] = x
+    t_levels = rf_time_levels_from_sigma_levels(sigma_levels).to(device=x.device, dtype=x.dtype)
+
+    for k in range(n_steps, 0, -1):
+        sigma = torch.full((x.shape[0],), float(sigma_levels[k].item()), device=x.device, dtype=x.dtype)
+        t_cur = float(t_levels[k].item())
+        t_prev = float(t_levels[k - 1].item())
+        dt = max(t_cur - t_prev, 0.0)
+        velocity = predict_velocity(
+            denoiser,
+            x,
+            sigma,
+            sigma_max=float(sigma_levels[-1].item()),
+        )
+        x = x - dt * velocity
+        states[k - 1] = x
+    return torch.stack(states, dim=1)
+
+
 @torch.no_grad()
 def sample_reverse_paths(
     denoiser,
@@ -43,6 +78,12 @@ def sample_reverse_paths(
         x = torch.randn(n_samples, 2, device=device) * sigma_levels[-1]
     else:
         x = sample_terminal_batch_fn(n_samples, sigma_levels[-1]).to(device=device)
+    if _is_rectified_flow_model(denoiser):
+        return _sample_rectified_flow_paths_from_terminal(
+            denoiser=denoiser,
+            x_terminal=x,
+            sigma_levels=sigma_levels,
+        )
     n_steps = sigma_levels.numel() - 1
     states = [None for _ in range(n_steps + 1)]
     states[n_steps] = x
@@ -84,6 +125,13 @@ def reverse_paths_from_terminal(
 ) -> torch.Tensor:
     """Reverse trajectories from provided terminal states x_k at the final index."""
 
+    if _is_rectified_flow_model(denoiser):
+        return _sample_rectified_flow_paths_from_terminal(
+            denoiser=denoiser,
+            x_terminal=x_terminal,
+            sigma_levels=sigma_levels,
+        )
+
     n_steps = sigma_levels.numel() - 1
     x = x_terminal.clone()
     states = [None for _ in range(n_steps + 1)]
@@ -115,4 +163,3 @@ def reverse_paths_from_terminal(
         states[k - 1] = x
 
     return torch.stack(states, dim=1)
-

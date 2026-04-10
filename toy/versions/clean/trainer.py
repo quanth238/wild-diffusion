@@ -31,6 +31,11 @@ def train_trajectory_robust_clean(
     """Continue the baseline EDM objective from an initialized checkpoint."""
 
     del control
+    if str(getattr(cfg, "training_objective", "edm")).lower() == "rf":
+        raise NotImplementedError(
+            "method_version='clean' does not yet implement rectified-flow continuation states. "
+            "Use the shared baseline RF path or add a clean RF continuation implementation first."
+        )
 
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     if optimizer_theta_state is not None:

@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from ...shared.objective import compute_training_loss
+from ...shared.objective import compute_training_loss, rf_time_levels_from_sigma_levels
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 
 
@@ -18,6 +18,10 @@ class RolloutResult:
     states_ctrl: Optional[torch.Tensor] = None
     delta_path: Optional[torch.Tensor] = None
     beta_path: Optional[torch.Tensor] = None
+
+
+def _is_rf_objective(cfg) -> bool:
+    return str(getattr(cfg, "training_objective", "edm")).lower() == "rf"
 
 
 def project_l2_ball(delta_raw: torch.Tensor, radius: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -107,6 +111,24 @@ def build_time_deltas(
     return dt
 
 
+def _build_time_deltas_for_objective(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    time_horizon: float,
+) -> torch.Tensor:
+    """Build method time deltas for the configured generative family."""
+
+    if _is_rf_objective(cfg):
+        t_levels = rf_time_levels_from_sigma_levels(sigma_levels)
+        dt = t_levels[1:] - t_levels[:-1]
+        total = float(dt.sum().item())
+        if total <= 0.0:
+            raise ValueError("RF time grid must have positive total length.")
+        return dt * (float(time_horizon) / total)
+    return build_time_deltas(sigma_levels, time_horizon)
+
+
 def _build_beta_budget_by_step(
     sigma_levels: torch.Tensor,
     total_budget: float,
@@ -118,6 +140,23 @@ def _build_beta_budget_by_step(
     total_tau = float(dt.sum().item())
     if total_tau <= 0:
         raise ValueError("sigma-induced CDRO time grid must have positive total length.")
+    beta_budget_by_step = float(total_budget) * dt / total_tau
+    return dt, beta_budget_by_step
+
+
+def _build_beta_budget_by_step_for_objective(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    total_budget: float,
+    time_horizon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return family-aware time deltas and matching per-step beta-space budgets."""
+
+    dt = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
+    total_tau = float(dt.sum().item())
+    if total_tau <= 0:
+        raise ValueError("CDRO time grid must have positive total length.")
     beta_budget_by_step = float(total_budget) * dt / total_tau
     return dt, beta_budget_by_step
 
@@ -140,6 +179,30 @@ def build_constraint_radii(
     return torch.sqrt(radius_sq.clamp_min(0.0))
 
 
+def build_constraint_radii_for_objective(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    total_budget: float,
+    time_horizon: float,
+) -> torch.Tensor:
+    """Exact Route-A local caps for the configured objective family."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    if n_steps <= 0:
+        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+    if total_budget < 0:
+        raise ValueError(f"total_budget must be >= 0, got {total_budget}")
+    dt, beta_budget_by_step = _build_beta_budget_by_step_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        total_budget=total_budget,
+        time_horizon=time_horizon,
+    )
+    radius_sq = dt * beta_budget_by_step
+    return torch.sqrt(radius_sq.clamp_min(0.0))
+
+
 def _build_beta_radii_by_step(
     sigma_levels: torch.Tensor,
     total_budget: float,
@@ -148,6 +211,24 @@ def _build_beta_radii_by_step(
     """Per-step beta-space radii with ||beta_k||^2 <= rho * Delta tau_k / T_tau."""
 
     _, beta_budget_by_step = _build_beta_budget_by_step(sigma_levels, total_budget, time_horizon)
+    return torch.sqrt(beta_budget_by_step.clamp_min(0.0))
+
+
+def _build_beta_radii_by_step_for_objective(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    total_budget: float,
+    time_horizon: float,
+) -> torch.Tensor:
+    """Per-step beta-space radii for the configured objective family."""
+
+    _, beta_budget_by_step = _build_beta_budget_by_step_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        total_budget=total_budget,
+        time_horizon=time_horizon,
+    )
     return torch.sqrt(beta_budget_by_step.clamp_min(0.0))
 
 
@@ -163,6 +244,23 @@ def _l2_normalize_per_sample(value: torch.Tensor, eps: float = 1e-12) -> torch.T
     flat = value.reshape(value.shape[0], -1)
     norm = flat.norm(p=2, dim=1, keepdim=True).clamp_min(eps)
     return (flat / norm).reshape_as(value)
+
+
+def _rf_terminal_noise(
+    *,
+    x0: torch.Tensor,
+    sigma_levels: torch.Tensor,
+    eps_schedule: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Resolve one terminal-noise sample per batch element for RF forward paths."""
+
+    if eps_schedule is None:
+        terminal_eps = torch.randn_like(x0)
+    elif eps_schedule.ndim == x0.ndim + 1:
+        terminal_eps = eps_schedule[-1].to(device=x0.device, dtype=x0.dtype)
+    else:
+        terminal_eps = eps_schedule.to(device=x0.device, dtype=x0.dtype)
+    return terminal_eps * float(sigma_levels[-1].item())
 
 
 def rollout_path_heuristic_attack(
@@ -193,10 +291,21 @@ def rollout_path_heuristic_attack(
     if time_horizon <= 0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
 
-    dt = build_time_deltas(sigma_levels, time_horizon)
+    dt = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
     sqrt_dt = torch.sqrt(dt.clamp_min(0.0))
-    beta_radius_by_step = _build_beta_radii_by_step(sigma_levels, total_budget, time_horizon)
+    beta_radius_by_step = _build_beta_radii_by_step_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        total_budget=total_budget,
+        time_horizon=time_horizon,
+    )
     amp_dtype = resolve_amp_dtype(x0.device, getattr(cfg, "amp_dtype", "auto"))
+    rf_objective = _is_rf_objective(cfg)
+    z_terminal = (
+        _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
+        if rf_objective
+        else None
+    )
 
     x_ref = x0.detach()
     x_ctrl = x0.detach()
@@ -211,10 +320,13 @@ def rollout_path_heuristic_attack(
     for k in range(n_steps):
         sigma_k = sigma_levels[k]
         sigma_next = sigma_levels[k + 1]
-        delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
-        eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
-
-        base_increment = delta_sigma * eps
+        if rf_objective:
+            delta_t = float(dt[k].item())
+            base_increment = delta_t * (z_terminal - x0)
+        else:
+            delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+            eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
+            base_increment = delta_sigma * eps
         reference_state = (x_ref + base_increment).detach()
         x_nominal_next = (x_ctrl + base_increment).detach()
         sigma_batch = _as_sigma_batch(sigma_next, batch_size, x0)
@@ -286,6 +398,7 @@ def rollout_controlled_ve(
     eps_schedule: Optional[torch.Tensor] = None,
     total_budget: Optional[float] = None,
     time_horizon: float = 1.0,
+    cfg=None,
 ) -> RolloutResult:
     """Reference VE rollout for CDRO.
 
@@ -300,7 +413,16 @@ def rollout_controlled_ve(
     n_steps = int(sigma_levels.numel() - 1)
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
-    _ = build_time_deltas(sigma_levels, time_horizon)
+    rf_objective = bool(cfg is not None and _is_rf_objective(cfg))
+    if cfg is not None:
+        _ = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
+    else:
+        _ = build_time_deltas(sigma_levels, time_horizon)
+    z_terminal = (
+        _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
+        if rf_objective
+        else None
+    )
 
     x_ref = x0
     path_ref = [x_ref]
@@ -311,9 +433,14 @@ def rollout_controlled_ve(
     for k in range(n_steps):
         sigma_k = sigma_levels[k]
         sigma_next = sigma_levels[k + 1]
-        delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
-        eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
-        x_ref = x_ref + delta_sigma * eps
+        if rf_objective:
+            t_levels = rf_time_levels_from_sigma_levels(sigma_levels).to(device=x0.device, dtype=x0.dtype)
+            delta_t = float((t_levels[k + 1] - t_levels[k]).item())
+            x_ref = x_ref + delta_t * (z_terminal - x0)
+        else:
+            delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+            eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
+            x_ref = x_ref + delta_sigma * eps
         path_ref.append(x_ref)
         path_ctrl.append(x_ref)
         path_delta.append(torch.zeros_like(x_ref))

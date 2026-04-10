@@ -125,6 +125,11 @@ def train_trajectory_robust_wdro(
     return_state: bool = False,
 ):
     del control, centers, sample_train_batch_fn, sample_population_batch_fn
+    if str(getattr(cfg, "training_objective", "edm")).lower() == "rf":
+        raise NotImplementedError(
+            "method_version='wdro' does not yet implement rectified-flow training states. "
+            "Wild-Diffusion RF is a follow-up after the baseline RF and CDRO-RF milestone."
+        )
 
     if train_pool is None:
         raise RuntimeError("WDRO trainer requires a finite train_pool so it can rebuild the augmented dataset.")

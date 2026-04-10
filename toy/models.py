@@ -30,6 +30,7 @@ class ToyEDMDenoiser(nn.Module):
 
     def __init__(self, hidden_dim: int = 128, sigma_data: float = 0.5):
         super().__init__()
+        self.generative_family = "ve"
         self.sigma_data = float(sigma_data)
         self.model = nn.Sequential(
             nn.Linear(2 + 3, hidden_dim),
@@ -63,6 +64,7 @@ class ToyScoreModel(nn.Module):
 
     def __init__(self, hidden_dim: int = 128, sigma_data: float = 0.5):
         super().__init__()
+        self.generative_family = "ve"
         self.sigma_data = float(sigma_data)
         self.model = nn.Sequential(
             nn.Linear(2 + 3, hidden_dim),
@@ -85,6 +87,35 @@ class ToyScoreModel(nn.Module):
         sigma = sigma.clamp_min(1e-6)
         score = self.predict_score(x, sigma)
         return x + batch_scalar_like(sigma.square(), x) * score
+
+
+class ToyRectifiedFlowModel(nn.Module):
+    """2D MLP rectified-flow velocity model with x0-compatible forward output."""
+
+    def __init__(self, hidden_dim: int = 128, sigma_max: float = 1.0):
+        super().__init__()
+        self.generative_family = "rectified_flow"
+        self.sigma_max = max(float(sigma_max), 1e-8)
+        self.model = nn.Sequential(
+            nn.Linear(2 + 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def _time(self, sigma: torch.Tensor) -> torch.Tensor:
+        return (sigma / self.sigma_max).clamp(0.0, 1.0)
+
+    def predict_velocity(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        t = self._time(sigma)
+        h = torch.cat([x, time_features(t)], dim=1)
+        return self.model(h)
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        t = self._time(sigma).clamp_min(1e-8)
+        velocity = self.predict_velocity(x, sigma)
+        return x - batch_scalar_like(t, x) * velocity
 
 
 class ControlNet(nn.Module):
@@ -152,6 +183,7 @@ class ImageEDMDenoiser(nn.Module):
 
     def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_data: float = 0.5, num_blocks: int = 4):
         super().__init__()
+        self.generative_family = "ve"
         self.sigma_data = float(sigma_data)
         self.in_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
         self.noise_mlp = nn.Sequential(
@@ -187,6 +219,7 @@ class ImageScoreModel(nn.Module):
 
     def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_data: float = 0.5, num_blocks: int = 4):
         super().__init__()
+        self.generative_family = "ve"
         self.sigma_data = float(sigma_data)
         self.in_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
         self.noise_mlp = nn.Sequential(
@@ -215,6 +248,41 @@ class ImageScoreModel(nn.Module):
         sigma = sigma.clamp_min(1e-6)
         score = self.predict_score(x, sigma)
         return x + batch_scalar_like(sigma.square(), x) * score
+
+
+class ImageRectifiedFlowModel(nn.Module):
+    """Small convolutional rectified-flow model with x0-compatible forward output."""
+
+    def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_max: float = 1.0, num_blocks: int = 4):
+        super().__init__()
+        self.generative_family = "rectified_flow"
+        self.sigma_max = max(float(sigma_max), 1e-8)
+        self.in_conv = nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.blocks = nn.ModuleList([_ConvResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.out_norm = nn.GroupNorm(_num_groups(hidden_dim), hidden_dim)
+        self.out_conv = nn.Conv2d(hidden_dim, in_channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+
+    def _time(self, sigma: torch.Tensor) -> torch.Tensor:
+        return (sigma / self.sigma_max).clamp(0.0, 1.0)
+
+    def predict_velocity(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        t = self._time(sigma)
+        cond = self.time_mlp(time_features(t))
+        h = self.in_conv(x)
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.out_conv(self.act(self.out_norm(h)))
+
+    def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        t = self._time(sigma).clamp_min(1e-8)
+        velocity = self.predict_velocity(x, sigma)
+        return x - batch_scalar_like(t, x) * velocity
 
 
 class ImageControlNet(nn.Module):

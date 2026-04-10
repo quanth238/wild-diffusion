@@ -49,9 +49,9 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--baseline-steps-override must be >= 0, got {cfg.baseline_steps_override}")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
-    if cfg.training_objective not in ("edm", "score"):
+    if cfg.training_objective not in ("edm", "score", "rf"):
         raise ValueError(
-            f"--training-objective must be one of ('edm', 'score'), got {cfg.training_objective}"
+            f"--training-objective must be one of ('edm', 'score', 'rf'), got {cfg.training_objective}"
         )
     if cfg.score_matching_weight_power < 0:
         raise ValueError(
@@ -295,7 +295,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-phi", type=float, default=ToyConfig.lr_phi)
     parser.add_argument("--inner-steps", type=int, default=ToyConfig.inner_steps)
     parser.add_argument("--clip-phi-grad", type=float, default=ToyConfig.clip_phi_grad)
-    parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score"])
+    parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score", "rf"])
     parser.add_argument("--score-matching-weight-power", type=float, default=ToyConfig.score_matching_weight_power)
 
     parser.add_argument("--n-modes", type=int, default=ToyConfig.n_modes)

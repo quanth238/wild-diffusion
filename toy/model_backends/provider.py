@@ -6,8 +6,10 @@ from ..models import (
     ControlNet,
     ImageControlNet,
     ImageEDMDenoiser,
+    ImageRectifiedFlowModel,
     ImageScoreModel,
     ToyEDMDenoiser,
+    ToyRectifiedFlowModel,
     ToyScoreModel,
 )
 
@@ -26,8 +28,8 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
     """Factory for denoiser/control backends used by the toy protocol."""
 
     objective = str(getattr(cfg, "training_objective", "edm")).lower()
-    if objective not in ("edm", "score"):
-        raise ValueError(f"Unsupported training_objective='{objective}'. Expected one of: edm, score.")
+    if objective not in ("edm", "score", "rf"):
+        raise ValueError(f"Unsupported training_objective='{objective}'. Expected one of: edm, score, rf.")
 
     model_kind = cfg.model_kind
     if model_kind == "auto":
@@ -53,11 +55,19 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
                 f"got data_shape={dataset.data_shape}"
             )
         channels = int(dataset.data_shape[0])
-        denoiser_cls = ImageEDMDenoiser if objective == "edm" else ImageScoreModel
+        if objective == "edm":
+            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
+            denoiser_cls = ImageEDMDenoiser
+        elif objective == "score":
+            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
+            denoiser_cls = ImageScoreModel
+        else:
+            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_max=cfg.sigma_max)
+            denoiser_cls = ImageRectifiedFlowModel
         return ModelBundle(
             name=f"image_conv_{objective}",
-            baseline=denoiser_cls(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
-            robust=denoiser_cls(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data).to(device),
+            baseline=denoiser_cls(**denoiser_kwargs).to(device),
+            robust=denoiser_cls(**denoiser_kwargs).to(device),
             control=ImageControlNet(in_channels=channels, hidden_dim=cfg.hidden_dim).to(device),
         )
 
@@ -67,10 +77,18 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
             f"got data_shape={dataset.data_shape}"
         )
 
-    denoiser_cls = ToyEDMDenoiser if objective == "edm" else ToyScoreModel
+    if objective == "edm":
+        denoiser_cls = ToyEDMDenoiser
+        denoiser_kwargs = dict(hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
+    elif objective == "score":
+        denoiser_cls = ToyScoreModel
+        denoiser_kwargs = dict(hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
+    else:
+        denoiser_cls = ToyRectifiedFlowModel
+        denoiser_kwargs = dict(hidden_dim=cfg.hidden_dim, sigma_max=cfg.sigma_max)
     return ModelBundle(
         name=f"toy_mlp_{objective}",
-        baseline=denoiser_cls(cfg.hidden_dim, sigma_data=sigma_data).to(device),
-        robust=denoiser_cls(cfg.hidden_dim, sigma_data=sigma_data).to(device),
+        baseline=denoiser_cls(**denoiser_kwargs).to(device),
+        robust=denoiser_cls(**denoiser_kwargs).to(device),
         control=ControlNet(cfg.hidden_dim).to(device),
     )

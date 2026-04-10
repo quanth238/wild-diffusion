@@ -25,10 +25,10 @@ from toy.config import ToyConfig  # noqa: E402
 from toy.data_backends.provider import build_dataset_bundle  # noqa: E402
 from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
-from toy.shared.reverse import reverse_posterior_mean, reverse_posterior_std  # noqa: E402
+from toy.shared.reverse import sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
 from toy.shared.sigma import build_sigma_levels  # noqa: E402
-from toy.utils import batch_scalar_like, ensure_dir, pick_device, set_seed  # noqa: E402
+from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
 
 
 _APPLIED_PROCESS_TITLE = apply_process_title()
@@ -163,7 +163,7 @@ def _safe_bool(value, *, default: bool = False) -> bool:
 
 
 def _parse_method_filter(text: str) -> Optional[set]:
-    methods = {token.strip() for token in str(text).split(",") if token.strip()}
+    methods = {_canonical_robust_method(token) for token in str(text).split(",") if token.strip()}
     return None if not methods else methods
 
 
@@ -189,10 +189,21 @@ def _row_step(row: Dict[str, str]) -> int:
     return _safe_int(row.get("step"), 0)
 
 
+def _canonical_robust_method(method_name: str) -> str:
+    method = str(method_name or "").strip().lower()
+    if method in {"baseline", "baseline_edm", "baseline_rf", "baseline_score"}:
+        return "baseline"
+    if method in {"wdro", "wild", "wild_diffusion"}:
+        return "wild_diffusion"
+    if method == "cdro":
+        return "cdro"
+    return method or "unknown"
+
+
 def _is_baseline_style_row(row: Dict[str, str]) -> bool:
-    method = str(row.get("method", "")).strip()
+    robust_method = _canonical_robust_method(row.get("robust_method", row.get("method", "")))
     row_origin = str(row.get("row_origin", "")).strip()
-    return method == "baseline_edm" or row_origin == "trajectory_warmup_phase"
+    return robust_method == "baseline" or row_origin == "trajectory_warmup_phase"
 
 
 def _checkpoint_branch(row: Dict[str, str]) -> str:
@@ -204,7 +215,7 @@ def _metrics_fid_key(row: Dict[str, str]) -> str:
 
 
 def _exp_name_from_row(prefix: str, row: Dict[str, str], occurrence_index: int) -> str:
-    method = str(row.get("method", "")).strip()
+    method = _canonical_robust_method(row.get("robust_method", row.get("method", "")))
     row_origin = str(row.get("row_origin", "")).strip() or "row"
     seed = _row_seed(row)
     step = _row_step(row)
@@ -291,20 +302,16 @@ def _sample_reverse_x0(
     amp_dtype: Optional[torch.dtype],
     sample_terminal_batch_fn,
 ) -> torch.Tensor:
-    x = sample_terminal_batch_fn(n_samples, sigma_levels[-1]).to(device=device)
-    n_steps = sigma_levels.numel() - 1
-    for k in range(n_steps, 0, -1):
-        sigma = torch.full((n_samples,), sigma_levels[k], device=device, dtype=x.dtype)
-        sigma_prev = torch.full((n_samples,), sigma_levels[k - 1], device=device, dtype=x.dtype)
-        with autocast_context(device, amp_dtype):
-            x0_pred = denoiser(x, sigma)
-            mean = reverse_posterior_mean(x, x0_pred, sigma, sigma_prev)
-        if k > 1:
-            std = reverse_posterior_std(sigma, sigma_prev)
-            x = mean + batch_scalar_like(std, x) * torch.randn_like(x)
-        else:
-            x = mean
-    return x
+    with autocast_context(device, amp_dtype):
+        states = sample_reverse_paths(
+            denoiser=denoiser,
+            sigma_levels=sigma_levels,
+            n_samples=n_samples,
+            device=device,
+            stochastic=True,
+            sample_terminal_batch_fn=sample_terminal_batch_fn,
+        )
+    return states[:, 0]
 
 
 @torch.no_grad()
@@ -384,8 +391,8 @@ def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
 
 def _load_robust_state_dict(ckpt_path: str, method_name: str) -> Dict[str, torch.Tensor]:
     payload = _load_checkpoint_payload(ckpt_path)
-    saved_method = str(payload.get("method_name", "")).strip().lower()
-    expected_method = str(method_name).strip().lower()
+    saved_method = _canonical_robust_method(payload.get("method_name", ""))
+    expected_method = _canonical_robust_method(method_name)
     if saved_method and saved_method != expected_method:
         raise RuntimeError(
             f"Robust resume checkpoint method mismatch: current={expected_method} saved={saved_method} ({ckpt_path})"
@@ -469,6 +476,18 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
         source_cfg = payload.get("config", {})
         if isinstance(source_cfg, dict):
             _apply_cfg_overrides(cfg, source_cfg)
+    if row.get("training_objective"):
+        cfg.training_objective = str(row.get("training_objective"))
+    if row.get("n_steps_path"):
+        cfg.n_steps_path = _safe_int(row.get("n_steps_path"), cfg.n_steps_path)
+    if row.get("sigma_min"):
+        sigma_min = _safe_float(row.get("sigma_min"))
+        if sigma_min is not None:
+            cfg.sigma_min = float(sigma_min)
+    if row.get("sigma_max"):
+        sigma_max = _safe_float(row.get("sigma_max"))
+        if sigma_max is not None:
+            cfg.sigma_max = float(sigma_max)
     cfg.amp_dtype = args.amp_dtype
     cfg.outdir = args.outdir
     cfg.exp_name = args.prefix
@@ -602,6 +621,10 @@ def _write_metrics_payload(
         },
         "row": {
             "method": str(row.get("method", "")),
+            "robust_method": str(row.get("robust_method", "")),
+            "backbone_family": str(row.get("backbone_family", "")),
+            "series_key": str(row.get("series_key", "")),
+            "series_label": str(row.get("series_label", "")),
             "row_origin": str(row.get("row_origin", "")),
             "seed": int(_row_seed(row)),
             "step": int(_row_step(row)),
@@ -734,7 +757,7 @@ def _run_plot_command(
 
 
 def _row_matches_filters(args: argparse.Namespace, row: Dict[str, str], methods_filter: Optional[set]) -> bool:
-    if methods_filter is not None and str(row.get("method", "")).strip() not in methods_filter:
+    if methods_filter is not None and _canonical_robust_method(row.get("robust_method", row.get("method", ""))) not in methods_filter:
         return False
     if bool(args.respect_fid_selection) and not _safe_bool(row.get("fid_eval_selected"), default=True):
         return False

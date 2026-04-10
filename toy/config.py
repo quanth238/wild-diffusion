@@ -64,7 +64,7 @@ class ToyConfig:
     lr_phi: float = 5e-4
     inner_steps: int = 1
     clip_phi_grad: float = 1.0
-    training_objective: str = "edm"  # edm|score
+    training_objective: str = "edm"  # edm|score|rf
     score_matching_weight_power: float = 2.0  # lambda(sigma)=sigma^p in score objective
 
     # Data.

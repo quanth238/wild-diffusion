@@ -1,4 +1,4 @@
-from ..wild.diffusion import build_kappa_schedule, rollout_controlled_ve
+from ..cdro.diffusion import build_kappa_schedule, rollout_controlled_ve
 from .trainer import train_trajectory_robust_wdro
 
 NAME = "wdro"

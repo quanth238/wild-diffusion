@@ -393,16 +393,29 @@ def _rollout_for_eval(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
         )
-    return method.rollout_controlled_ve(
-        x0=x0,
-        target_indices=target_indices,
-        control_net=control,
-        sigma_levels=sigma_levels,
-        grad_through_control=False,
-        control_radius_kappa=cfg.control_radius_kappa,
-        kappa_by_step=kappa_by_step,
-        **rollout_kwargs,
-    )
+    try:
+        return method.rollout_controlled_ve(
+            x0=x0,
+            target_indices=target_indices,
+            control_net=control,
+            sigma_levels=sigma_levels,
+            grad_through_control=False,
+            control_radius_kappa=cfg.control_radius_kappa,
+            kappa_by_step=kappa_by_step,
+            cfg=cfg,
+            **rollout_kwargs,
+        )
+    except TypeError:
+        return method.rollout_controlled_ve(
+            x0=x0,
+            target_indices=target_indices,
+            control_net=control,
+            sigma_levels=sigma_levels,
+            grad_through_control=False,
+            control_radius_kappa=cfg.control_radius_kappa,
+            kappa_by_step=kappa_by_step,
+            **rollout_kwargs,
+        )
 
 
 def _empty_baseline_history() -> Dict:
@@ -1261,6 +1274,7 @@ def run_experiment(cfg) -> dict:
                 train_pool=dataset.train_pool,
                 sample_train_batch_fn=dataset.sample_train_batch,
                 sample_population_batch_fn=dataset.sample_population_batch,
+                sample_terminal_batch_fn=dataset.sample_terminal_batch,
             )
             runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
             if baseline_ckpt_enabled:

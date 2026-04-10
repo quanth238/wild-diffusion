@@ -7,7 +7,7 @@ from ..compute_accounting import append_denoiser_op_count_step, ensure_denoiser_
 from ..models import set_requires_grad
 from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
-from .objective import compute_training_loss, weighted_denoise_loss
+from .objective import build_training_state, compute_training_loss, weighted_denoise_loss
 from .reverse import sample_reverse_paths
 from .sigma import sample_target_indices, sample_target_indices_log_normal
 from .train_utils import sample_train_batch
@@ -21,8 +21,9 @@ def train_baseline(
     train_pool: torch.Tensor = None,
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
+    sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
 ):
-    """Train baseline denoiser theta on standard EDM weighted denoising loss."""
+    """Train baseline model theta under the configured generative objective."""
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     history = {"loss": [], "proxy_weighted_denoise_loss": []}
@@ -54,7 +55,12 @@ def train_baseline(
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
         sigma_counts += torch.bincount(indices - 1, minlength=sigma_counts.numel())
         sigma = sigma_levels[indices]
-        x_noisy = x0 + batch_scalar_like(sigma, x0) * torch.randn_like(x0)
+        x_noisy = build_training_state(
+            cfg=cfg,
+            x_clean=x0,
+            sigma=sigma,
+            sample_terminal_batch_fn=sample_terminal_batch_fn,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(sigma_levels.device, amp_dtype):

@@ -217,6 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--fid-gen-batch", type=int, default=2048)
@@ -485,6 +486,64 @@ def _ensure_row_fid_fields(row: Dict) -> Dict:
         }
     )
     return out
+
+
+def _backbone_family(training_objective: str) -> str:
+    objective = str(training_objective).strip().lower()
+    if objective == "rf":
+        return "rf"
+    if objective == "score":
+        return "score"
+    return "edm"
+
+
+def _backbone_label(training_objective: str) -> str:
+    family = _backbone_family(training_objective)
+    if family == "rf":
+        return "Rectified Flow"
+    if family == "score":
+        return "Score VE"
+    return "EDM"
+
+
+def _canonical_robust_method(method_name: str) -> str:
+    method = str(method_name).strip().lower()
+    if method in {"baseline", "baseline_edm", "baseline_rf", "baseline_score"}:
+        return "baseline"
+    if method in {"wdro", "wild", "wild_diffusion"}:
+        return "wild_diffusion"
+    if method == "cdro":
+        return "cdro"
+    return method
+
+
+def _robust_label(method_name: str) -> str:
+    robust_method = _canonical_robust_method(method_name)
+    if robust_method == "baseline":
+        return "Baseline"
+    if robust_method == "wild_diffusion":
+        return "Wild-Diffusion"
+    if robust_method == "cdro":
+        return "CDRO"
+    return robust_method.replace("_", " ").title()
+
+
+def _series_fields(*, method_name: str, training_objective: str, method_version_used: Optional[str] = None) -> Dict[str, str]:
+    robust_method = _canonical_robust_method(method_name)
+    backbone_family = _backbone_family(training_objective)
+    backbone_label = _backbone_label(training_objective)
+    robust_label = _robust_label(method_name)
+    return {
+        "method": robust_method,
+        "method_version_used": str(method_version_used or method_name),
+        "robust_method": robust_method,
+        "robust_label": robust_label,
+        "backbone_family": backbone_family,
+        "backbone_label": backbone_label,
+        "training_objective": str(training_objective),
+        "series_key": f"{robust_method}_{backbone_family}",
+        "series_label": f"{robust_label} {backbone_label}",
+    }
 
 
 def _summary_stat(series, stat_name: str) -> Optional[float]:
@@ -1022,7 +1081,6 @@ def _normalize_baseline_runs(*, runs_csv: str, args: argparse.Namespace) -> List
         out.append(
             _apply_wall_clock_accounting(
                 row={
-                    "method": "baseline_edm",
                     "seed": int(row["seed"]),
                     "step": int(row["step"]),
                     "fid": fid_value,
@@ -1042,6 +1100,11 @@ def _normalize_baseline_runs(*, runs_csv: str, args: argparse.Namespace) -> List
                     "fid_evaluated": bool(fid_evaluated),
                     "fid_missing_reason": str(fid_missing_reason),
                     "fid_source": str(fid_source),
+                    **_series_fields(
+                        method_name="baseline",
+                        training_objective=str(args.training_objective),
+                        method_version_used="baseline",
+                    ),
                     **_empty_objective_debug_fields(),
                 },
                 args=args,
@@ -1102,7 +1165,6 @@ def _extract_wdro_row(
         else _optional_float(sample_quality.get("robust_fid"))
     )
     row = {
-        "method": "wdro",
         "step": int(total_steps_requested),
         "compute_budget_be": float(total_compute_be_effective),
         "baseline_compute_be": float(baseline_compute_be_effective),
@@ -1141,6 +1203,11 @@ def _extract_wdro_row(
         "phase_step_split_mode": str(flow["phase_step_split_mode"]),
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
+        ),
+        **_series_fields(
+            method_name="wdro",
+            training_objective=str(flow.get("training_objective", getattr(args, "training_objective", "edm"))),
+            method_version_used="wdro",
         ),
         **_objective_debug_fields(objective=objective),
     }
@@ -1207,7 +1274,6 @@ def _extract_cdro_row(
         else _optional_float(sample_quality.get("robust_fid"))
     )
     row = {
-        "method": "cdro",
         "step": int(total_steps_requested),
         "compute_budget_be": float(total_compute_be_effective),
         "baseline_compute_be": float(baseline_compute_be_effective),
@@ -1243,6 +1309,11 @@ def _extract_cdro_row(
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
+        **_series_fields(
+            method_name="cdro",
+            training_objective=str(flow.get("training_objective", getattr(args, "training_objective", "edm"))),
+            method_version_used="cdro",
+        ),
         **_objective_debug_fields(objective=objective),
     }
     row.update(
@@ -1266,7 +1337,7 @@ def _normalize_method_metrics_row(
     fixed_warmup_steps: int,
 ) -> Dict:
     out = dict(row)
-    out["method"] = str(method_name)
+    out["method_version_used"] = str(out.get("method_version_used", method_name))
     out["seed"] = int(seed)
     out["row_origin"] = str(row_origin)
     out["row_role"] = "comparison_knot"
@@ -1291,7 +1362,13 @@ def _transfer_baseline_row_to_method(
     row_origin: str = "trajectory_warmup_phase",
 ) -> Dict:
     row = dict(baseline_row)
-    row["method"] = str(method_name)
+    row.update(
+        _series_fields(
+            method_name=method_name,
+            training_objective=str(row.get("training_objective", "")),
+            method_version_used=method_name,
+        )
+    )
     row["row_origin"] = str(row_origin)
     row["weighted_grid_target"] = float(weighted_grid_target)
     row["comparison_weighted_targets"] = _encode_float_list([float(weighted_grid_target)])
@@ -1323,7 +1400,13 @@ def _transfer_baseline_row_to_aux_warmup_support(
     fixed_warmup_steps: int,
 ) -> Dict:
     row = dict(baseline_row)
-    row["method"] = str(method_name)
+    row.update(
+        _series_fields(
+            method_name=method_name,
+            training_objective=str(row.get("training_objective", "")),
+            method_version_used=method_name,
+        )
+    )
     row["row_origin"] = "trajectory_warmup_phase"
     weighted_compute_units = _optional_float(baseline_row.get("weighted_compute_units"))
     row["weighted_grid_target"] = 0.0 if weighted_compute_units is None else float(weighted_compute_units)
@@ -1384,6 +1467,8 @@ def _build_baseline_sweep_cmd(
         str(args.batch_size),
         "--hidden-dim",
         str(args.hidden_dim),
+        "--training-objective",
+        str(args.training_objective),
         "--n-steps-path",
         str(args.n_steps_path),
         "--sigma-min",
@@ -1493,6 +1578,8 @@ def _build_run_toy_cmd(
         str(args.sigma_max),
         "--fid-ref-path",
         args.fid_ref_path,
+        "--training-objective",
+        str(args.training_objective),
         "--method-version",
         method_name,
         "--disable-baseline-gate",
@@ -2029,7 +2116,7 @@ def main() -> None:
         reused_rows = [
             _apply_wall_clock_accounting(row=_ensure_row_fid_fields(row), args=args)
             for row in load_csv_rows(reused_wdro_raw_csv)
-            if str(row.get("method", "")) == "wdro" and int(row["seed"]) in seeds
+            if _canonical_robust_method(str(row.get("method", ""))) == "wild_diffusion" and int(row["seed"]) in seeds
         ]
         if not reused_rows:
             raise RuntimeError(f"No WDRO rows found in reused raw CSV for seeds={seeds}: {reused_wdro_raw_csv}")
@@ -2290,9 +2377,9 @@ def main() -> None:
     posthoc_reeval_log_path = None
     posthoc_methods: List[str] = []
     if baseline_fid_posthoc:
-        posthoc_methods.append("baseline_edm")
+        posthoc_methods.append("baseline")
     if robust_fid_posthoc:
-        posthoc_methods.extend(["wdro", "cdro"])
+        posthoc_methods.extend(["wild_diffusion", "cdro"])
     if posthoc_methods:
         reeval_cmd = _build_posthoc_reeval_cmd(
             args=args,
@@ -2315,9 +2402,9 @@ def main() -> None:
         posthoc_reeval_manifest_path = os.path.join(args.outdir, f"{args.prefix}_reeval_manifest.json")
         combined_raw = [_ensure_row_fid_fields(row) for row in load_csv_rows(combined_raw_csv)]
         combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
-        baseline_target_rows = [row for row in combined_raw if str(row.get("method", "")) == "baseline_edm"]
+        baseline_target_rows = [row for row in combined_raw if str(row.get("method", "")) == "baseline"]
         baseline_all_eval_rows = list(baseline_target_rows)
-        wdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "wdro"]
+        wdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "wild_diffusion"]
         cdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "cdro"]
         combined_by_key = {
             (
@@ -2328,12 +2415,15 @@ def main() -> None:
             ): row
             for row in combined_raw
         }
-        for method_name, seed_manifests in (("wdro", wdro_seed_manifests), ("cdro", cdro_seed_manifests)):
+        for method_name, row_method_name, seed_manifests in (
+            ("wdro", "wild_diffusion", wdro_seed_manifests),
+            ("cdro", "cdro", cdro_seed_manifests),
+        ):
             for seed_manifest in seed_manifests:
                 for checkpoint_entry in seed_manifest.get("robust_checkpoints", []):
                     row = combined_by_key.get(
                         (
-                            str(method_name),
+                            str(row_method_name),
                             int(checkpoint_entry.get("seed", 0)),
                             int(checkpoint_entry.get("step", 0)),
                             "trajectory_robust_phase",

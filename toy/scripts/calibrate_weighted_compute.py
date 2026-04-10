@@ -15,10 +15,10 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from toy.config import ToyConfig
-from toy.models import ImageEDMDenoiser, ImageScoreModel
-from toy.shared.objective import compute_training_loss
+from toy.models import ImageEDMDenoiser, ImageRectifiedFlowModel, ImageScoreModel
+from toy.shared.objective import build_training_state, compute_training_loss
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
-from toy.utils import batch_scalar_like, ensure_dir, pick_device, set_seed
+from toy.utils import ensure_dir, pick_device, set_seed
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-tf32", action="store_true")
     parser.add_argument("--disable-cudnn-benchmark", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score"])
+    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--score-matching-weight-power", type=float, default=2.0)
     parser.add_argument("--image-size", type=int, default=28)
     parser.add_argument("--image-channels", type=int, default=3)
@@ -69,12 +69,28 @@ def build_cfg(args: argparse.Namespace) -> ToyConfig:
 
 
 def build_denoiser(cfg: ToyConfig, device: torch.device) -> torch.nn.Module:
-    denoiser_cls = ImageEDMDenoiser if cfg.training_objective == "edm" else ImageScoreModel
-    denoiser = denoiser_cls(
-        in_channels=int(cfg.image_channels),
-        hidden_dim=int(cfg.hidden_dim),
-        sigma_data=float(cfg.sigma_data),
-    ).to(device)
+    if cfg.training_objective == "edm":
+        denoiser_cls = ImageEDMDenoiser
+        denoiser_kwargs = dict(
+            in_channels=int(cfg.image_channels),
+            hidden_dim=int(cfg.hidden_dim),
+            sigma_data=float(cfg.sigma_data),
+        )
+    elif cfg.training_objective == "score":
+        denoiser_cls = ImageScoreModel
+        denoiser_kwargs = dict(
+            in_channels=int(cfg.image_channels),
+            hidden_dim=int(cfg.hidden_dim),
+            sigma_data=float(cfg.sigma_data),
+        )
+    else:
+        denoiser_cls = ImageRectifiedFlowModel
+        denoiser_kwargs = dict(
+            in_channels=int(cfg.image_channels),
+            hidden_dim=int(cfg.hidden_dim),
+            sigma_max=float(cfg.sigma_max),
+        )
+    denoiser = denoiser_cls(**denoiser_kwargs).to(device)
     return denoiser
 
 
@@ -92,8 +108,22 @@ def make_batch(cfg: ToyConfig, device: torch.device) -> tuple[torch.Tensor, torc
             float(torch.log(torch.tensor(cfg.sigma_max)).item()),
         )
     )
-    x_noisy = x_clean + batch_scalar_like(sigma, x_clean) * torch.randn_like(x_clean)
-    return x_noisy, x_clean, sigma
+    x_state = build_training_state(
+        cfg=cfg,
+        x_clean=x_clean,
+        sigma=sigma,
+        sample_terminal_batch_fn=lambda batch_size, terminal_sigma: (
+            torch.randn(
+                int(batch_size),
+                int(cfg.image_channels),
+                int(cfg.image_size),
+                int(cfg.image_size),
+                device=device,
+            )
+            * float(terminal_sigma)
+        ),
+    )
+    return x_state, x_clean, sigma
 
 
 def benchmark(op_name: str, fn, warmup_iters: int, measure_iters: int, device: torch.device) -> dict:

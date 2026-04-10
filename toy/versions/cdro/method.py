@@ -1,5 +1,5 @@
 from .diffusion import (
-    build_constraint_radii as build_constraint_radii_impl,
+    build_constraint_radii_for_objective as build_constraint_radii_impl,
     build_kappa_schedule,
     rollout_controlled_ve,
     rollout_path_heuristic_attack,
@@ -48,6 +48,7 @@ def build_constraint_radii_for_method(*, cfg, sigma_levels):
     """Method-scoped helper used by experiment metrics for exact sigma-time CDRO cap statistics."""
 
     return build_constraint_radii_impl(
+        cfg=cfg,
         sigma_levels=sigma_levels,
         total_budget=float(cfg.cdro_total_budget_rho),
         time_horizon=float(cfg.cdro_time_horizon),

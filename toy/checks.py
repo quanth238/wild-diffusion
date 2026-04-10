@@ -10,6 +10,15 @@ from .shared.sigma import sample_target_indices
 from .versions.registry import resolve_method_module
 
 
+def _rollout_controlled_ve_with_cfg(method, cfg, *args, **kwargs):
+    """Call rollout_controlled_ve with cfg when the method supports it."""
+
+    try:
+        return method.rollout_controlled_ve(*args, cfg=cfg, **kwargs)
+    except TypeError:
+        return method.rollout_controlled_ve(*args, **kwargs)
+
+
 def _sample_check_batch(cfg, batch_size: int, centers=None, sample_batch_fn=None) -> torch.Tensor:
     """Sample x0 for numerical checks from backend callback or toy GMM fallback."""
 
@@ -69,7 +78,9 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg, sample_batch_fn=No
         high_multiplier=cfg.kappa_high_multiplier,
         preserve_l2_budget=cfg.kappa_preserve_l2_budget,
     )
-    roll = method.rollout_controlled_ve(
+    roll = _rollout_controlled_ve_with_cfg(
+        method,
+        cfg,
         x0,
         idx,
         control,
@@ -133,7 +144,9 @@ def gradient_check_denoiser(
     )
 
     def loss_fn():
-        roll = method.rollout_controlled_ve(
+        roll = _rollout_controlled_ve_with_cfg(
+            method,
+            cfg,
             x0,
             idx,
             control,
@@ -193,7 +206,9 @@ def gradient_check_control(
     )
 
     def inner_fn():
-        roll = method.rollout_controlled_ve(
+        roll = _rollout_controlled_ve_with_cfg(
+            method,
+            cfg,
             x0,
             idx,
             control,

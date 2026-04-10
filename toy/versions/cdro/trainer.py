@@ -10,7 +10,7 @@ from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
-from .diffusion import build_constraint_radii, rollout_controlled_ve, rollout_path_heuristic_attack
+from .diffusion import build_constraint_radii_for_objective, rollout_controlled_ve, rollout_path_heuristic_attack
 
 
 def _beta_transport_cost(beta_path: torch.Tensor) -> torch.Tensor:
@@ -320,7 +320,8 @@ def train_trajectory_robust_cdro(
         set_requires_grad(ema_model, False)
         if ema_state_dict is not None:
             ema_model.load_state_dict(ema_state_dict, strict=True)
-    radius_by_step = build_constraint_radii(
+    radius_by_step = build_constraint_radii_for_objective(
+        cfg=cfg,
         sigma_levels=sigma_levels,
         total_budget=total_budget,
         time_horizon=time_horizon,
@@ -385,6 +386,7 @@ def train_trajectory_robust_cdro(
                     total_budget=total_budget,
                     time_horizon=time_horizon,
                     eps_schedule=eps_schedule,
+                    cfg=cfg,
                 )
             rollouts.append(roll)
         if attack_enabled:
@@ -549,6 +551,7 @@ def train_trajectory_robust_cdro(
                         kappa_by_step=None,
                         total_budget=total_budget,
                         time_horizon=time_horizon,
+                        cfg=cfg,
                     )
 
             with torch.no_grad():
@@ -566,6 +569,7 @@ def train_trajectory_robust_cdro(
                     kappa_by_step=None,
                     total_budget=total_budget,
                     time_horizon=time_horizon,
+                    cfg=cfg,
                 )
                 with autocast_context(sigma_levels.device, amp_dtype):
                     attack_zero = _path_average_training_loss(cfg, denoiser, roll_zero_diag.states_ctrl, x0, sigma_levels)

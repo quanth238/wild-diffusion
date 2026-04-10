@@ -40,7 +40,7 @@ if __package__ is None or __package__ == "":
     from toy.model_backends.provider import build_model_bundle
     from toy.models import set_requires_grad
     from toy.process_title import apply_process_title, build_process_title
-    from toy.shared.objective import compute_training_loss, weighted_denoise_loss
+    from toy.shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from toy.shared.reverse import sample_reverse_paths
     from toy.shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
     from toy.shared.train_utils import sample_train_batch
@@ -53,7 +53,7 @@ else:
     from ..model_backends.provider import build_model_bundle
     from ..models import set_requires_grad
     from ..process_title import apply_process_title, build_process_title
-    from ..shared.objective import compute_training_loss, weighted_denoise_loss
+    from ..shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from ..shared.reverse import sample_reverse_paths
     from ..shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
     from ..shared.train_utils import sample_train_batch
@@ -891,6 +891,15 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     return cfg
 
 
+def _objective_display_name(training_objective: str) -> str:
+    objective = str(training_objective).strip().lower()
+    if objective == "rf":
+        return "Rectified Flow"
+    if objective == "score":
+        return "Score VE"
+    return "EDM"
+
+
 def _run_combo(
     *,
     args,
@@ -1167,7 +1176,12 @@ def _run_combo(
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
         sigma_counts += torch.bincount(indices - 1, minlength=sigma_counts.numel())
         sigma = sigma_levels[indices]
-        x_noisy = x0 + batch_scalar_like(sigma, x0) * torch.randn_like(x0)
+        x_noisy = build_training_state(
+            cfg=cfg,
+            x_clean=x0,
+            sigma=sigma,
+            sample_terminal_batch_fn=dataset.sample_terminal_batch,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         with _autocast_context(device, amp_dtype):
@@ -1270,7 +1284,7 @@ def build_parser():
     parser.add_argument("--mnist-val-percent", type=float, default=100.0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score"])
+    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--n-steps-path", type=int, default=24)
     parser.add_argument("--sigma-min", type=float, default=0.01)
     parser.add_argument("--sigma-max", type=float, default=80.0)
@@ -1457,7 +1471,11 @@ def main() -> None:
                 rows=aggregates,
                 thresholds=thresholds,
                 out_path=fig_path,
-                title=f"{str(args.dataset_kind).replace('_', ' ').title()} Baseline EDM Convergence | threshold={args.threshold_pct:.1f}% of best median FID",
+                title=(
+                    f"{str(args.dataset_kind).replace('_', ' ').title()} Baseline "
+                    f"{_objective_display_name(args.training_objective)} Convergence | "
+                    f"threshold={args.threshold_pct:.1f}% of best median FID"
+                ),
                 dataset_label=str(args.dataset_kind).replace("_", " ").title(),
             )
             plot_written = True
@@ -1470,7 +1488,10 @@ def main() -> None:
         "protocol": {
             "name": f"{str(args.dataset_kind)}_checkpointed_baseline_convergence",
             "family": "from_scratch_curve",
-            "description": "Train baseline EDM once per subset+seed and evaluate intermediate checkpoints.",
+            "description": (
+                f"Train baseline {_objective_display_name(args.training_objective)} once per subset+seed "
+                "and evaluate intermediate checkpoints."
+            ),
             "primary_metric": "train_wall_clock_sec",
             "secondary_metric": "weighted_compute_units",
             "legacy_metric": "batch_equiv_denoiser_evals",
