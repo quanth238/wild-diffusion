@@ -114,6 +114,7 @@ class ToyConfig:
     # weighted-compute warmup share, then solves for the baseline warmup steps
     # needed to match that share under CDRO's more expensive robust steps.
     cdro_warmup_fraction: float = 0.05
+    cdro_antithetic_rollouts: bool = False
     # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
     v12_step_size: float = 0.02
     v12_lambda_init: float = 0.1

@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 DEFAULT_REPO_URL = "https://github.com/alvarobartt/simpsons-mnist"
-DEFAULT_CLONE_DIR = ".tmp/simpsons-mnist"
+DEFAULT_CLONE_DIR = ".tmp/simpsons-mnist-src"
 DEFAULT_OUT_ROOT = "toy_data/simpsons_mnist_rgb"
 DEFAULT_FID_REF_NAME = "simpsons_mnist_rgb_test_28x28.npz"
 
@@ -23,6 +23,13 @@ def _repo_root() -> Path:
 
 def _clone_or_update(repo_url: str, clone_dir: Path) -> str:
     clone_dir.parent.mkdir(parents=True, exist_ok=True)
+    if (clone_dir / ".git").is_file() or (clone_dir / ".git").is_dir():
+        pass
+    elif clone_dir.exists():
+        raise SystemExit(
+            "[error] clone_dir already exists but is not a standalone git checkout: "
+            f"{clone_dir}. Pick a different --clone-dir."
+        )
     if not clone_dir.exists():
         subprocess.run(["git", "clone", "--depth", "1", repo_url, str(clone_dir)], check=True)
     else:

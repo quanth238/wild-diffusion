@@ -193,6 +193,8 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "off", "bfloat16", "float16", "bf16", "fp16", "half"],
     )
+    parser.add_argument("--use-ema-eval", action="store_true")
+    parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--dataset-path", type=str, default=DEFAULT_TRAIN_ROOT)
     parser.add_argument("--dataset-val-path", type=str, default=DEFAULT_VAL_ROOT)
     parser.add_argument("--fid-ref-path", type=str, default=DEFAULT_FID_REF)
@@ -271,6 +273,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
     parser.add_argument("--cdro-warmup-fraction", type=float, default=0.05)
+    parser.add_argument("--cdro-antithetic-rollouts", action="store_true")
     parser.add_argument("--cdro-n-steps-path", type=int, default=0)
     return parser.parse_args()
 
@@ -807,6 +810,7 @@ def _cdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
         inner_steps=int(args.inner_steps),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
+        antithetic_rollouts=bool(args.cdro_antithetic_rollouts),
         calibration=calibration,
     )
     if units is None:
@@ -1397,6 +1401,14 @@ def _build_baseline_sweep_cmd(
         "--train-accelerator-count",
         str(args.train_accelerator_count),
     ]
+    if bool(args.use_ema_eval):
+        cmd.extend(
+            [
+                "--use-ema-eval",
+                "--ema-decay",
+                str(args.ema_decay),
+            ]
+        )
     if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
         cmd.extend(
             [
@@ -1490,6 +1502,14 @@ def _build_run_toy_cmd(
     ]
     if compute_fid:
         cmd.append("--compute-fid")
+    if bool(args.use_ema_eval):
+        cmd.extend(
+            [
+                "--use-ema-eval",
+                "--ema-decay",
+                str(args.ema_decay),
+            ]
+        )
     if fixed_warmup_steps is not None and int(fixed_warmup_steps) > 0:
         cmd.extend(
             [
@@ -1556,6 +1576,13 @@ def _build_run_toy_cmd(
                 str(args.cdro_time_horizon),
                 "--cdro-warmup-fraction",
                 str(args.cdro_warmup_fraction),
+                *(
+                    [
+                        "--cdro-antithetic-rollouts",
+                    ]
+                    if bool(args.cdro_antithetic_rollouts)
+                    else []
+                ),
                 "--disable-collapse-diagnostics",
             ]
         )
@@ -2380,6 +2407,8 @@ def main() -> None:
             "cross_method_baseline_cache_reuse": False,
             "cross_knot_robust_resume_reuse": "same_seed_same_method_only",
             "cdro_collapse_diagnostics_disabled": True,
+            "use_ema_eval": bool(args.use_ema_eval),
+            "ema_decay": float(args.ema_decay),
             "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
         },
@@ -2390,6 +2419,7 @@ def main() -> None:
             "wdro_expected_robust_step_weighted_units": float(wdro_robust_step_weighted_units),
             "cdro_expected_robust_step_weighted_units": float(cdro_robust_step_weighted_units),
             "cdro_effective_n_steps_path": int(_effective_cdro_n_steps_path(args)),
+            "cdro_antithetic_rollouts": bool(args.cdro_antithetic_rollouts),
             "calibration": calibration,
         },
         "trajectories": {

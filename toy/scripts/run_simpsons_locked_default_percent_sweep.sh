@@ -34,6 +34,8 @@ DEBUG_EVAL_BATCH="${DEBUG_EVAL_BATCH:-64}"
 DEBUG_TERMINAL_STEP="${DEBUG_TERMINAL_STEP:-20}"
 LOG_EVERY="${LOG_EVERY:-200}"
 N_STEPS_PATH="${N_STEPS_PATH:-64}"
+USE_EMA_EVAL="${USE_EMA_EVAL:-0}"
+EMA_DECAY="${EMA_DECAY:-0.999}"
 
 GRID_TEMPLATE="${GRID_TEMPLATE:-denser}"
 FID_EVAL_TEMPLATE="${FID_EVAL_TEMPLATE:-balanced}"
@@ -50,6 +52,7 @@ CDRO_TOTAL_BUDGET_RHO="${CDRO_TOTAL_BUDGET_RHO:-4.0}"
 CDRO_TIME_HORIZON="${CDRO_TIME_HORIZON:-1.0}"
 CDRO_WARMUP_FRACTION="${CDRO_WARMUP_FRACTION:-0.05}"
 CDRO_N_STEPS_PATH="${CDRO_N_STEPS_PATH:-64}"
+CDRO_ANTITHETIC_ROLLOUTS="${CDRO_ANTITHETIC_ROLLOUTS:-0}"
 
 mkdir -p "${OUTDIR}"
 
@@ -98,6 +101,13 @@ for pct in ${PERCENTS}; do
   pct_tag="$(printf "%03d" "${pct}")"
   run_outdir="${OUTDIR}/${pct_tag}pct"
   run_prefix="${PREFIX_ROOT}_${pct_tag}pct"
+  extra_args=()
+  if [[ "${USE_EMA_EVAL}" == "1" ]]; then
+    extra_args+=(--use-ema-eval --ema-decay "${EMA_DECAY}")
+  fi
+  if [[ "${CDRO_ANTITHETIC_ROLLOUTS}" == "1" ]]; then
+    extra_args+=(--cdro-antithetic-rollouts)
+  fi
 
   echo "[locked-default-sweep] pct=${pct}% train_size=${train_size} outdir=${run_outdir}"
 
@@ -139,7 +149,8 @@ for pct in ${PERCENTS}; do
     --cdro-total-budget-rho "${CDRO_TOTAL_BUDGET_RHO}" \
     --cdro-time-horizon "${CDRO_TIME_HORIZON}" \
     --cdro-warmup-fraction "${CDRO_WARMUP_FRACTION}" \
-    --cdro-n-steps-path "${CDRO_N_STEPS_PATH}"
+    --cdro-n-steps-path "${CDRO_N_STEPS_PATH}" \
+    "${extra_args[@]}"
 done
 
 echo "[locked-default-sweep] done: ${OUTDIR}"

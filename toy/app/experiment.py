@@ -552,11 +552,12 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
         return 0.0
     attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(getattr(cfg, "inner_steps", 0)) > 0
     clean_enabled = float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
+    rollout_multiplier = 2.0 if bool(getattr(cfg, "cdro_antithetic_rollouts", False)) else 1.0
     if not attack_enabled:
-        return float(path_steps if clean_enabled else 0.0)
-    attack_construction_units = float(path_steps * max(int(getattr(cfg, "inner_steps", 0)), 0))
-    attack_eval_units = float(path_steps * 2)
-    clean_eval_units = float(path_steps if clean_enabled else 0)
+        return float(path_steps if clean_enabled else 0.0) * rollout_multiplier
+    attack_construction_units = float(path_steps * max(int(getattr(cfg, "inner_steps", 0)), 0)) * rollout_multiplier
+    attack_eval_units = float(path_steps * 2) * rollout_multiplier
+    clean_eval_units = float(path_steps if clean_enabled else 0) * rollout_multiplier
     return attack_construction_units + attack_eval_units + clean_eval_units
 
 
@@ -627,6 +628,7 @@ def _resolve_phase_steps(
                     inner_steps=int(getattr(cfg, "inner_steps", 0)),
                     outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
                     outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
+                    antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
                     calibration=weighted_calibration,
                 )
                 baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(
@@ -1000,7 +1002,7 @@ def _run_robust_phase(
             if method_name == "v2":
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["optimizer_phi_state"] = trainer_state_in.get("optimizer_phi_state")
-            elif method_name in ("clean", "wdro"):
+            elif method_name in ("clean", "wdro", "cdro"):
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["ema_state_dict"] = trainer_state_in.get("ema_state_dict")
             else:
@@ -1687,6 +1689,7 @@ def run_experiment(cfg) -> dict:
             "cdro_total_budget_rho": float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
             "cdro_time_horizon": float(getattr(cfg, "cdro_time_horizon", 0.0)),
             "cdro_warmup_fraction": float(getattr(cfg, "cdro_warmup_fraction", 0.0)),
+            "cdro_antithetic_rollouts": bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
             "method_version": cfg.method_version,
             "method_description": getattr(method, "DESCRIPTION", ""),
             "phase_step_split_mode": str(phase_steps["split_mode"]),

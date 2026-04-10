@@ -341,6 +341,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdro-total-budget-rho", type=float, default=ToyConfig.cdro_total_budget_rho)
     parser.add_argument("--cdro-time-horizon", type=float, default=ToyConfig.cdro_time_horizon)
     parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
+    parser.add_argument(
+        "--cdro-antithetic-rollouts",
+        action="store_true",
+        default=ToyConfig.cdro_antithetic_rollouts,
+    )
+    parser.add_argument("--disable-cdro-antithetic-rollouts", action="store_true")
     parser.add_argument("--v12-step-size", type=float, default=ToyConfig.v12_step_size)
     parser.add_argument("--v12-lambda-init", type=float, default=ToyConfig.v12_lambda_init)
     parser.add_argument("--v12-lambda-lr", type=float, default=ToyConfig.v12_lambda_lr)
@@ -445,6 +451,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_eval_shared_reverse_noise = bool(args_dict.pop("disable_eval_shared_reverse_noise"))
     force_det_plot = bool(args_dict.pop("plot_deterministic_backward"))
     disable_ema_eval = bool(args_dict.pop("disable_ema_eval"))
+    disable_cdro_antithetic_rollouts = bool(args_dict.pop("disable_cdro_antithetic_rollouts"))
     disable_limited_data = bool(args_dict.pop("disable_limited_data"))
     disable_mnist_percent_split = bool(args_dict.pop("disable_mnist_percent_split"))
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
@@ -479,6 +486,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.plot_stochastic_backward = False
     if disable_ema_eval:
         cfg.use_ema_eval = False
+    if disable_cdro_antithetic_rollouts:
+        cfg.cdro_antithetic_rollouts = False
     if disable_limited_data:
         cfg.limited_data_enabled = False
     if disable_mnist_percent_split:

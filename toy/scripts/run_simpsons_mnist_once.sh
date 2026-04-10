@@ -50,9 +50,18 @@ LOG_EVERY="${LOG_EVERY:-25}"
 N_STEPS_PATH="${N_STEPS_PATH:-64}"
 OUTER_ATTACK_WEIGHT="${OUTER_ATTACK_WEIGHT:-0.3}"
 OUTER_CLEAN_WEIGHT="${OUTER_CLEAN_WEIGHT:-1.0}"
+USE_EMA_EVAL="${USE_EMA_EVAL:-0}"
+EMA_DECAY="${EMA_DECAY:-0.999}"
+CDRO_ANTITHETIC_ROLLOUTS="${CDRO_ANTITHETIC_ROLLOUTS:-0}"
 
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_ARGS="--compute-fid --fid-ref-path ${FID_REF_PATH} --cdro-step-size 0.02 --cdro-total-budget-rho 4.0 --cdro-time-horizon 1.0 --cdro-warmup-fraction 0.05 ${EXTRA_ARGS}"
+if [[ "${USE_EMA_EVAL}" == "1" ]]; then
+  EXTRA_ARGS="--use-ema-eval --ema-decay ${EMA_DECAY} ${EXTRA_ARGS}"
+fi
+if [[ "${CDRO_ANTITHETIC_ROLLOUTS}" == "1" ]]; then
+  EXTRA_ARGS="--cdro-antithetic-rollouts ${EXTRA_ARGS}"
+fi
 
 export PYTHON_BIN RUN_MODE METHOD_VERSION EXP_NAME OUTDIR DEVICE SEED
 export DATASET_PATH="${TRAIN_ROOT}"

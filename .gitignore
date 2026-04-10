@@ -143,3 +143,4 @@ datasets/raw/
 toy-runs/
 training-runs/
 toy_data/
+.tmp/simpsons-mnist-src/
