@@ -776,11 +776,30 @@ def _load_baseline_checkpoint(
     history.setdefault("proxy_weighted_denoise_loss", [])
     history.setdefault("sigma_counts", [])
     ensure_denoiser_op_count_history(history)
+    continuation_state = None
+    continuation_source = "unavailable"
+    expected_step = signature.get("baseline_steps")
+    payload_step = payload.get("step")
+    step_matches = expected_step is None or payload_step is None or int(payload_step) == int(expected_step)
+    raw_state_dict = payload.get("model_state_dict")
+    if not step_matches:
+        continuation_source = "step_mismatch"
+    elif isinstance(raw_state_dict, dict):
+        continuation_state = {
+            "model_state_dict": raw_state_dict,
+            "optimizer_theta_state": payload.get("optimizer_state_dict"),
+            "ema_state_dict": payload.get("ema_state_dict"),
+            "rng_state": payload.get("rng_state"),
+            "step": None if payload_step is None else int(payload_step),
+        }
+        continuation_source = "baseline_checkpoint_full_state"
     return {
         "history": history,
         "saved_at": payload.get("saved_at"),
         "signature": loaded_signature,
         "runtime": payload.get("baseline_runtime"),
+        "continuation_state": continuation_state,
+        "continuation_source": continuation_source,
     }
 
 
@@ -967,6 +986,7 @@ def _run_robust_phase(
     baseline_gate: Dict,
     method,
     robust_resume_payload: Optional[Dict[str, Any]] = None,
+    baseline_handoff_state: Optional[Dict[str, Any]] = None,
     return_trainer_state: bool = False,
 ):
     """Execute or skip robust training depending on baseline-only mode and gate status."""
@@ -1022,8 +1042,12 @@ def _run_robust_phase(
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
         else:
             raise RuntimeError(f"Robust resume is not implemented for method_version='{cfg.method_version}'.")
-    elif return_trainer_state and method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
-        trainer_kwargs["return_state"] = True
+    else:
+        if return_trainer_state and method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
+            trainer_kwargs["return_state"] = True
+        if baseline_handoff_state is not None and method_name in ("clean", "wdro", "cdro"):
+            trainer_kwargs["optimizer_theta_state"] = baseline_handoff_state.get("optimizer_theta_state")
+            trainer_kwargs["ema_state_dict"] = baseline_handoff_state.get("ema_state_dict")
 
     attack_training_executed = True
     train_result = method.train_trajectory_robust(
@@ -1218,6 +1242,9 @@ def run_experiment(cfg) -> dict:
     baseline_ckpt_saved = False
     baseline_ckpt_saved_at = None
     baseline_runtime_from_ckpt = None
+    baseline_handoff_state = None
+    baseline_handoff_source = "unavailable"
+    baseline_handoff_rng_restored = False
     baseline_reference_runtime = {"train_wall_clock_sec": None, "source": "unavailable"}
     robust_resume_payload = None
     robust_resume_loaded = False
@@ -1262,6 +1289,8 @@ def run_experiment(cfg) -> dict:
             baseline_ckpt_loaded = True
             baseline_ckpt_saved_at = load_info.get("saved_at")
             baseline_runtime_from_ckpt = load_info.get("runtime")
+            baseline_handoff_state = load_info.get("continuation_state")
+            baseline_handoff_source = str(load_info.get("continuation_source", "unavailable"))
             print(f"[baseline] loaded checkpoint: {baseline_ckpt_path}", flush=True)
     if not baseline_restored_from_robust_resume and not baseline_ckpt_loaded:
         t_phase = time.perf_counter()
@@ -1297,7 +1326,15 @@ def run_experiment(cfg) -> dict:
             baseline_eval = baseline
     runtime_sec["baseline_phase"] = float(time.perf_counter() - t_baseline_phase)
     baseline_eval.eval()
-    robust.load_state_dict(baseline_eval.state_dict())
+    if isinstance(baseline_handoff_state, dict) and isinstance(baseline_handoff_state.get("model_state_dict"), dict):
+        robust.load_state_dict(baseline_handoff_state["model_state_dict"], strict=True)
+        print(
+            "[baseline->robust] restored raw handoff state "
+            f"source={baseline_handoff_source} step={baseline_handoff_state.get('step')}",
+            flush=True,
+        )
+    else:
+        robust.load_state_dict(baseline_eval.state_dict())
     if robust_resume_path:
         robust.load_state_dict(robust_resume_payload["robust_state_dict"], strict=True)
         if "control_state_dict" in robust_resume_payload:
@@ -1344,6 +1381,9 @@ def run_experiment(cfg) -> dict:
         runtime_sec["baseline_gate_eval"] = float(time.perf_counter() - t_phase)
         baseline_gate["eval_seed"] = int(gate_eval_seed)
         baseline_gate["eval_seed_scoped"] = True
+        if isinstance(baseline_handoff_state, dict) and baseline_handoff_state.get("rng_state") is not None:
+            _restore_rng_state(baseline_handoff_state["rng_state"])
+            baseline_handoff_rng_restored = True
 
     t_phase = time.perf_counter()
     attack_training_executed, history_robust, robust, robust_trainer_state = _run_robust_phase(
@@ -1356,6 +1396,7 @@ def run_experiment(cfg) -> dict:
         baseline_gate=baseline_gate,
         method=method,
         robust_resume_payload=robust_resume_payload,
+        baseline_handoff_state=baseline_handoff_state,
         return_trainer_state=bool(robust_save_path),
     )
     runtime_sec["robust_phase"] = float(time.perf_counter() - t_phase)
@@ -1757,6 +1798,20 @@ def run_experiment(cfg) -> dict:
             "baseline_ckpt_saved": bool(baseline_ckpt_saved),
             "baseline_ckpt_saved_at": baseline_ckpt_saved_at,
             "baseline_ckpt_signature_hash": baseline_signature_hash,
+            "baseline_handoff_source": str(baseline_handoff_source),
+            "baseline_handoff_loaded": bool(
+                isinstance(baseline_handoff_state, dict)
+                and isinstance(baseline_handoff_state.get("model_state_dict"), dict)
+            ),
+            "baseline_handoff_has_optimizer_state": bool(
+                isinstance(baseline_handoff_state, dict)
+                and baseline_handoff_state.get("optimizer_theta_state") is not None
+            ),
+            "baseline_handoff_has_ema_state": bool(
+                isinstance(baseline_handoff_state, dict)
+                and isinstance(baseline_handoff_state.get("ema_state_dict"), dict)
+            ),
+            "baseline_handoff_rng_restored": bool(baseline_handoff_rng_restored),
             "compute_accounting": {
                 "primary_metric_name": "train_wall_clock_sec",
                 "primary_metric_definition": (

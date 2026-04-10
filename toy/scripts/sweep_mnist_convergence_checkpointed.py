@@ -225,6 +225,10 @@ def _save_checkpoint(
     path: Path,
     *,
     model: torch.nn.Module,
+    raw_model: Optional[torch.nn.Module] = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    ema_model: Optional[torch.nn.Module] = None,
+    rng_state: Optional[Dict[str, Any]] = None,
     step: int,
     train_percent: float,
     seed: int,
@@ -245,6 +249,14 @@ def _save_checkpoint(
             "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
         },
     }
+    if raw_model is not None:
+        payload["model_state_dict"] = _to_cpu_tree(raw_model.state_dict())
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = _to_cpu_tree(optimizer.state_dict())
+    if ema_model is not None:
+        payload["ema_state_dict"] = _to_cpu_tree(ema_model.state_dict())
+    if rng_state is not None:
+        payload["rng_state"] = _to_cpu_tree(rng_state)
     tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
@@ -1060,6 +1072,10 @@ def _run_combo(
         _save_checkpoint(
             ckpt_path,
             model=eval_model,
+            raw_model=baseline,
+            optimizer=optimizer,
+            ema_model=ema_model,
+            rng_state=_capture_rng_state(),
             step=step,
             train_percent=train_percent,
             seed=seed,

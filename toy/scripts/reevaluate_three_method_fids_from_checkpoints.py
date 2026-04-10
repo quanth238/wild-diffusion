@@ -389,7 +389,12 @@ def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
     return state_dict
 
 
-def _load_robust_state_dict(ckpt_path: str, method_name: str) -> Dict[str, torch.Tensor]:
+def _load_robust_state_dict(
+    ckpt_path: str,
+    method_name: str,
+    *,
+    prefer_ema: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], str]:
     payload = _load_checkpoint_payload(ckpt_path)
     saved_method = _canonical_robust_method(payload.get("method_name", ""))
     expected_method = _canonical_robust_method(method_name)
@@ -397,10 +402,16 @@ def _load_robust_state_dict(ckpt_path: str, method_name: str) -> Dict[str, torch
         raise RuntimeError(
             f"Robust resume checkpoint method mismatch: current={expected_method} saved={saved_method} ({ckpt_path})"
         )
+    if prefer_ema:
+        trainer_state = payload.get("trainer_state", {})
+        if isinstance(trainer_state, dict):
+            ema_state_dict = trainer_state.get("ema_state_dict")
+            if isinstance(ema_state_dict, dict):
+                return ema_state_dict, "ema_state_dict"
     state_dict = payload.get("robust_state_dict")
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"Missing robust_state_dict in robust checkpoint: {ckpt_path}")
-    return state_dict
+    return state_dict, "robust_state_dict"
 
 
 def _base_cfg_from_args(args: argparse.Namespace) -> ToyConfig:
@@ -581,6 +592,7 @@ def _write_metrics_payload(
     metrics_eval_seed: int,
     runtime_sec: float,
     checkpoint_path: str,
+    checkpoint_state_variant: str,
 ) -> None:
     branch = _checkpoint_branch(row)
     sample_quality = {
@@ -636,6 +648,7 @@ def _write_metrics_payload(
                 "baseline_only": bool(branch == "baseline"),
                 "direct_fid_only": True,
                 "checkpoint_branch": branch,
+                "checkpoint_state_variant": str(checkpoint_state_variant),
             },
         },
         "runtime_sec": {
@@ -686,11 +699,17 @@ def _evaluate_checkpoint_fid(
         log_handle.write("[fid-only] legacy eval-samples argument is ignored in direct FID mode.\n")
         log_handle.flush()
 
-        state_dict = (
-            _load_baseline_state_dict(checkpoint_path)
-            if branch == "baseline"
-            else _load_robust_state_dict(checkpoint_path, str(row.get("method", "")))
-        )
+        checkpoint_state_variant = "baseline_eval_state_dict"
+        if branch == "baseline":
+            state_dict = _load_baseline_state_dict(checkpoint_path)
+        else:
+            state_dict, checkpoint_state_variant = _load_robust_state_dict(
+                checkpoint_path,
+                str(row.get("method", "")),
+                prefer_ema=bool(getattr(ctx.cfg, "use_ema_eval", False)),
+            )
+        log_handle.write(f"[fid-only] checkpoint_state_variant={checkpoint_state_variant}\n")
+        log_handle.flush()
         model.load_state_dict(state_dict, strict=True)
         model.eval()
 
@@ -722,6 +741,7 @@ def _evaluate_checkpoint_fid(
         metrics_eval_seed=metrics_eval_seed,
         runtime_sec=runtime_sec,
         checkpoint_path=checkpoint_path,
+        checkpoint_state_variant=checkpoint_state_variant,
     )
     return fid_value
 
