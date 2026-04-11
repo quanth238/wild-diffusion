@@ -8,7 +8,7 @@ from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import batch_scalar_like, has_nan_or_inf, scalarize
 from .objective import build_training_state, compute_training_loss, weighted_denoise_loss
 from .reverse import sample_reverse_paths
-from .sigma import sample_target_indices, sample_target_indices_log_normal
+from .sigma import assign_sigmas_to_nearest_levels, sample_sigmas_log_normal, sample_target_indices
 from .train_utils import sample_train_batch
 
 
@@ -41,16 +41,20 @@ def train_baseline(
             sample_population_batch_fn=sample_population_batch_fn,
         )
         if cfg.use_log_normal_sigma_sampling:
-            indices = sample_target_indices_log_normal(
+            sigma = sample_sigmas_log_normal(
                 cfg.batch_size,
-                sigma_levels,
+                sigma_min=float(cfg.sigma_min),
+                sigma_max=float(cfg.sigma_max),
+                device=sigma_levels.device,
                 p_mean=cfg.p_mean,
                 p_std=cfg.p_std,
+                dtype=sigma_levels.dtype,
             )
+            indices = assign_sigmas_to_nearest_levels(sigma, sigma_levels)
         else:
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
+            sigma = sigma_levels[indices]
         sigma_counts += torch.bincount(indices - 1, minlength=sigma_counts.numel())
-        sigma = sigma_levels[indices]
         x_noisy = build_training_state(
             cfg=cfg,
             x_clean=x0,

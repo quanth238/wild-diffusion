@@ -26,7 +26,8 @@ from ..compute_accounting import (
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
 from ..shared.ema import ema_config_dict
-from ..shared.sigma import build_sigma_levels, sample_target_indices
+from ..shared.objective import terminal_prior_scale_from_objective
+from ..shared.sigma import build_sigma_levels, build_sigma_levels_from_warmup_quantiles, sample_target_indices
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
 from ..model_backends.provider import build_model_bundle
 from .utils import (
@@ -81,6 +82,22 @@ def _run_with_scoped_seed(seed: int, fn):
         return fn()
     finally:
         _restore_rng_state(state)
+
+
+def _sample_terminal_batch_for_objective(
+    *,
+    cfg,
+    dataset: DatasetBundle,
+    batch_size: int,
+    sigma_levels: torch.Tensor,
+) -> torch.Tensor:
+    """Sample terminal states using the correct objective-family terminal law."""
+
+    terminal_scale = terminal_prior_scale_from_objective(
+        getattr(cfg, "training_objective", "edm"),
+        float(sigma_levels[-1].item()),
+    )
+    return dataset.sample_terminal_batch(batch_size, terminal_scale)
 
 
 def _load_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
@@ -959,7 +976,12 @@ def _build_baseline_gate(
     with autocast_context(x_gate.device, amp_dtype):
         gate_gen_paths = reverse_paths_from_terminal(
             denoiser=baseline_eval,
-            x_terminal=dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1]),
+            x_terminal=_sample_terminal_batch_for_objective(
+                cfg=cfg,
+                dataset=dataset,
+                batch_size=int(cfg.eval_samples),
+                sigma_levels=sigma_levels,
+            ),
             sigma_levels=sigma_levels,
             stochastic=True,
         )
@@ -1185,7 +1207,17 @@ def run_experiment(cfg) -> dict:
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
-    sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+    baseline_sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+    sigma_levels = baseline_sigma_levels
+    if method_name == "cdro":
+        sigma_levels = build_sigma_levels_from_warmup_quantiles(
+            cfg.sigma_min,
+            cfg.sigma_max,
+            cfg.n_steps_path,
+            device=device,
+            p_mean=cfg.p_mean,
+            p_std=cfg.p_std,
+        )
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -1230,7 +1262,7 @@ def run_experiment(cfg) -> dict:
             flush=True,
         )
 
-    baseline_signature = _build_baseline_signature(cfg_baseline, dataset, model_bundle, sigma_levels)
+    baseline_signature = _build_baseline_signature(cfg_baseline, dataset, model_bundle, baseline_sigma_levels)
     baseline_signature_hash = hashlib.sha1(
         json.dumps(baseline_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1298,7 +1330,7 @@ def run_experiment(cfg) -> dict:
             history_baseline, baseline_eval = train_baseline(
                 baseline,
                 centers,
-                sigma_levels,
+                baseline_sigma_levels,
                 cfg_baseline,
                 train_pool=dataset.train_pool,
                 sample_train_batch_fn=dataset.sample_train_batch,
@@ -1556,12 +1588,22 @@ def run_experiment(cfg) -> dict:
     )
     shared_gen_terminal = None
     if cfg.eval_use_shared_terminal_noise:
-        shared_gen_terminal = dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1])
+        shared_gen_terminal = _sample_terminal_batch_for_objective(
+            cfg=cfg,
+            dataset=dataset,
+            batch_size=int(cfg.eval_samples),
+            sigma_levels=sigma_levels,
+        )
     shared_gen_reverse_noise = None
     if cfg.eval_use_shared_reverse_noise:
         noise_ref = shared_gen_terminal
         if noise_ref is None:
-            noise_ref = dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1])
+            noise_ref = _sample_terminal_batch_for_objective(
+                cfg=cfg,
+                dataset=dataset,
+                batch_size=int(cfg.eval_samples),
+                sigma_levels=sigma_levels,
+            )
         shared_gen_reverse_noise = torch.randn(
             (sigma_levels.numel(), noise_ref.shape[0], *noise_ref.shape[1:]),
             device=noise_ref.device,
@@ -1570,12 +1612,22 @@ def run_experiment(cfg) -> dict:
     baseline_terminal = (
         shared_gen_terminal
         if shared_gen_terminal is not None
-        else dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1])
+        else _sample_terminal_batch_for_objective(
+            cfg=cfg,
+            dataset=dataset,
+            batch_size=int(cfg.eval_samples),
+            sigma_levels=sigma_levels,
+        )
     )
     robust_terminal = (
         shared_gen_terminal
         if shared_gen_terminal is not None
-        else dataset.sample_terminal_batch(cfg.eval_samples, sigma_levels[-1])
+        else _sample_terminal_batch_for_objective(
+            cfg=cfg,
+            dataset=dataset,
+            batch_size=int(cfg.eval_samples),
+            sigma_levels=sigma_levels,
+        )
     )
     with autocast_context(device, amp_dtype):
         baseline_gen_paths = reverse_paths_from_terminal(

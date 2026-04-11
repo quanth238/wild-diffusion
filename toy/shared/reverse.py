@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 
-from .objective import predict_velocity, rf_time_levels_from_sigma_levels
+from .objective import predict_velocity, rf_time_levels_from_sigma_levels, terminal_prior_scale_from_family
 from ..utils import batch_scalar_like
 
 
@@ -74,10 +74,14 @@ def sample_reverse_paths(
 ) -> torch.Tensor:
     """Generate full reverse trajectories from sigma_N to sigma_0."""
 
+    terminal_scale = terminal_prior_scale_from_family(
+        getattr(denoiser, "generative_family", ""),
+        float(sigma_levels[-1].item()),
+    )
     if sample_terminal_batch_fn is None:
-        x = torch.randn(n_samples, 2, device=device) * sigma_levels[-1]
+        x = torch.randn(n_samples, 2, device=device, dtype=sigma_levels.dtype) * terminal_scale
     else:
-        x = sample_terminal_batch_fn(n_samples, sigma_levels[-1]).to(device=device)
+        x = sample_terminal_batch_fn(n_samples, terminal_scale).to(device=device, dtype=sigma_levels.dtype)
     if _is_rectified_flow_model(denoiser):
         return _sample_rectified_flow_paths_from_terminal(
             denoiser=denoiser,

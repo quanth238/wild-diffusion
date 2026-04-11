@@ -9,7 +9,7 @@ from .trainer import train_trajectory_robust_cdro
 NAME = "cdro"
 IMPLEMENTED = True
 DESCRIPTION = (
-    "Route-A CDRO path attack: beta-space greedy ascent with sigma-time-weighted local caps "
+    "Route-A CDRO path attack: u-space greedy ascent with sigma-time-weighted local caps "
     "on the Jiang-style additive-drift cost, no learned attack policy."
 )
 
@@ -28,7 +28,7 @@ def rollout_eval(
     control_radius_kappa,
     kappa_by_step=None,
 ):
-    """Evaluation rollout for CDRO using the denoiser-dependent beta-space attack."""
+    """Evaluation rollout for CDRO using the denoiser-dependent u-space attack."""
 
     del control_radius_kappa, kappa_by_step
     return rollout_path_heuristic_attack(

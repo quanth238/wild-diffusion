@@ -39,6 +39,31 @@ def rf_time_levels_from_sigma_levels(
     return (sigma_levels / sigma_max_value).clamp(0.0, 1.0)
 
 
+def terminal_prior_scale_from_objective(
+    training_objective: str,
+    sigma_max: float,
+) -> float:
+    """Return the objective-specific terminal prior scale used for training/sampling."""
+
+    objective = str(training_objective).strip().lower()
+    if objective == "rf":
+        # Straight-path RF uses the standard Gaussian terminal prior z ~ N(0, I).
+        return 1.0
+    return max(float(sigma_max), 1e-8)
+
+
+def terminal_prior_scale_from_family(
+    generative_family: str,
+    sigma_max: float,
+) -> float:
+    """Return the model-family terminal prior scale used for reverse sampling."""
+
+    family = str(generative_family).strip().lower()
+    if family == "rectified_flow":
+        return 1.0
+    return max(float(sigma_max), 1e-8)
+
+
 def predict_score(
     denoiser,
     x_noisy: torch.Tensor,
@@ -126,15 +151,16 @@ def build_training_state(
     if objective in ("edm", "score"):
         return x_clean + batch_scalar_like(sigma, x_clean) * torch.randn_like(x_clean)
     if objective == "rf":
-        terminal_sigma = float(getattr(cfg, "sigma_max", 1.0))
+        sigma_max = float(getattr(cfg, "sigma_max", 1.0))
+        terminal_scale = terminal_prior_scale_from_objective(objective, sigma_max)
         if sample_terminal_batch_fn is None:
-            x_terminal = torch.randn_like(x_clean) * terminal_sigma
+            x_terminal = torch.randn_like(x_clean) * terminal_scale
         else:
-            x_terminal = sample_terminal_batch_fn(x_clean.shape[0], terminal_sigma).to(
+            x_terminal = sample_terminal_batch_fn(x_clean.shape[0], terminal_scale).to(
                 device=x_clean.device,
                 dtype=x_clean.dtype,
             )
-        t = batch_scalar_like(rf_time_from_sigma(sigma, terminal_sigma), x_clean)
+        t = batch_scalar_like(rf_time_from_sigma(sigma, sigma_max), x_clean)
         return (1.0 - t) * x_clean + t * x_terminal
     raise ValueError(f"Unsupported training objective '{objective}'. Expected one of: edm, score, rf.")
 
@@ -146,7 +172,7 @@ def compute_training_loss(
     x_clean: torch.Tensor,
     sigma: torch.Tensor,
 ) -> torch.Tensor:
-    """Dispatch train loss by objective kind: EDM x0 regression or score matching."""
+    """Dispatch train loss by objective kind: EDM, score matching, or rectified flow."""
 
     objective = str(getattr(cfg, "training_objective", "edm")).lower()
     if objective == "edm":

@@ -11,14 +11,21 @@ from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
-from .diffusion import build_constraint_radii_for_objective, rollout_controlled_ve, rollout_path_heuristic_attack
+from .diffusion import (
+    build_constraint_radii_for_objective,
+    build_transition_deltas_for_objective,
+    rollout_controlled_ve,
+    rollout_path_heuristic_attack,
+)
 
 
-def _beta_transport_cost(beta_path: torch.Tensor) -> torch.Tensor:
-    """Route-A discrete control cost: E[sum_k ||beta_k||^2]."""
+def _control_transport_cost(control_path: torch.Tensor, transition_deltas: torch.Tensor) -> torch.Tensor:
+    """Route-A discrete control cost: E[sum_k Delta_tau_k ||u_k||^2]."""
 
-    flat = beta_path.reshape(beta_path.shape[0], beta_path.shape[1], -1)
-    return flat.pow(2).sum(dim=2).sum(dim=1).mean()
+    flat = control_path.reshape(control_path.shape[0], control_path.shape[1], -1)
+    control_sq = flat.pow(2).sum(dim=2)
+    dt = transition_deltas.view(1, -1).to(device=control_sq.device, dtype=control_sq.dtype)
+    return (control_sq * dt).sum(dim=1).mean()
 
 
 def _path_average_training_loss(
@@ -55,8 +62,8 @@ def _path_outer_loss_backward(
     states_ref: torch.Tensor,
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
-    attack_weight: float,
-    clean_weight: float,
+    lambda_ctrl: float,
+    lambda_ref: float,
     amp_dtype,
 ) -> tuple[float, float, float]:
     """Accumulate exact path-mean outer loss with per-timestep backward passes."""
@@ -79,7 +86,7 @@ def _path_outer_loss_backward(
             dtype=x0.dtype,
         )
         with autocast_context(sigma_levels.device, amp_dtype):
-            if attack_weight > 0.0:
+            if lambda_ctrl > 0.0:
                 attack_loss_step = compute_training_loss(
                     cfg,
                     denoiser,
@@ -97,7 +104,7 @@ def _path_outer_loss_backward(
                         sigma,
                     )
 
-            if clean_weight > 0.0:
+            if lambda_ref > 0.0:
                 clean_loss_step = compute_training_loss(
                     cfg,
                     denoiser,
@@ -108,7 +115,7 @@ def _path_outer_loss_backward(
             else:
                 clean_loss_step = torch.zeros((), device=x0.device, dtype=x0.dtype)
 
-            chunk_outer = attack_weight * attack_loss_step + clean_weight * clean_loss_step
+            chunk_outer = lambda_ctrl * attack_loss_step + lambda_ref * clean_loss_step
             chunk_outer = chunk_outer / float(n_steps)
 
         if has_nan_or_inf(chunk_outer):
@@ -171,7 +178,7 @@ def _path_clean_only_loss_backward(
     states_ref: torch.Tensor,
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
-    clean_weight: float,
+    lambda_ref: float,
     amp_dtype,
 ) -> tuple[float, float, float]:
     """Accumulate clean-only path loss without the redundant attacked-path pass."""
@@ -198,7 +205,7 @@ def _path_clean_only_loss_backward(
                 x0,
                 sigma,
             )
-            chunk_outer = clean_weight * clean_loss_step / float(n_steps)
+            chunk_outer = lambda_ref * clean_loss_step / float(n_steps)
 
         if has_nan_or_inf(chunk_outer):
             raise RuntimeError("NaN/Inf detected in cdro clean-only outer loss.")
@@ -226,7 +233,7 @@ def train_trajectory_robust_cdro(
     ema_state_dict: Optional[dict] = None,
     return_state: bool = False,
 ):
-    """Route-A CDRO training with beta-space local caps and greedy denoiser-dependent attacks."""
+    """Route-A CDRO training with u-space local caps and greedy denoiser-dependent attacks."""
 
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     if optimizer_theta_state is not None:
@@ -308,6 +315,11 @@ def train_trajectory_robust_cdro(
     step_size = float(cfg.cdro_step_size)
     total_budget = float(cfg.cdro_total_budget_rho)
     time_horizon = float(cfg.cdro_time_horizon)
+    transition_deltas = build_transition_deltas_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        time_horizon=time_horizon,
+    ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
     path_batch_equiv_evals = _path_batch_equiv_denoiser_evals(sigma_levels)
     cumulative_batch_equiv_evals = (
         float(history["batch_equiv_denoiser_evals_cumulative"][-1])
@@ -341,11 +353,16 @@ def train_trajectory_robust_cdro(
         else:
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
 
-        clean_weight = float(cfg.outer_clean_weight)
-        attack_weight = float(cfg.outer_attack_weight)
-        phi_lr_scale = 1.0 if attack_weight > 0.0 else 0.0
-        control_updates_enabled = attack_weight > 0.0
-        attack_enabled = bool(control_updates_enabled and attack_weight > 0.0 and cfg.inner_steps > 0)
+        raw_lambda_ref = float(cfg.outer_clean_weight)
+        raw_lambda_ctrl = float(cfg.outer_attack_weight)
+        mixture_mass = raw_lambda_ref + raw_lambda_ctrl
+        if mixture_mass <= 0.0:
+            raise RuntimeError("CDRO continuation mixture must have positive total mass.")
+        lambda_ref = raw_lambda_ref / mixture_mass
+        lambda_ctrl = raw_lambda_ctrl / mixture_mass
+        phi_lr_scale = 1.0 if lambda_ctrl > 0.0 else 0.0
+        control_updates_enabled = lambda_ctrl > 0.0
+        attack_enabled = bool(control_updates_enabled and cfg.inner_steps > 0)
         rollout_schedules = _build_rollout_noise_schedules(
             x0=x0,
             sigma_levels=sigma_levels,
@@ -396,7 +413,7 @@ def train_trajectory_robust_cdro(
             for roll in rollouts:
                 with autocast_context(sigma_levels.device, amp_dtype):
                     attack_loss_chunk = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
-                transport_chunk = _beta_transport_cost(roll.beta_path)
+                transport_chunk = _control_transport_cost(roll.control_path, transition_deltas)
                 attack_loss_inner = (
                     attack_loss_chunk if attack_loss_inner is None else (attack_loss_inner + attack_loss_chunk)
                 )
@@ -410,7 +427,7 @@ def train_trajectory_robust_cdro(
             attack_loss_inner = torch.zeros((), device=x0.device, dtype=x0.dtype)
             transport_inner = None
             for roll in rollouts:
-                transport_chunk = _beta_transport_cost(roll.beta_path)
+                transport_chunk = _control_transport_cost(roll.control_path, transition_deltas)
                 transport_inner = transport_chunk if transport_inner is None else (transport_inner + transport_chunk)
             transport_inner = transport_inner / rollout_multiplier
             inner_obj = torch.zeros((), device=x0.device, dtype=x0.dtype)
@@ -439,8 +456,8 @@ def train_trajectory_robust_cdro(
         outer_loss_attack_vals = []
         outer_loss_clean_vals = []
         outer_loss_vals = []
-        if attack_weight <= 0.0:
-            clean_weight_scaled = float(clean_weight) / rollout_multiplier
+        if lambda_ctrl <= 0.0:
+            lambda_ref_scaled = float(lambda_ref) / rollout_multiplier
             for roll in rollouts:
                 outer_loss_attack_val, outer_loss_clean_val, outer_loss_val = _path_clean_only_loss_backward(
                     cfg=cfg,
@@ -448,17 +465,17 @@ def train_trajectory_robust_cdro(
                     states_ref=roll.states_ref,
                     x0=x0,
                     sigma_levels=sigma_levels,
-                    clean_weight=clean_weight_scaled,
+                    lambda_ref=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
                 )
                 outer_loss_attack_vals.append(float(outer_loss_attack_val))
                 outer_loss_clean_vals.append(float(outer_loss_clean_val))
                 outer_loss_vals.append(float(outer_loss_val))
             attack_eval_units = 0.0
-            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if clean_weight > 0.0 else 0.0
+            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if lambda_ref > 0.0 else 0.0
         else:
-            attack_weight_scaled = float(attack_weight) / rollout_multiplier
-            clean_weight_scaled = float(clean_weight) / rollout_multiplier
+            lambda_ctrl_scaled = float(lambda_ctrl) / rollout_multiplier
+            lambda_ref_scaled = float(lambda_ref) / rollout_multiplier
             for roll in rollouts:
                 outer_loss_attack_val, outer_loss_clean_val, outer_loss_val = _path_outer_loss_backward(
                     cfg=cfg,
@@ -467,15 +484,15 @@ def train_trajectory_robust_cdro(
                     states_ref=roll.states_ref,
                     x0=x0,
                     sigma_levels=sigma_levels,
-                    attack_weight=attack_weight_scaled,
-                    clean_weight=clean_weight_scaled,
+                    lambda_ctrl=lambda_ctrl_scaled,
+                    lambda_ref=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
                 )
                 outer_loss_attack_vals.append(float(outer_loss_attack_val))
                 outer_loss_clean_vals.append(float(outer_loss_clean_val))
                 outer_loss_vals.append(float(outer_loss_val))
             attack_eval_units = path_batch_equiv_evals * 2.0 * rollout_multiplier
-            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if clean_weight > 0.0 else 0.0
+            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if lambda_ref > 0.0 else 0.0
         optimizer_theta.step()
         update_ema_model(
             ema_model,
@@ -502,8 +519,8 @@ def train_trajectory_robust_cdro(
         history["delta_norm_max"].append(last_delta_norm_max)
         history["delta_norm_ratio_mean"].append(last_delta_ratio_mean)
         history["delta_norm_ratio_max"].append(last_delta_ratio_max)
-        history["sched_attack_weight"].append(float(attack_weight))
-        history["sched_clean_weight"].append(float(clean_weight))
+        history["sched_attack_weight"].append(float(lambda_ctrl))
+        history["sched_clean_weight"].append(float(lambda_ref))
         history["sched_phi_lr_scale"].append(float(phi_lr_scale))
         history["batch_equiv_denoiser_evals_step"].append(float(step_batch_equiv_evals))
         history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
@@ -515,7 +532,7 @@ def train_trajectory_robust_cdro(
             n_fwd=float(path_batch_equiv_evals) * rollout_multiplier if attack_enabled else 0.0,
             n_fwd_inputgrad=float(attack_construction_units),
             n_fwd_parambackward=float(path_batch_equiv_evals)
-            * float(int(attack_weight > 0.0) + int(clean_weight > 0.0))
+            * float(int(lambda_ctrl > 0.0) + int(lambda_ref > 0.0))
             * rollout_multiplier,
         )
 
@@ -524,7 +541,7 @@ def train_trajectory_robust_cdro(
             and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(cfg.steps))
         )
         if run_diag:
-            if attack_weight > 0.0 and cfg.inner_steps > 0:
+            if lambda_ctrl > 0.0 and cfg.inner_steps > 0:
                 set_requires_grad(denoiser, False)
                 roll_cur_diag = rollout_path_heuristic_attack(
                     cfg=cfg,
@@ -615,7 +632,7 @@ def train_trajectory_robust_cdro(
                 f"inner_obj={last_inner_obj:.6f} control_cost={last_transport:.6f} "
                 f"delta_norm={last_delta_norm_mean:.6f} delta_ratio={last_delta_ratio_mean:.6f} "
                 f"be_evals={step_batch_equiv_evals:.1f} be_evals_cum={cumulative_batch_equiv_evals:.1f} "
-                f"w_attack={attack_weight:.3f} w_clean={clean_weight:.3f} phi_lr_scale={phi_lr_scale:.3f} "
+                f"lambda_ctrl={lambda_ctrl:.3f} lambda_ref={lambda_ref:.3f} phi_lr_scale={phi_lr_scale:.3f} "
                 f"step_size={step_size:.6f} rho={total_budget:.4f} T={time_horizon:.4f}"
                 f"{diag_msg}",
                 flush=True,

@@ -2029,6 +2029,7 @@ def main() -> None:
     reused_baseline_runs_csv = str(args.reuse_baseline_runs_csv).strip()
     reused_baseline_aggregate_csv = str(args.reuse_baseline_aggregate_csv).strip()
     reused_wdro_raw_csv = str(args.reuse_wdro_raw_csv).strip()
+    wdro_enabled = bool(reused_wdro_raw_csv) or str(args.training_objective).strip().lower() != "rf"
 
     baseline_outdir = os.path.join(args.outdir, "baseline")
     wdro_root = os.path.join(args.outdir, "wdro")
@@ -2101,7 +2102,13 @@ def main() -> None:
     wdro_seed_manifests: List[Dict] = []
     cdro_seed_manifests: List[Dict] = []
 
-    if reused_wdro_raw_csv:
+    if not wdro_enabled:
+        print(
+            "[collect-weighted] skip wdro for training_objective=rf "
+            "(Wild-Diffusion-RF is optional and not implemented in this milestone)",
+            flush=True,
+        )
+    elif reused_wdro_raw_csv:
         if not os.path.isfile(reused_wdro_raw_csv):
             raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
         reused_rows = [
@@ -2123,7 +2130,7 @@ def main() -> None:
         print(f"[collect-weighted] reuse wdro raw csv: {reused_wdro_raw_csv}", flush=True)
 
     for seed in seeds:
-        if not reused_wdro_raw_csv:
+        if wdro_enabled and not reused_wdro_raw_csv:
             wdro_outdir = os.path.join(wdro_root, f"s{seed}")
             ensure_dir(wdro_outdir)
             wdro_warmup_rows, wdro_support_checkpoint, wdro_warmup_manifest = _run_method_local_warmup_trajectory(
@@ -2370,7 +2377,10 @@ def main() -> None:
     if baseline_fid_posthoc:
         posthoc_methods.append("baseline")
     if robust_fid_posthoc:
-        posthoc_methods.extend(["wild_diffusion", "cdro"])
+        if wdro_rows:
+            posthoc_methods.append("wild_diffusion")
+        if cdro_rows:
+            posthoc_methods.append("cdro")
     if posthoc_methods:
         reeval_cmd = _build_posthoc_reeval_cmd(
             args=args,
@@ -2491,6 +2501,8 @@ def main() -> None:
             **ema_config_dict(args),
             "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
+            "wdro_enabled": bool(wdro_enabled),
+            "wdro_optional_for_rf_first_milestone": bool(str(args.training_objective).strip().lower() == "rf"),
         },
         "weighted_compute": {
             "shared_cap": float(shared_weighted_cap),
@@ -2510,6 +2522,7 @@ def main() -> None:
                 "fid_eval_steps": baseline_fid_eval_steps,
             },
             "wdro": {
+                "enabled": bool(wdro_enabled),
                 "max_total_steps": int(wdro_max_total_steps),
                 "warmup_mode": "fixed_from_max_budget_trajectory",
                 "fixed_warmup_steps": int(wdro_fixed_warmup_steps),

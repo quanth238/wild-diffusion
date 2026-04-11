@@ -6,6 +6,7 @@ import torch
 
 from ...shared.objective import compute_training_loss, rf_time_levels_from_sigma_levels
 from ...shared.runtime import autocast_context, resolve_amp_dtype
+from ...shared.sigma import build_log_sigma_quantile_cell_edges
 
 
 @dataclass
@@ -17,7 +18,7 @@ class RolloutResult:
     states_ref: Optional[torch.Tensor] = None
     states_ctrl: Optional[torch.Tensor] = None
     delta_path: Optional[torch.Tensor] = None
-    beta_path: Optional[torch.Tensor] = None
+    control_path: Optional[torch.Tensor] = None
 
 
 def _is_rf_objective(cfg) -> bool:
@@ -69,45 +70,107 @@ def build_kappa_schedule(
     return kappa * raw
 
 
-def build_time_deltas(
+def build_tau_levels(
     sigma_levels: torch.Tensor,
     time_horizon: float,
+    *,
+    sigma_min: float,
+    sigma_max: float,
 ) -> torch.Tensor:
-    """Build sigma-induced auxiliary-time deltas over the positive VE ladder.
-
-    The clean anchor `sigma_0 = 0` is treated as a boundary condition, not as part of
-    the log-sigma control clock. Consequently the first hop `0 -> sigma_min` receives
-    zero sigma-time, while positive-noise hops are spaced by normalized log-sigma and
-    scaled to `time_horizon`.
-    """
+    """Build the positive continuation tau ladder from the actual sigma ladder."""
 
     n_steps = int(sigma_levels.numel() - 1)
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
     if time_horizon <= 0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
-
-    if n_steps == 1:
-        return torch.full(
-            (1,),
-            float(time_horizon),
-            device=sigma_levels.device,
-            dtype=sigma_levels.dtype,
-        )
+    if sigma_min <= 0.0 or sigma_max <= 0.0:
+        raise ValueError(f"sigma_min and sigma_max must be positive, got {sigma_min}, {sigma_max}")
+    if sigma_min >= sigma_max:
+        raise ValueError(f"sigma_min must be < sigma_max, got {sigma_min} >= {sigma_max}")
 
     positive_sigma = sigma_levels[1:]
     if torch.any(positive_sigma <= 0):
         raise ValueError("sigma_levels[1:] must be strictly positive for the log-sigma CDRO clock.")
+    if positive_sigma.numel() > 1 and not torch.all(positive_sigma[1:] > positive_sigma[:-1]):
+        raise ValueError("Continuation sigma ladder must be strictly increasing.")
 
-    dt = torch.zeros((n_steps,), device=sigma_levels.device, dtype=sigma_levels.dtype)
-    log_sigma = positive_sigma.log()
-    log_span = log_sigma[-1] - log_sigma[0]
-    if float(log_span.abs().item()) <= 1e-12:
-        dt[1:] = float(time_horizon) / float(n_steps - 1)
-        return dt
+    log_span = math.log(float(sigma_max)) - math.log(float(sigma_min))
+    if log_span <= 0.0:
+        raise ValueError("Log-sigma continuation span must be positive.")
 
-    tau = float(time_horizon) * (log_sigma - log_sigma[0]) / log_span
-    dt[1:] = tau[1:] - tau[:-1]
+    tau = float(time_horizon) * (positive_sigma.log() - math.log(float(sigma_min))) / log_span
+    if torch.any(tau <= 0):
+        raise ValueError("Continuation tau ladder must be strictly positive.")
+    if tau.numel() > 1 and not torch.all(tau[1:] > tau[:-1]):
+        raise ValueError("Continuation tau ladder must be strictly increasing.")
+    return tau
+
+
+def build_time_deltas(
+    sigma_levels: torch.Tensor,
+    time_horizon: float,
+    *,
+    sigma_min: float,
+    sigma_max: float,
+) -> torch.Tensor:
+    """Build strictly positive transition sizes aligned to the positive continuation ladder."""
+
+    tau = build_tau_levels(
+        sigma_levels,
+        time_horizon,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    dt = torch.empty_like(tau)
+    dt[0] = tau[0]
+    if tau.numel() > 1:
+        dt[1:] = tau[1:] - tau[:-1]
+    if torch.any(dt <= 0):
+        raise ValueError("All continuation transition sizes Delta_tau_k must be strictly positive.")
+    return dt
+
+
+def _build_rf_path_deltas(sigma_levels: torch.Tensor) -> torch.Tensor:
+    """Return physical straight-path RF increments over the normalized t-grid."""
+
+    t_levels = rf_time_levels_from_sigma_levels(sigma_levels)
+    dt = t_levels[1:] - t_levels[:-1]
+    total = float(dt.sum().item())
+    if total <= 0.0:
+        raise ValueError("RF time grid must have positive total length.")
+    return dt
+
+
+def build_transition_deltas_for_objective(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    time_horizon: float,
+) -> torch.Tensor:
+    """Build method time deltas for the configured generative family."""
+
+    if _is_rf_objective(cfg):
+        dt = _build_rf_path_deltas(sigma_levels)
+        total = float(dt.sum().item())
+        return dt * (float(time_horizon) / total)
+    n_steps = int(sigma_levels.numel() - 1)
+    z_edges = build_log_sigma_quantile_cell_edges(
+        float(getattr(cfg, "sigma_min", 0.0)),
+        float(getattr(cfg, "sigma_max", 0.0)),
+        n_steps,
+        p_mean=float(getattr(cfg, "p_mean", -1.2)),
+        p_std=float(getattr(cfg, "p_std", 1.2)),
+        device=sigma_levels.device,
+        dtype=sigma_levels.dtype,
+    )
+    log_span = math.log(float(getattr(cfg, "sigma_max", 0.0))) - math.log(float(getattr(cfg, "sigma_min", 0.0)))
+    if log_span <= 0.0:
+        raise ValueError("Log-sigma continuation span must be positive.")
+    tau_edges = float(time_horizon) * (z_edges - math.log(float(getattr(cfg, "sigma_min", 0.0)))) / log_span
+    dt = tau_edges[1:] - tau_edges[:-1]
+    if torch.any(dt <= 0):
+        raise ValueError("All continuation transition sizes Delta_tau_k must be strictly positive.")
     return dt
 
 
@@ -117,54 +180,33 @@ def _build_time_deltas_for_objective(
     sigma_levels: torch.Tensor,
     time_horizon: float,
 ) -> torch.Tensor:
-    """Build method time deltas for the configured generative family."""
+    """Backward-compatible alias for family-aware continuation transition sizes."""
 
-    if _is_rf_objective(cfg):
-        t_levels = rf_time_levels_from_sigma_levels(sigma_levels)
-        dt = t_levels[1:] - t_levels[:-1]
-        total = float(dt.sum().item())
-        if total <= 0.0:
-            raise ValueError("RF time grid must have positive total length.")
-        return dt * (float(time_horizon) / total)
-    return build_time_deltas(sigma_levels, time_horizon)
+    return build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
 
 
-def _build_beta_budget_by_step(
-    sigma_levels: torch.Tensor,
+def _build_control_radius(
     total_budget: float,
     time_horizon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return sigma-time deltas and matching per-step beta-space budget shares."""
+) -> float:
+    """Return the shared per-step Euclidean projection radius in u-space."""
 
-    dt = build_time_deltas(sigma_levels, time_horizon)
-    total_tau = float(dt.sum().item())
-    if total_tau <= 0:
-        raise ValueError("sigma-induced CDRO time grid must have positive total length.")
-    beta_budget_by_step = float(total_budget) * dt / total_tau
-    return dt, beta_budget_by_step
-
-
-def _build_beta_budget_by_step_for_objective(
-    *,
-    cfg,
-    sigma_levels: torch.Tensor,
-    total_budget: float,
-    time_horizon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return family-aware time deltas and matching per-step beta-space budgets."""
-
-    dt = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
-    total_tau = float(dt.sum().item())
-    if total_tau <= 0:
-        raise ValueError("CDRO time grid must have positive total length.")
-    beta_budget_by_step = float(total_budget) * dt / total_tau
-    return dt, beta_budget_by_step
+    if total_budget < 0:
+        raise ValueError(f"total_budget must be >= 0, got {total_budget}")
+    if time_horizon <= 0:
+        raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
+    if total_budget == 0:
+        return 0.0
+    return math.sqrt(float(total_budget) / float(time_horizon))
 
 
 def build_constraint_radii(
     sigma_levels: torch.Tensor,
     total_budget: float,
     time_horizon: float,
+    *,
+    sigma_min: float,
+    sigma_max: float,
 ) -> torch.Tensor:
     """Exact Route-A local cap expressed in state-increment (`delta`) space."""
 
@@ -174,9 +216,14 @@ def build_constraint_radii(
     if total_budget < 0:
         raise ValueError(f"total_budget must be >= 0, got {total_budget}")
 
-    dt, beta_budget_by_step = _build_beta_budget_by_step(sigma_levels, total_budget, time_horizon)
-    radius_sq = dt * beta_budget_by_step
-    return torch.sqrt(radius_sq.clamp_min(0.0))
+    dt = build_time_deltas(
+        sigma_levels,
+        time_horizon,
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+    )
+    control_radius = _build_control_radius(total_budget, time_horizon)
+    return dt * float(control_radius)
 
 
 def build_constraint_radii_for_objective(
@@ -186,50 +233,16 @@ def build_constraint_radii_for_objective(
     total_budget: float,
     time_horizon: float,
 ) -> torch.Tensor:
-    """Exact Route-A local caps for the configured objective family."""
+    """Exact Route-A local delta caps implied by the u-space projection rule."""
 
     n_steps = int(sigma_levels.numel() - 1)
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
     if total_budget < 0:
         raise ValueError(f"total_budget must be >= 0, got {total_budget}")
-    dt, beta_budget_by_step = _build_beta_budget_by_step_for_objective(
-        cfg=cfg,
-        sigma_levels=sigma_levels,
-        total_budget=total_budget,
-        time_horizon=time_horizon,
-    )
-    radius_sq = dt * beta_budget_by_step
-    return torch.sqrt(radius_sq.clamp_min(0.0))
-
-
-def _build_beta_radii_by_step(
-    sigma_levels: torch.Tensor,
-    total_budget: float,
-    time_horizon: float,
-) -> torch.Tensor:
-    """Per-step beta-space radii with ||beta_k||^2 <= rho * Delta tau_k / T_tau."""
-
-    _, beta_budget_by_step = _build_beta_budget_by_step(sigma_levels, total_budget, time_horizon)
-    return torch.sqrt(beta_budget_by_step.clamp_min(0.0))
-
-
-def _build_beta_radii_by_step_for_objective(
-    *,
-    cfg,
-    sigma_levels: torch.Tensor,
-    total_budget: float,
-    time_horizon: float,
-) -> torch.Tensor:
-    """Per-step beta-space radii for the configured objective family."""
-
-    _, beta_budget_by_step = _build_beta_budget_by_step_for_objective(
-        cfg=cfg,
-        sigma_levels=sigma_levels,
-        total_budget=total_budget,
-        time_horizon=time_horizon,
-    )
-    return torch.sqrt(beta_budget_by_step.clamp_min(0.0))
+    dt = build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
+    control_radius = _build_control_radius(total_budget, time_horizon)
+    return dt * float(control_radius)
 
 
 def _as_sigma_batch(value: torch.Tensor, batch_size: int, x_ref: torch.Tensor) -> torch.Tensor:
@@ -260,7 +273,8 @@ def _rf_terminal_noise(
         terminal_eps = eps_schedule[-1].to(device=x0.device, dtype=x0.dtype)
     else:
         terminal_eps = eps_schedule.to(device=x0.device, dtype=x0.dtype)
-    return terminal_eps * float(sigma_levels[-1].item())
+    # Straight-path RF uses z ~ N(0, I); sigma_max only defines the inherited time grid.
+    return terminal_eps
 
 
 def rollout_path_heuristic_attack(
@@ -276,7 +290,7 @@ def rollout_path_heuristic_attack(
     time_horizon: float,
     eps_schedule: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
-    """Greedy Route-A CDRO attack with sigma-time-weighted local beta caps."""
+    """Greedy Route-A CDRO attack with literal u-space drift controls."""
 
     batch_size = x0.shape[0]
     n_steps = int(sigma_levels.numel() - 1)
@@ -291,16 +305,11 @@ def rollout_path_heuristic_attack(
     if time_horizon <= 0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
 
-    dt = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
-    sqrt_dt = torch.sqrt(dt.clamp_min(0.0))
-    beta_radius_by_step = _build_beta_radii_by_step_for_objective(
-        cfg=cfg,
-        sigma_levels=sigma_levels,
-        total_budget=total_budget,
-        time_horizon=time_horizon,
-    )
+    dt = build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
+    control_radius = _build_control_radius(total_budget, time_horizon)
     amp_dtype = resolve_amp_dtype(x0.device, getattr(cfg, "amp_dtype", "auto"))
     rf_objective = _is_rf_objective(cfg)
+    rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
     z_terminal = (
         _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
         if rf_objective
@@ -312,7 +321,7 @@ def rollout_path_heuristic_attack(
     path_ref = [x_ref]
     path_ctrl = [x_ctrl]
     path_delta = []
-    path_beta = []
+    path_control = []
 
     was_training = attack_net.training
     attack_net.eval()
@@ -321,52 +330,56 @@ def rollout_path_heuristic_attack(
         sigma_k = sigma_levels[k]
         sigma_next = sigma_levels[k + 1]
         if rf_objective:
-            delta_t = float(dt[k].item())
+            # The reference path follows the normalized RF straight path.
+            # The auxiliary CDRO clock only scales control magnitudes and budgets.
+            delta_t = float(rf_path_dt[k].item())
             base_increment = delta_t * (z_terminal - x0)
         else:
-            delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+            variance_increment = sigma_next.square() - sigma_k.square()
+            if float(variance_increment.item()) < -1e-12:
+                raise ValueError("VE variance increments must be nonnegative.")
+            delta_sigma = torch.sqrt(variance_increment.clamp_min(0.0))
             eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
             base_increment = delta_sigma * eps
         reference_state = (x_ref + base_increment).detach()
         x_nominal_next = (x_ctrl + base_increment).detach()
         sigma_batch = _as_sigma_batch(sigma_next, batch_size, x0)
 
-        beta = torch.zeros_like(x_ctrl)
-        step_sqrt_dt = float(sqrt_dt[k].item())
-        step_beta_radius = float(beta_radius_by_step[k].item())
-        if step_sqrt_dt > 0.0 and step_beta_radius > 0.0 and int(inner_steps) == 1:
+        control = torch.zeros_like(x_ctrl)
+        step_delta_tau = float(dt[k].item())
+        if step_delta_tau > 0.0 and control_radius > 0.0 and int(inner_steps) == 1:
             # With one inner step, solve the linearized local-cap problem exactly:
-            # max_{||beta|| <= sqrt(rho_k)} <grad, beta> where rho_k = rho * Delta tau_k / T_tau.
-            beta = beta.requires_grad_(True)
-            candidate = x_nominal_next + step_sqrt_dt * beta
+            # max_{||u|| <= sqrt(rho / T_tau)} <grad, u> under the local u-space cap.
+            control = control.requires_grad_(True)
+            candidate = x_nominal_next + step_delta_tau * control
             with autocast_context(x0.device, amp_dtype):
                 step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
-            grad = torch.autograd.grad(step_loss, beta)[0]
+            grad = torch.autograd.grad(step_loss, control)[0]
             grad_unit = _l2_normalize_per_sample(grad)
-            beta_radius = torch.full((batch_size,), step_beta_radius, device=x0.device, dtype=x0.dtype)
-            beta = (grad_unit.reshape(batch_size, -1) * beta_radius[:, None]).reshape_as(grad).detach()
-        elif step_sqrt_dt > 0.0 and step_beta_radius > 0.0:
-            beta_radius = torch.full((batch_size,), step_beta_radius, device=x0.device, dtype=x0.dtype)
+            control_cap = torch.full((batch_size,), control_radius, device=x0.device, dtype=x0.dtype)
+            control = (grad_unit.reshape(batch_size, -1) * control_cap[:, None]).reshape_as(grad).detach()
+        elif step_delta_tau > 0.0 and control_radius > 0.0:
+            control_cap = torch.full((batch_size,), control_radius, device=x0.device, dtype=x0.dtype)
             for _ in range(int(inner_steps)):
-                beta.requires_grad_(True)
-                candidate = x_nominal_next + step_sqrt_dt * beta
+                control.requires_grad_(True)
+                candidate = x_nominal_next + step_delta_tau * control
                 with autocast_context(x0.device, amp_dtype):
                     step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
-                grad = torch.autograd.grad(step_loss, beta)[0]
+                grad = torch.autograd.grad(step_loss, control)[0]
 
                 grad_unit = _l2_normalize_per_sample(grad)
                 step = float(step_size) * grad_unit
-                beta = (beta + step).detach()
-                beta = project_l2_ball(beta, beta_radius).detach()
+                control = (control + step).detach()
+                control = project_l2_ball(control, control_cap).detach()
 
-        delta_effective = step_sqrt_dt * beta
+        delta_effective = step_delta_tau * control
         candidate_final = (x_nominal_next + delta_effective).detach()
         x_ref = reference_state
         x_ctrl = candidate_final
         path_ref.append(x_ref)
         path_ctrl.append(x_ctrl)
         path_delta.append(delta_effective.detach())
-        path_beta.append(beta.detach())
+        path_control.append(control.detach())
 
     if was_training:
         attack_net.train()
@@ -374,7 +387,7 @@ def rollout_path_heuristic_attack(
     states_ctrl = torch.stack(path_ctrl, dim=1)
     states_ref = torch.stack(path_ref, dim=1)
     delta_path = torch.stack(path_delta, dim=1)
-    beta_path = torch.stack(path_beta, dim=1)
+    control_path = torch.stack(path_control, dim=1)
     x_target = states_ctrl[torch.arange(batch_size, device=x0.device), target_indices]
     sigma_target = sigma_levels[target_indices]
     return RolloutResult(
@@ -383,7 +396,7 @@ def rollout_path_heuristic_attack(
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,
-        beta_path=beta_path,
+        control_path=control_path,
     )
 
 
@@ -402,7 +415,7 @@ def rollout_controlled_ve(
 ) -> RolloutResult:
     """Reference VE rollout for CDRO.
 
-    CDRO training uses a denoiser-dependent beta-space attack during rollout construction,
+    CDRO training uses a denoiser-dependent u-space attack during rollout construction,
     not a persistent learned control policy. For API compatibility we expose the shared-noise
     reference rollout with zero additional control increments.
     """
@@ -415,9 +428,15 @@ def rollout_controlled_ve(
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
     rf_objective = bool(cfg is not None and _is_rf_objective(cfg))
     if cfg is not None:
-        _ = _build_time_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
+        _ = build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
     else:
-        _ = build_time_deltas(sigma_levels, time_horizon)
+        _ = build_time_deltas(
+            sigma_levels,
+            time_horizon,
+            sigma_min=float(sigma_levels[1].item()),
+            sigma_max=float(sigma_levels[-1].item()),
+        )
+    rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
     z_terminal = (
         _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
         if rf_objective
@@ -428,28 +447,30 @@ def rollout_controlled_ve(
     path_ref = [x_ref]
     path_ctrl = [x_ref]
     path_delta = []
-    path_beta = []
+    path_control = []
 
     for k in range(n_steps):
         sigma_k = sigma_levels[k]
         sigma_next = sigma_levels[k + 1]
         if rf_objective:
-            t_levels = rf_time_levels_from_sigma_levels(sigma_levels).to(device=x0.device, dtype=x0.dtype)
-            delta_t = float((t_levels[k + 1] - t_levels[k]).item())
+            delta_t = float(rf_path_dt[k].item())
             x_ref = x_ref + delta_t * (z_terminal - x0)
         else:
-            delta_sigma = torch.sqrt((sigma_next.square() - sigma_k.square()).clamp_min(1e-8))
+            variance_increment = sigma_next.square() - sigma_k.square()
+            if float(variance_increment.item()) < -1e-12:
+                raise ValueError("VE variance increments must be nonnegative.")
+            delta_sigma = torch.sqrt(variance_increment.clamp_min(0.0))
             eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
             x_ref = x_ref + delta_sigma * eps
         path_ref.append(x_ref)
         path_ctrl.append(x_ref)
         path_delta.append(torch.zeros_like(x_ref))
-        path_beta.append(torch.zeros_like(x_ref))
+        path_control.append(torch.zeros_like(x_ref))
 
     states_ref = torch.stack(path_ref, dim=1)
     states_ctrl = torch.stack(path_ctrl, dim=1)
     delta_path = torch.stack(path_delta, dim=1)
-    beta_path = torch.stack(path_beta, dim=1)
+    control_path = torch.stack(path_control, dim=1)
     x_target = states_ctrl[torch.arange(batch_size, device=x0.device), target_indices]
     sigma_target = sigma_levels[target_indices]
 
@@ -459,5 +480,5 @@ def rollout_controlled_ve(
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,
-        beta_path=beta_path,
+        control_path=control_path,
     )
