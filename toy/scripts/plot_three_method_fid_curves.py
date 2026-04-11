@@ -17,7 +17,7 @@ ROBUST_STYLE = {
 
 FAMILY_STYLE = {
     "edm": {"label": "EDM", "marker": "o", "linestyle": "-", "order": 0},
-    "rf": {"label": "Rectified Flow", "marker": "s", "linestyle": "--", "order": 1},
+    "rf": {"label": "RF", "marker": "s", "linestyle": "--", "order": 1},
     "score": {"label": "Score VE", "marker": "^", "linestyle": ":", "order": 2},
 }
 
@@ -112,19 +112,21 @@ def _normalize_series_fields(row: Dict) -> Dict:
         robust_method,
         {"label": robust_method.replace("_", " ").title()},
     )["label"]
+    if robust_method == "wild_diffusion":
+        robust_label = "Wild-Diffusion"
     backbone_label = str(row.get("backbone_label", "")).strip() or FAMILY_STYLE.get(
         backbone_family,
         {"label": backbone_family.replace("_", " ").title()},
     )["label"]
+    if backbone_family == "rf":
+        backbone_label = "RF"
     out["method"] = robust_method
     out["robust_method"] = robust_method
     out["robust_label"] = robust_label
     out["backbone_family"] = backbone_family
     out["backbone_label"] = backbone_label
     out["series_key"] = str(row.get("series_key", "")).strip() or f"{robust_method}_{backbone_family}"
-    out["series_label"] = (
-        str(row.get("series_label", "")).strip() or f"{robust_label} {backbone_label}"
-    )
+    out["series_label"] = f"{robust_label} {backbone_label}"
     out["method_version_used"] = str(row.get("method_version_used", row.get("method", ""))).strip()
     return out
 
@@ -540,7 +542,7 @@ def main() -> None:
         "notes": {
             "style_encoding": (
                 "Color encodes the robustifier family (Baseline / Wild-Diffusion / CDRO); "
-                "line style and marker encode the backbone family (EDM / Rectified Flow / Score VE)."
+                "line style and marker encode the backbone family (EDM / RF / Score VE)."
             ),
             "loss_metric_warning": (
                 "Baseline uses the backbone-native baseline loss, while robust methods use robust outer losses. "

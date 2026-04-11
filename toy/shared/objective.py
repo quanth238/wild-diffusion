@@ -123,19 +123,62 @@ def weighted_score_matching_loss(
     return (w * (pred_score - target_score).pow(2)).reshape(x_clean.shape[0], -1).sum(dim=1).mean()
 
 
+def _regression_loss_from_error(
+    error: torch.Tensor,
+    *,
+    loss_kind: str = "mse",
+    pseudo_huber_delta: float = 0.1,
+) -> torch.Tensor:
+    """Reduce a per-sample regression error with the configured RF loss."""
+
+    flat = error.reshape(error.shape[0], -1)
+    kind = str(loss_kind).strip().lower()
+    if kind == "pseudo_huber":
+        delta = max(float(pseudo_huber_delta), 1e-8)
+        per_element = (delta ** 2) * (torch.sqrt(1.0 + (flat / delta).pow(2)) - 1.0)
+        return per_element.sum(dim=1).mean()
+    if kind == "mse":
+        return flat.pow(2).sum(dim=1).mean()
+    raise ValueError(f"Unsupported RF regression loss '{loss_kind}'. Expected one of: mse, pseudo_huber.")
+
+
 def weighted_rectified_flow_loss(
     denoiser,
     x_t: torch.Tensor,
-    x_clean: torch.Tensor,
+    x_left: torch.Tensor,
     sigma: torch.Tensor,
     sigma_max: float,
+    *,
+    x_right: torch.Tensor = None,
+    loss_kind: str = "mse",
+    pseudo_huber_delta: float = 0.1,
 ) -> torch.Tensor:
-    """Compute RF regression loss E[||v_theta(x_t,t) - (x_t - x0)/t||^2]."""
+    """Compute RF velocity regression under an explicit or inferred path pair."""
 
     t = rf_time_from_sigma(sigma, sigma_max).clamp_min(1e-6)
     pred_velocity = predict_velocity(denoiser, x_t, sigma, sigma_max=sigma_max)
-    target_velocity = (x_t - x_clean) / batch_scalar_like(t, x_t).clamp_min(1e-8)
-    return (pred_velocity - target_velocity).pow(2).reshape(x_clean.shape[0], -1).sum(dim=1).mean()
+    if x_right is None:
+        # Backward-compatible path: valid when x_t lies on the unperturbed RF
+        # straight path from x_left to the sampled terminal endpoint.
+        target_velocity = (x_t - x_left) / batch_scalar_like(t, x_t).clamp_min(1e-8)
+    else:
+        target_velocity = x_right - x_left
+    return _regression_loss_from_error(
+        pred_velocity - target_velocity,
+        loss_kind=loss_kind,
+        pseudo_huber_delta=pseudo_huber_delta,
+    )
+
+
+def build_rectified_flow_state(
+    x_left: torch.Tensor,
+    x_right: torch.Tensor,
+    t: torch.Tensor,
+) -> torch.Tensor:
+    """Construct the RF interpolant x_t = (1 - t) x_left + t x_right."""
+
+    t_batch = batch_scalar_like(t, x_left)
+    return (1.0 - t_batch) * x_left + t_batch * x_right
 
 
 def build_training_state(
@@ -171,6 +214,8 @@ def compute_training_loss(
     x_noisy: torch.Tensor,
     x_clean: torch.Tensor,
     sigma: torch.Tensor,
+    *,
+    x_right: torch.Tensor = None,
 ) -> torch.Tensor:
     """Dispatch train loss by objective kind: EDM, score matching, or rectified flow."""
 
@@ -192,6 +237,9 @@ def compute_training_loss(
             x_clean,
             sigma,
             sigma_max=float(getattr(cfg, "sigma_max", 1.0)),
+            x_right=x_right,
+            loss_kind=str(getattr(cfg, "rf_loss", "mse")),
+            pseudo_huber_delta=float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
         )
     raise ValueError(f"Unsupported training objective '{objective}'. Expected one of: edm, score, rf.")
 

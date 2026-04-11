@@ -57,6 +57,30 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--score-matching-weight-power must be >= 0, got {cfg.score_matching_weight_power}"
         )
+    if str(cfg.rf_baseline_mode).lower() not in ("strong", "plain"):
+        raise ValueError(
+            f"--rf-baseline-mode must be one of ('strong', 'plain'), got {cfg.rf_baseline_mode}"
+        )
+    if not (0.0 < float(cfg.rf_stage1_fraction) < 1.0):
+        raise ValueError(
+            f"--rf-stage1-fraction must be in (0, 1), got {cfg.rf_stage1_fraction}"
+        )
+    if str(cfg.rf_reflow_t_distribution).lower() not in ("u_shaped", "uniform"):
+        raise ValueError(
+            "--rf-reflow-t-distribution must be one of ('u_shaped', 'uniform'), got "
+            f"{cfg.rf_reflow_t_distribution}"
+        )
+    if str(cfg.rf_loss).lower() not in ("pseudo_huber", "mse"):
+        raise ValueError(f"--rf-loss must be one of ('pseudo_huber', 'mse'), got {cfg.rf_loss}")
+    if float(cfg.rf_pseudo_huber_delta) <= 0:
+        raise ValueError(
+            f"--rf-pseudo-huber-delta must be > 0, got {cfg.rf_pseudo_huber_delta}"
+        )
+    if str(cfg.rf_cdro_pair_source).lower() not in ("auto", "reflow", "data_noise"):
+        raise ValueError(
+            "--rf-cdro-pair-source must be one of ('auto', 'reflow', 'data_noise'), got "
+            f"{cfg.rf_cdro_pair_source}"
+        )
     if cfg.n_steps_path <= 0:
         raise ValueError(f"--n-steps-path must be > 0, got {cfg.n_steps_path}")
     if cfg.sigma_min <= 0:
@@ -301,6 +325,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-phi-grad", type=float, default=ToyConfig.clip_phi_grad)
     parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score", "rf"])
     parser.add_argument("--score-matching-weight-power", type=float, default=ToyConfig.score_matching_weight_power)
+    parser.add_argument(
+        "--rf-baseline-mode",
+        type=str,
+        default=ToyConfig.rf_baseline_mode,
+        choices=["strong", "plain"],
+    )
+    parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
+    parser.add_argument(
+        "--rf-reflow-t-distribution",
+        type=str,
+        default=ToyConfig.rf_reflow_t_distribution,
+        choices=["u_shaped", "uniform"],
+    )
+    parser.add_argument("--rf-loss", type=str, default=ToyConfig.rf_loss, choices=["pseudo_huber", "mse"])
+    parser.add_argument("--rf-pseudo-huber-delta", type=float, default=ToyConfig.rf_pseudo_huber_delta)
+    parser.add_argument("--rf-edm-init-ckpt-path", type=str, default=ToyConfig.rf_edm_init_ckpt_path)
+    parser.add_argument(
+        "--rf-cdro-pair-source",
+        type=str,
+        default=ToyConfig.rf_cdro_pair_source,
+        choices=["auto", "reflow", "data_noise"],
+    )
 
     parser.add_argument("--n-modes", type=int, default=ToyConfig.n_modes)
     parser.add_argument("--mode-radius", type=float, default=ToyConfig.mode_radius)

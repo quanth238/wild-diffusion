@@ -70,6 +70,15 @@ class ToyConfig:
     clip_phi_grad: float = 1.0
     training_objective: str = "edm"  # edm|score|rf
     score_matching_weight_power: float = 2.0  # lambda(sigma)=sigma^p in score objective
+    # Rectified Flow baseline controls. Public RF runs default to a two-stage
+    # baseline: continuous-time 1-RF pretraining followed by one reflow round.
+    rf_baseline_mode: str = "strong"  # strong|plain
+    rf_stage1_fraction: float = 0.5
+    rf_reflow_t_distribution: str = "u_shaped"  # u_shaped|uniform
+    rf_loss: str = "pseudo_huber"  # pseudo_huber|mse
+    rf_pseudo_huber_delta: float = 0.1
+    rf_edm_init_ckpt_path: str = ""
+    rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise
 
     # Data.
     n_modes: int = 8

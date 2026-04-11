@@ -15,6 +15,8 @@ class RolloutResult:
 
     x_target: torch.Tensor
     sigma_target: torch.Tensor
+    x_left: Optional[torch.Tensor] = None
+    x_right: Optional[torch.Tensor] = None
     states_ref: Optional[torch.Tensor] = None
     states_ctrl: Optional[torch.Tensor] = None
     delta_path: Optional[torch.Tensor] = None
@@ -264,9 +266,17 @@ def _rf_terminal_noise(
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
     eps_schedule: Optional[torch.Tensor],
+    rf_pair_right: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Resolve one terminal-noise sample per batch element for RF forward paths."""
 
+    del sigma_levels
+    if rf_pair_right is not None:
+        if tuple(rf_pair_right.shape) != tuple(x0.shape):
+            raise ValueError(
+                f"rf_pair_right must match x0 shape {tuple(x0.shape)}, got {tuple(rf_pair_right.shape)}"
+            )
+        return rf_pair_right.to(device=x0.device, dtype=x0.dtype)
     if eps_schedule is None:
         terminal_eps = torch.randn_like(x0)
     elif eps_schedule.ndim == x0.ndim + 1:
@@ -289,6 +299,7 @@ def rollout_path_heuristic_attack(
     total_budget: float,
     time_horizon: float,
     eps_schedule: Optional[torch.Tensor] = None,
+    rf_pair_right: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
     """Greedy Route-A CDRO attack with literal u-space drift controls."""
 
@@ -311,7 +322,12 @@ def rollout_path_heuristic_attack(
     rf_objective = _is_rf_objective(cfg)
     rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
     z_terminal = (
-        _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
+        _rf_terminal_noise(
+            x0=x0,
+            sigma_levels=sigma_levels,
+            eps_schedule=eps_schedule,
+            rf_pair_right=rf_pair_right,
+        )
         if rf_objective
         else None
     )
@@ -353,7 +369,14 @@ def rollout_path_heuristic_attack(
             control = control.requires_grad_(True)
             candidate = x_nominal_next + step_delta_tau * control
             with autocast_context(x0.device, amp_dtype):
-                step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
+                step_loss = compute_training_loss(
+                    cfg,
+                    attack_net,
+                    candidate,
+                    x0,
+                    sigma_batch,
+                    x_right=z_terminal,
+                )
             grad = torch.autograd.grad(step_loss, control)[0]
             grad_unit = _l2_normalize_per_sample(grad)
             control_cap = torch.full((batch_size,), control_radius, device=x0.device, dtype=x0.dtype)
@@ -364,7 +387,14 @@ def rollout_path_heuristic_attack(
                 control.requires_grad_(True)
                 candidate = x_nominal_next + step_delta_tau * control
                 with autocast_context(x0.device, amp_dtype):
-                    step_loss = compute_training_loss(cfg, attack_net, candidate, x0, sigma_batch)
+                    step_loss = compute_training_loss(
+                        cfg,
+                        attack_net,
+                        candidate,
+                        x0,
+                        sigma_batch,
+                        x_right=z_terminal,
+                    )
                 grad = torch.autograd.grad(step_loss, control)[0]
 
                 grad_unit = _l2_normalize_per_sample(grad)
@@ -393,6 +423,8 @@ def rollout_path_heuristic_attack(
     return RolloutResult(
         x_target=x_target,
         sigma_target=sigma_target,
+        x_left=x0,
+        x_right=z_terminal,
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,
@@ -412,6 +444,7 @@ def rollout_controlled_ve(
     total_budget: Optional[float] = None,
     time_horizon: float = 1.0,
     cfg=None,
+    rf_pair_right: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
     """Reference VE rollout for CDRO.
 
@@ -438,7 +471,12 @@ def rollout_controlled_ve(
         )
     rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
     z_terminal = (
-        _rf_terminal_noise(x0=x0, sigma_levels=sigma_levels, eps_schedule=eps_schedule)
+        _rf_terminal_noise(
+            x0=x0,
+            sigma_levels=sigma_levels,
+            eps_schedule=eps_schedule,
+            rf_pair_right=rf_pair_right,
+        )
         if rf_objective
         else None
     )
@@ -477,6 +515,8 @@ def rollout_controlled_ve(
     return RolloutResult(
         x_target=x_target,
         sigma_target=sigma_target,
+        x_left=x0,
+        x_right=z_terminal,
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,

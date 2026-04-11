@@ -15,6 +15,39 @@ def build_sigma_levels(sigma_min: float, sigma_max: float, n_steps: int, device:
     )
 
 
+def build_rf_time_quantile_levels(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    distribution: str = "u_shaped",
+) -> torch.Tensor:
+    """Build an RF solver/continuation ladder from normalized-time cell edges.
+
+    The returned tensor still uses the repo's sigma-shaped API, with
+    `sigma = t * sigma_max`; unlike EDM ladders, these values are RF clock
+    coordinates rather than noise scales.
+    """
+
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    sigma_max_value = float(sigma_max)
+    if sigma_max_value <= 0.0:
+        raise ValueError(f"sigma_max must be > 0 for RF time levels, got {sigma_max}")
+    probs = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=device)
+    mode = str(distribution).strip().lower()
+    if mode == "u_shaped":
+        # Inverse CDF of Beta(1/2, 1/2): F^{-1}(u) = sin^2(pi u / 2).
+        t_levels = torch.sin(0.5 * math.pi * probs).square()
+    elif mode == "uniform":
+        t_levels = probs
+    else:
+        raise ValueError(
+            f"Unsupported RF time distribution '{distribution}'. Expected one of: u_shaped, uniform."
+        )
+    return t_levels * sigma_max_value
+
+
 def _truncated_log_sigma_cdf_bounds(
     *,
     sigma_min: float,

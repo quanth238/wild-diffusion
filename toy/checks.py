@@ -156,7 +156,14 @@ def gradient_check_denoiser(
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
         )
-        return compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
+        return compute_training_loss(
+            cfg,
+            denoiser,
+            roll.x_target,
+            x0,
+            roll.sigma_target,
+            x_right=getattr(roll, "x_right", None),
+        )
 
     loss = loss_fn()
     loss.backward()
@@ -218,7 +225,14 @@ def gradient_check_control(
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
         )
-        train_loss = compute_training_loss(cfg, denoiser, roll.x_target, x0, roll.sigma_target)
+        train_loss = compute_training_loss(
+            cfg,
+            denoiser,
+            roll.x_target,
+            x0,
+            roll.sigma_target,
+            x_right=getattr(roll, "x_right", None),
+        )
         return inner_objective_attack_only(train_loss)
 
     def training_inner_loss():

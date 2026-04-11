@@ -43,7 +43,12 @@ if __package__ is None or __package__ == "":
     from toy.shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from toy.shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from toy.shared.reverse import sample_reverse_paths
-    from toy.shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
+    from toy.shared.sigma import (
+        build_rf_time_quantile_levels,
+        build_sigma_levels,
+        sample_target_indices,
+        sample_target_indices_log_normal,
+    )
     from toy.shared.train_utils import sample_train_batch
     from toy.utils import batch_scalar_like, ensure_dir, has_nan_or_inf, pick_device, scalarize, set_seed
 else:
@@ -57,7 +62,12 @@ else:
     from ..shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from ..shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
     from ..shared.reverse import sample_reverse_paths
-    from ..shared.sigma import build_sigma_levels, sample_target_indices, sample_target_indices_log_normal
+    from ..shared.sigma import (
+        build_rf_time_quantile_levels,
+        build_sigma_levels,
+        sample_target_indices,
+        sample_target_indices_log_normal,
+    )
     from ..shared.train_utils import sample_train_batch
     from ..utils import batch_scalar_like, ensure_dir, has_nan_or_inf, pick_device, scalarize, set_seed
 
@@ -299,6 +309,13 @@ def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float,
         "hidden_dim": int(cfg.hidden_dim),
         "lr_theta": float(cfg.lr_theta),
         "training_objective": str(cfg.training_objective),
+        "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
+        "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+        "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
+        "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
+        "rf_edm_init_ckpt_path": str(getattr(cfg, "rf_edm_init_ckpt_path", "")),
+        "rf_cdro_pair_source": str(getattr(cfg, "rf_cdro_pair_source", "auto")),
         "n_steps_path": int(cfg.n_steps_path),
         "sigma_min": float(cfg.sigma_min),
         "sigma_max": float(cfg.sigma_max),
@@ -864,6 +881,13 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.batch_size = int(args.batch_size)
     cfg.hidden_dim = int(args.hidden_dim)
     cfg.training_objective = str(args.training_objective)
+    cfg.rf_baseline_mode = str(args.rf_baseline_mode)
+    cfg.rf_stage1_fraction = float(args.rf_stage1_fraction)
+    cfg.rf_reflow_t_distribution = str(args.rf_reflow_t_distribution)
+    cfg.rf_loss = str(args.rf_loss)
+    cfg.rf_pseudo_huber_delta = float(args.rf_pseudo_huber_delta)
+    cfg.rf_edm_init_ckpt_path = str(args.rf_edm_init_ckpt_path)
+    cfg.rf_cdro_pair_source = str(args.rf_cdro_pair_source)
     cfg.n_steps_path = int(args.n_steps_path)
     cfg.sigma_min = float(args.sigma_min)
     cfg.sigma_max = float(args.sigma_max)
@@ -910,7 +934,7 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
 def _objective_display_name(training_objective: str) -> str:
     objective = str(training_objective).strip().lower()
     if objective == "rf":
-        return "Rectified Flow"
+        return "RF"
     if objective == "score":
         return "Score VE"
     return "EDM"
@@ -959,10 +983,27 @@ def _run_combo(
             ]
 
     print(f"[combo] start pct={train_percent:g} seed={seed} max_step={cfg.steps}", flush=True)
+    if (
+        str(cfg.training_objective).strip().lower() == "rf"
+        and str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower() == "strong"
+    ):
+        raise NotImplementedError(
+            "The checkpointed baseline convergence sweep does not yet support the strong two-stage RF baseline. "
+            "Use toy/run_toy.py for public RF and CDRO-RF runs, or pass --rf-baseline-mode=plain for an internal "
+            "debug-only RF trajectory."
+        )
     set_seed(cfg.seed)
     dataset = build_dataset_bundle(cfg, device)
     cfg.sigma_data = dataset.estimate_sigma_data()
-    sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+    if str(cfg.training_objective).strip().lower() == "rf":
+        sigma_levels = build_rf_time_quantile_levels(
+            cfg.sigma_max,
+            cfg.n_steps_path,
+            device=device,
+            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+    else:
+        sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
     model_bundle = build_model_bundle(cfg, dataset, sigma_data=cfg.sigma_data, device=device)
     baseline = model_bundle.baseline
 
@@ -1305,6 +1346,23 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
+    parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong", "plain"])
+    parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
+    parser.add_argument(
+        "--rf-reflow-t-distribution",
+        type=str,
+        default=ToyConfig.rf_reflow_t_distribution,
+        choices=["u_shaped", "uniform"],
+    )
+    parser.add_argument("--rf-loss", type=str, default=ToyConfig.rf_loss, choices=["pseudo_huber", "mse"])
+    parser.add_argument("--rf-pseudo-huber-delta", type=float, default=ToyConfig.rf_pseudo_huber_delta)
+    parser.add_argument("--rf-edm-init-ckpt-path", type=str, default=ToyConfig.rf_edm_init_ckpt_path)
+    parser.add_argument(
+        "--rf-cdro-pair-source",
+        type=str,
+        default=ToyConfig.rf_cdro_pair_source,
+        choices=["auto", "reflow", "data_noise"],
+    )
     parser.add_argument("--n-steps-path", type=int, default=24)
     parser.add_argument("--sigma-min", type=float, default=0.01)
     parser.add_argument("--sigma-max", type=float, default=80.0)

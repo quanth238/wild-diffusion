@@ -10,7 +10,7 @@ from .shared.reverse import (
     reverse_posterior_std as _reverse_posterior_std,
     sample_reverse_paths,
 )
-from .shared.trainer_common import sample_with_denoiser, train_baseline
+from .shared.trainer_common import generate_reflow_pairs, sample_with_denoiser, train_baseline
 from .versions.cdro.trainer import train_trajectory_robust_energy
 
 # Preserve the legacy symbol for older imports that still expect a constrained
@@ -24,6 +24,7 @@ __all__ = [
     "train_trajectory_robust_constrained",
     "train_trajectory_robust_energy",
     "sample_with_denoiser",
+    "generate_reflow_pairs",
     "sample_reverse_paths",
     "reverse_paths_from_terminal",
 ]

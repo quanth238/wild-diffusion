@@ -27,7 +27,12 @@ from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
 from ..shared.ema import ema_config_dict
 from ..shared.objective import terminal_prior_scale_from_objective
-from ..shared.sigma import build_sigma_levels, build_sigma_levels_from_warmup_quantiles, sample_target_indices
+from ..shared.sigma import (
+    build_rf_time_quantile_levels,
+    build_sigma_levels,
+    build_sigma_levels_from_warmup_quantiles,
+    sample_target_indices,
+)
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
 from ..model_backends.provider import build_model_bundle
 from .utils import (
@@ -98,6 +103,132 @@ def _sample_terminal_batch_for_objective(
         float(sigma_levels[-1].item()),
     )
     return dataset.sample_terminal_batch(batch_size, terminal_scale)
+
+
+def _build_family_sigma_levels(cfg, device: torch.device) -> torch.Tensor:
+    """Build the solver/continuation grid for the active generative family."""
+
+    objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
+    if objective == "rf":
+        return build_rf_time_quantile_levels(
+            float(getattr(cfg, "sigma_max", 1.0)),
+            int(getattr(cfg, "n_steps_path", 1)),
+            device=device,
+            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+    return build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+
+
+def _checkpoint_state_dict_for_rf_init(payload: Any) -> tuple[Dict[str, torch.Tensor], str]:
+    """Extract a likely model state dict from common repo checkpoint payloads."""
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("RF EDM init checkpoint must contain a state-dict-like payload.")
+    for key in ("baseline_state_dict", "state_dict", "model_state_dict", "robust_state_dict", "ema_state_dict"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict):
+            return candidate, key
+    if payload and all(torch.is_tensor(value) for value in payload.values()):
+        return payload, "raw_state_dict"
+    raise RuntimeError(
+        "Could not find a model state dict in RF EDM init checkpoint. "
+        "Expected one of baseline_state_dict, state_dict, model_state_dict, robust_state_dict, ema_state_dict, "
+        "or a raw tensor state dict."
+    )
+
+
+def _normalize_source_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            continue
+        text_key = str(key)
+        out[text_key] = value
+        if text_key.startswith("module."):
+            out[text_key[len("module.") :]] = value
+    return out
+
+
+def _candidate_edm_source_keys_for_rf(target_key: str) -> list[str]:
+    candidates = [target_key]
+    if "time_mlp" in target_key:
+        candidates.append(target_key.replace("time_mlp", "noise_mlp"))
+    return candidates
+
+
+def _warm_start_rf_model_from_state_dict(model, source_state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Best-effort EDM -> RF weight transfer for compatible trunks/backbones."""
+
+    source = _normalize_source_state_dict(source_state_dict)
+    target = model.state_dict()
+    updated = dict(target)
+    transferred = []
+    shape_mismatches = []
+    missing = []
+    for target_key, target_tensor in target.items():
+        copied = False
+        saw_candidate = False
+        for source_key in _candidate_edm_source_keys_for_rf(target_key):
+            source_tensor = source.get(source_key)
+            if source_tensor is None:
+                continue
+            saw_candidate = True
+            if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+                shape_mismatches.append(
+                    {
+                        "target_key": target_key,
+                        "source_key": source_key,
+                        "target_shape": list(target_tensor.shape),
+                        "source_shape": list(source_tensor.shape),
+                    }
+                )
+                continue
+            updated[target_key] = source_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
+            transferred.append({"target_key": target_key, "source_key": source_key})
+            copied = True
+            break
+        if not copied and not saw_candidate:
+            missing.append(target_key)
+    model.load_state_dict(updated, strict=True)
+    return {
+        "transferred_count": int(len(transferred)),
+        "target_key_count": int(len(target)),
+        "shape_mismatch_count": int(len(shape_mismatches)),
+        "missing_count": int(len(missing)),
+        "transferred_preview": transferred[:12],
+        "shape_mismatch_preview": shape_mismatches[:12],
+        "missing_preview": missing[:12],
+    }
+
+
+def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle) -> Dict[str, Any]:
+    """Initialize RF models from an EDM checkpoint when requested."""
+
+    objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
+    ckpt_path = str(getattr(cfg, "rf_edm_init_ckpt_path", "")).strip()
+    report: Dict[str, Any] = {
+        "enabled": bool(objective == "rf" and ckpt_path),
+        "path": ckpt_path,
+        "source_state_key": None,
+        "baseline": None,
+        "robust": None,
+    }
+    if objective != "rf" or not ckpt_path:
+        return report
+    abs_path = os.path.abspath(ckpt_path)
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"RF EDM init checkpoint not found: {abs_path}")
+    payload = torch.load(abs_path, map_location="cpu", weights_only=False)
+    source_state, source_key = _checkpoint_state_dict_for_rf_init(payload)
+    report["path"] = abs_path
+    report["source_state_key"] = source_key
+    report["baseline"] = _warm_start_rf_model_from_state_dict(model_bundle.baseline, source_state)
+    report["robust"] = _warm_start_rf_model_from_state_dict(model_bundle.robust, source_state)
+    if int(report["baseline"]["transferred_count"]) <= 0:
+        raise RuntimeError(
+            f"RF EDM init checkpoint did not transfer any compatible baseline weights: {abs_path}"
+        )
+    return report
 
 
 def _load_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
@@ -449,10 +580,11 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
 
     train_selection_policy = dataset.metadata.get("train_selection_policy")
     sigma_list = [float(v.item()) for v in sigma_levels.detach().cpu()]
+    objective = str(cfg.training_objective).strip().lower()
     # NOTE: `method_version` is intentionally excluded so v2/v2.1/v1.1 can share
     # one identical baseline checkpoint under the same baseline data+train settings.
-    return {
-        "signature_version": 1,
+    signature = {
+        "signature_version": 2 if objective == "rf" else 1,
         "seed": int(cfg.seed),
         "dataset_kind": str(dataset.name),
         "dataset_path": str(getattr(cfg, "dataset_path", "")),
@@ -481,6 +613,21 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
         "p_std": float(cfg.p_std),
         **ema_config_dict(cfg),
     }
+    if objective == "rf":
+        signature.update(
+            {
+                "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
+                "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+                "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+                "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
+                "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
+                "rf_edm_init_ckpt_path": str(getattr(cfg, "rf_edm_init_ckpt_path", "")),
+                "rf_ema_forced_for_strong_baseline": bool(
+                    str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower() == "strong"
+                ),
+            }
+        )
+    return signature
 
 
 def _estimate_wdro_robust_step_batch_equiv(cfg, train_pool_size: Optional[int]) -> float:
@@ -1207,17 +1354,25 @@ def run_experiment(cfg) -> dict:
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
-    baseline_sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+    baseline_sigma_levels = _build_family_sigma_levels(cfg, device)
     sigma_levels = baseline_sigma_levels
     if method_name == "cdro":
-        sigma_levels = build_sigma_levels_from_warmup_quantiles(
-            cfg.sigma_min,
-            cfg.sigma_max,
-            cfg.n_steps_path,
-            device=device,
-            p_mean=cfg.p_mean,
-            p_std=cfg.p_std,
-        )
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            sigma_levels = build_rf_time_quantile_levels(
+                float(cfg.sigma_max),
+                int(cfg.n_steps_path),
+                device=device,
+                distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            )
+        else:
+            sigma_levels = build_sigma_levels_from_warmup_quantiles(
+                cfg.sigma_min,
+                cfg.sigma_max,
+                cfg.n_steps_path,
+                device=device,
+                p_mean=cfg.p_mean,
+                p_std=cfg.p_std,
+            )
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -1241,6 +1396,16 @@ def run_experiment(cfg) -> dict:
     baseline = model_bundle.baseline
     robust = model_bundle.robust
     control = model_bundle.control
+    rf_edm_init_report = _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle)
+    if rf_edm_init_report.get("enabled"):
+        print(
+            "[rf-init] loaded EDM warm start "
+            f"path={rf_edm_init_report['path']} "
+            f"source={rf_edm_init_report['source_state_key']} "
+            f"baseline_transferred={rf_edm_init_report['baseline']['transferred_count']} "
+            f"robust_transferred={rf_edm_init_report['robust']['transferred_count']}",
+            flush=True,
+        )
 
     check_report = {}
     if cfg.run_checks:
@@ -1720,6 +1885,13 @@ def run_experiment(cfg) -> dict:
     )
     baseline_phase_images_seen_total = int(baseline_steps_for_phase * int(cfg.batch_size))
     baseline_phase_batch_equiv_total = float(baseline_steps_for_phase)
+    direct_baseline_batch_equiv_counts = read_denoiser_op_count_totals(history_baseline)
+    if direct_baseline_batch_equiv_counts is not None:
+        baseline_phase_batch_equiv_total = float(
+            direct_baseline_batch_equiv_counts["n_fwd"]
+            + direct_baseline_batch_equiv_counts["n_fwd_inputgrad"]
+            + direct_baseline_batch_equiv_counts["n_fwd_parambackward"]
+        )
     baseline_images_seen_total = int(
         robust_resume_accounting.get("baseline_images_seen_total", 0)
         if preserve_baseline_from_resume
@@ -1820,6 +1992,13 @@ def run_experiment(cfg) -> dict:
             "diagnostics_backend": diagnostics.name,
             "training_objective": str(getattr(cfg, "training_objective", "edm")),
             "score_matching_weight_power": float(getattr(cfg, "score_matching_weight_power", 2.0)),
+            "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
+            "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+            "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
+            "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
+            "rf_edm_init": rf_edm_init_report,
+            "rf_cdro_pair_source": str(getattr(cfg, "rf_cdro_pair_source", "auto")),
             "wild_update_interval": int(getattr(cfg, "wild_update_interval", 0)),
             "wild_cache_batches": int(getattr(cfg, "wild_cache_batches", 0)),
             "wild_inner_steps": int(getattr(cfg, "wild_inner_steps", 0)),
@@ -1967,6 +2146,10 @@ def run_experiment(cfg) -> dict:
                 float(v) for v in history_baseline.get("proxy_weighted_denoise_loss", [])
             ],
             "baseline_sigma_counts": history_baseline.get("sigma_counts", []),
+            "baseline_rf_stage_curve": [str(v) for v in history_baseline.get("rf_stage", [])],
+            "baseline_rf_t_mean_curve": [float(v) for v in history_baseline.get("rf_t_mean", [])],
+            "baseline_rf_stage1_steps": int(history_baseline.get("rf_stage1_steps", 0) or 0),
+            "baseline_rf_reflow_steps": int(history_baseline.get("rf_reflow_steps", 0) or 0),
             "robust_outer_loss": summarize_series(history_robust["outer_loss"]),
             "robust_outer_loss_attack": summarize_series(history_robust.get("outer_loss_attack", [])),
             "robust_outer_loss_clean": summarize_series(history_robust.get("outer_loss_clean", [])),
@@ -1976,6 +2159,7 @@ def run_experiment(cfg) -> dict:
             "robust_inner_obj": summarize_series(history_robust["inner_obj"]),
             "robust_inner_obj_curve": [float(v) for v in history_robust.get("inner_obj", [])],
             "robust_energy": summarize_series(history_robust.get("energy", [])),
+            "robust_rf_pair_source_resolved": str(history_robust.get("rf_pair_source_resolved", "")),
             "v11_path_transport_cost": summarize_series(
                 history_robust.get("energy", []) if str(cfg.method_version).lower() in ("v1.1", "1.1") else []
             ),

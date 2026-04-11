@@ -27,7 +27,7 @@ from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
 from toy.shared.reverse import sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
-from toy.shared.sigma import build_sigma_levels  # noqa: E402
+from toy.shared.sigma import build_rf_time_quantile_levels, build_sigma_levels  # noqa: E402
 from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
 
 
@@ -466,6 +466,12 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "limited_data_enabled",
         "model_kind",
         "n_steps_path",
+        "rf_baseline_mode",
+        "rf_cdro_pair_source",
+        "rf_loss",
+        "rf_pseudo_huber_delta",
+        "rf_reflow_t_distribution",
+        "rf_stage1_fraction",
         "sigma_data",
         "sigma_max",
         "sigma_min",
@@ -528,6 +534,7 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device) -> Tuple[object, 
         float(cfg.sigma_min),
         float(cfg.sigma_max),
         float(getattr(cfg, "sigma_data", -1.0)),
+        str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         bool(getattr(cfg, "allow_tf32", True)),
         bool(getattr(cfg, "cudnn_benchmark", True)),
         int(getattr(cfg, "eval_seed_offset_metrics", ToyConfig.eval_seed_offset_metrics)),
@@ -557,7 +564,15 @@ def _get_or_build_context(
     if float(getattr(cfg, "sigma_data", -1.0)) <= 0.0:
         cfg.sigma_data = float(dataset.estimate_sigma_data())
     model_bundle = build_model_bundle(cfg, dataset, float(cfg.sigma_data), device)
-    sigma_levels = build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
+    if str(cfg.training_objective).strip().lower() == "rf":
+        sigma_levels = build_rf_time_quantile_levels(
+            float(cfg.sigma_max),
+            int(cfg.n_steps_path),
+            device=device,
+            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+    else:
+        sigma_levels = build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
     context = EvalContext(
         key=key,
         cfg=cfg,
@@ -626,6 +641,7 @@ def _write_metrics_payload(
             "sigma_max": float(ctx.cfg.sigma_max),
             "sigma_data": float(ctx.cfg.sigma_data),
             "training_objective": str(ctx.cfg.training_objective),
+            "rf_reflow_t_distribution": str(getattr(ctx.cfg, "rf_reflow_t_distribution", "u_shaped")),
             "amp_dtype": str(ctx.cfg.amp_dtype),
             "eval_seed_offset_metrics": int(ctx.cfg.eval_seed_offset_metrics),
             "fid_ref_path": str(ctx.cfg.fid_ref_path),

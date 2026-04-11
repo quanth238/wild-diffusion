@@ -8,6 +8,7 @@ from ...models import set_requires_grad
 from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
+from ...shared.trainer_common import generate_reflow_pairs
 from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
@@ -28,12 +29,28 @@ def _control_transport_cost(control_path: torch.Tensor, transition_deltas: torch
     return (control_sq * dt).sum(dim=1).mean()
 
 
+def _is_rf_objective(cfg) -> bool:
+    return str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+
+
+def _resolve_rf_cdro_pair_source(cfg) -> str:
+    mode = str(getattr(cfg, "rf_cdro_pair_source", "auto")).strip().lower()
+    if mode == "auto":
+        baseline_mode = str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower()
+        return "reflow" if baseline_mode == "strong" else "data_noise"
+    if mode not in ("reflow", "data_noise"):
+        raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
+    return mode
+
+
 def _path_average_training_loss(
     cfg,
     denoiser,
     states: torch.Tensor,
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
+    *,
+    x_right: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Average weighted denoise loss over all rollout timesteps k=1..N."""
 
@@ -49,7 +66,14 @@ def _path_average_training_loss(
             device=x0.device,
             dtype=x0.dtype,
         )
-        loss_step = compute_training_loss(cfg, denoiser, states[:, step_idx + 1], x0, sigma)
+        loss_step = compute_training_loss(
+            cfg,
+            denoiser,
+            states[:, step_idx + 1],
+            x0,
+            sigma,
+            x_right=x_right,
+        )
         total_loss = loss_step if total_loss is None else (total_loss + loss_step)
     return total_loss / float(n_steps)
 
@@ -61,6 +85,7 @@ def _path_outer_loss_backward(
     states_ctrl: torch.Tensor,
     states_ref: torch.Tensor,
     x0: torch.Tensor,
+    x_right: Optional[torch.Tensor],
     sigma_levels: torch.Tensor,
     lambda_ctrl: float,
     lambda_ref: float,
@@ -93,6 +118,7 @@ def _path_outer_loss_backward(
                     states_ctrl[:, step_idx + 1],
                     x0,
                     sigma,
+                    x_right=x_right,
                 )
             else:
                 with torch.no_grad():
@@ -102,6 +128,7 @@ def _path_outer_loss_backward(
                         states_ctrl[:, step_idx + 1],
                         x0,
                         sigma,
+                        x_right=x_right,
                     )
 
             if lambda_ref > 0.0:
@@ -111,6 +138,7 @@ def _path_outer_loss_backward(
                     states_ref[:, step_idx + 1],
                     x0,
                     sigma,
+                    x_right=x_right,
                 )
             else:
                 clean_loss_step = torch.zeros((), device=x0.device, dtype=x0.dtype)
@@ -177,6 +205,7 @@ def _path_clean_only_loss_backward(
     denoiser,
     states_ref: torch.Tensor,
     x0: torch.Tensor,
+    x_right: Optional[torch.Tensor],
     sigma_levels: torch.Tensor,
     lambda_ref: float,
     amp_dtype,
@@ -204,6 +233,7 @@ def _path_clean_only_loss_backward(
                 states_ref[:, step_idx + 1],
                 x0,
                 sigma,
+                x_right=x_right,
             )
             chunk_outer = lambda_ref * clean_loss_step / float(n_steps)
 
@@ -334,6 +364,12 @@ def train_trajectory_robust_cdro(
         total_budget=total_budget,
         time_horizon=time_horizon,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
+    rf_pair_source = _resolve_rf_cdro_pair_source(cfg) if _is_rf_objective(cfg) else "data_noise"
+    history["rf_pair_source_resolved"] = rf_pair_source
+    rf_pair_teacher = None
+    if _is_rf_objective(cfg) and rf_pair_source == "reflow":
+        rf_pair_teacher = copy.deepcopy(denoiser).eval()
+        set_requires_grad(rf_pair_teacher, False)
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
         x0 = sample_train_batch(
@@ -343,15 +379,23 @@ def train_trajectory_robust_cdro(
             sample_train_batch_fn=sample_train_batch_fn,
             sample_population_batch_fn=sample_population_batch_fn,
         )
+        rf_pair_right = None
+        if rf_pair_teacher is not None:
+            x0, rf_pair_right = generate_reflow_pairs(
+                rf_pair_teacher,
+                sigma_levels,
+                x0,
+                sample_terminal_batch_fn=None,
+            )
         if cfg.use_log_normal_sigma_sampling:
             indices = sample_target_indices_log_normal(
-                cfg.batch_size,
+                x0.shape[0],
                 sigma_levels,
                 p_mean=cfg.p_mean,
                 p_std=cfg.p_std,
             )
         else:
-            indices = sample_target_indices(cfg.batch_size, sigma_levels)
+            indices = sample_target_indices(x0.shape[0], sigma_levels)
 
         raw_lambda_ref = float(cfg.outer_clean_weight)
         raw_lambda_ctrl = float(cfg.outer_attack_weight)
@@ -386,6 +430,7 @@ def train_trajectory_robust_cdro(
                     total_budget=total_budget,
                     time_horizon=time_horizon,
                     eps_schedule=eps_schedule,
+                    rf_pair_right=rf_pair_right,
                 )
             else:
                 roll = rollout_controlled_ve(
@@ -400,6 +445,7 @@ def train_trajectory_robust_cdro(
                     time_horizon=time_horizon,
                     eps_schedule=eps_schedule,
                     cfg=cfg,
+                    rf_pair_right=rf_pair_right,
                 )
             rollouts.append(roll)
         if attack_enabled:
@@ -412,7 +458,14 @@ def train_trajectory_robust_cdro(
             transport_inner = None
             for roll in rollouts:
                 with autocast_context(sigma_levels.device, amp_dtype):
-                    attack_loss_chunk = _path_average_training_loss(cfg, denoiser, roll.states_ctrl, x0, sigma_levels)
+                    attack_loss_chunk = _path_average_training_loss(
+                        cfg,
+                        denoiser,
+                        roll.states_ctrl,
+                        x0,
+                        sigma_levels,
+                        x_right=roll.x_right,
+                    )
                 transport_chunk = _control_transport_cost(roll.control_path, transition_deltas)
                 attack_loss_inner = (
                     attack_loss_chunk if attack_loss_inner is None else (attack_loss_inner + attack_loss_chunk)
@@ -464,6 +517,7 @@ def train_trajectory_robust_cdro(
                     denoiser=denoiser,
                     states_ref=roll.states_ref,
                     x0=x0,
+                    x_right=roll.x_right,
                     sigma_levels=sigma_levels,
                     lambda_ref=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
@@ -483,6 +537,7 @@ def train_trajectory_robust_cdro(
                     states_ctrl=roll.states_ctrl,
                     states_ref=roll.states_ref,
                     x0=x0,
+                    x_right=roll.x_right,
                     sigma_levels=sigma_levels,
                     lambda_ctrl=lambda_ctrl_scaled,
                     lambda_ref=lambda_ref_scaled,
@@ -553,6 +608,7 @@ def train_trajectory_robust_cdro(
                     step_size=step_size,
                     total_budget=total_budget,
                     time_horizon=time_horizon,
+                    rf_pair_right=rf_pair_right,
                 )
                 set_requires_grad(denoiser, True)
             else:
@@ -568,11 +624,19 @@ def train_trajectory_robust_cdro(
                         total_budget=total_budget,
                         time_horizon=time_horizon,
                         cfg=cfg,
+                        rf_pair_right=rf_pair_right,
                     )
 
             with torch.no_grad():
                 with autocast_context(sigma_levels.device, amp_dtype):
-                    attack_cur = _path_average_training_loss(cfg, denoiser, roll_cur_diag.states_ctrl, x0, sigma_levels)
+                    attack_cur = _path_average_training_loss(
+                        cfg,
+                        denoiser,
+                        roll_cur_diag.states_ctrl,
+                        x0,
+                        sigma_levels,
+                        x_right=roll_cur_diag.x_right,
+                    )
                     inner_obj_cur = inner_objective_attack_only(attack_cur)
 
                 roll_zero_diag = rollout_controlled_ve(
@@ -586,9 +650,17 @@ def train_trajectory_robust_cdro(
                     total_budget=total_budget,
                     time_horizon=time_horizon,
                     cfg=cfg,
+                    rf_pair_right=rf_pair_right,
                 )
                 with autocast_context(sigma_levels.device, amp_dtype):
-                    attack_zero = _path_average_training_loss(cfg, denoiser, roll_zero_diag.states_ctrl, x0, sigma_levels)
+                    attack_zero = _path_average_training_loss(
+                        cfg,
+                        denoiser,
+                        roll_zero_diag.states_ctrl,
+                        x0,
+                        sigma_levels,
+                        x_right=roll_zero_diag.x_right,
+                    )
                     inner_obj_zero = inner_objective_attack_only(attack_zero)
                 gap = inner_obj_cur - inner_obj_zero
                 gap_ratio = gap / (inner_obj_zero.abs() + 1e-8)

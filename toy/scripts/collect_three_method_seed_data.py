@@ -223,6 +223,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
+    parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong", "plain"])
+    parser.add_argument("--rf-stage1-fraction", type=float, default=0.5)
+    parser.add_argument("--rf-reflow-t-distribution", type=str, default="u_shaped", choices=["u_shaped", "uniform"])
+    parser.add_argument("--rf-loss", type=str, default="pseudo_huber", choices=["pseudo_huber", "mse"])
+    parser.add_argument("--rf-pseudo-huber-delta", type=float, default=0.1)
+    parser.add_argument("--rf-edm-init-ckpt-path", type=str, default="")
+    parser.add_argument("--rf-cdro-pair-source", type=str, default="auto", choices=["auto", "reflow", "data_noise"])
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--fid-gen-batch", type=int, default=2048)
@@ -297,6 +304,28 @@ def _canonical_amp_dtype(value: str) -> str:
     if mode in {"fp16", "half"}:
         return "float16"
     raise ValueError(f"Unsupported amp dtype: {value}")
+
+
+def _append_rf_cli_args(cmd: List[str], args: argparse.Namespace) -> None:
+    cmd.extend(
+        [
+            "--rf-baseline-mode",
+            str(args.rf_baseline_mode),
+            "--rf-stage1-fraction",
+            str(args.rf_stage1_fraction),
+            "--rf-reflow-t-distribution",
+            str(args.rf_reflow_t_distribution),
+            "--rf-loss",
+            str(args.rf_loss),
+            "--rf-pseudo-huber-delta",
+            str(args.rf_pseudo_huber_delta),
+            "--rf-cdro-pair-source",
+            str(args.rf_cdro_pair_source),
+        ]
+    )
+    rf_edm_init_ckpt_path = str(getattr(args, "rf_edm_init_ckpt_path", "")).strip()
+    if rf_edm_init_ckpt_path:
+        cmd.extend(["--rf-edm-init-ckpt-path", rf_edm_init_ckpt_path])
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -505,7 +534,7 @@ def _backbone_family(training_objective: str) -> str:
 def _backbone_label(training_objective: str) -> str:
     family = _backbone_family(training_objective)
     if family == "rf":
-        return "Rectified Flow"
+        return "RF"
     if family == "score":
         return "Score VE"
     return "EDM"
@@ -1491,6 +1520,7 @@ def _build_baseline_sweep_cmd(
         "--train-accelerator-count",
         str(args.train_accelerator_count),
     ]
+    _append_rf_cli_args(cmd, args)
     append_ema_cli_args(cmd, args)
     if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
         cmd.extend(
@@ -1587,6 +1617,7 @@ def _build_run_toy_cmd(
     ]
     if compute_fid:
         cmd.append("--compute-fid")
+    _append_rf_cli_args(cmd, args)
     append_ema_cli_args(cmd, args)
     if fixed_warmup_steps is not None and int(fixed_warmup_steps) > 0:
         cmd.extend(
