@@ -90,7 +90,7 @@ class ToyScoreModel(nn.Module):
 
 
 class ToyRectifiedFlowModel(nn.Module):
-    """2D MLP rectified-flow velocity model with x0-compatible forward output."""
+    """2D MLP rectified-flow velocity model with endpoint-compatible forward output."""
 
     def __init__(self, hidden_dim: int = 128, sigma_max: float = 1.0):
         super().__init__()
@@ -113,9 +113,9 @@ class ToyRectifiedFlowModel(nn.Module):
         return self.model(h)
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        t = self._time(sigma).clamp_min(1e-8)
+        t = self._time(sigma).clamp(0.0, 1.0)
         velocity = self.predict_velocity(x, sigma)
-        return x - batch_scalar_like(t, x) * velocity
+        return x + batch_scalar_like(1.0 - t, x) * velocity
 
 
 class ControlNet(nn.Module):
@@ -251,7 +251,7 @@ class ImageScoreModel(nn.Module):
 
 
 class ImageRectifiedFlowModel(nn.Module):
-    """Small convolutional rectified-flow model with x0-compatible forward output."""
+    """Small convolutional rectified-flow model with endpoint-compatible forward output."""
 
     def __init__(self, in_channels: int = 3, hidden_dim: int = 64, sigma_max: float = 1.0, num_blocks: int = 4):
         super().__init__()
@@ -280,9 +280,9 @@ class ImageRectifiedFlowModel(nn.Module):
         return self.out_conv(self.act(self.out_norm(h)))
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-        t = self._time(sigma).clamp_min(1e-8)
+        t = self._time(sigma).clamp(0.0, 1.0)
         velocity = self.predict_velocity(x, sigma)
-        return x - batch_scalar_like(t, x) * velocity
+        return x + batch_scalar_like(1.0 - t, x) * velocity
 
 
 class ImageControlNet(nn.Module):

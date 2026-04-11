@@ -4,7 +4,7 @@ from .diffusion import (
     rollout_controlled_ve,
     rollout_path_heuristic_attack,
 )
-from .trainer import train_trajectory_robust_cdro
+from .trainer import _resolve_attack_num_steps, train_trajectory_robust_cdro
 
 NAME = "cdro"
 IMPLEMENTED = True
@@ -31,13 +31,14 @@ def rollout_eval(
     """Evaluation rollout for CDRO using the denoiser-dependent u-space attack."""
 
     del control_radius_kappa, kappa_by_step
+    attack_num_steps, _ = _resolve_attack_num_steps(cfg)
     return rollout_path_heuristic_attack(
         cfg=cfg,
         x0=x0,
         target_indices=target_indices,
         attack_net=attack_net,
         sigma_levels=sigma_levels,
-        inner_steps=int(cfg.inner_steps),
+        inner_steps=int(attack_num_steps),
         step_size=float(cfg.cdro_step_size),
         total_budget=float(cfg.cdro_total_budget_rho),
         time_horizon=float(cfg.cdro_time_horizon),

@@ -30,12 +30,16 @@ def build_rf_time_quantile_levels(
     device: torch.device,
     *,
     distribution: str = "u_shaped",
+    quantile_rule: str = "right_endpoint",
 ) -> torch.Tensor:
     """Build an RF solver/continuation ladder from normalized-time cell edges.
 
     The returned tensor still uses the repo's sigma-shaped API, with
     `sigma = t * sigma_max`; unlike EDM ladders, these values are RF clock
-    coordinates rather than noise scales.
+    coordinates rather than noise scales. The positive levels `sigma_levels[1:]`
+    are quantiles of the chosen RF time law. The default `right_endpoint` rule
+    uses `F^{-1}(k / N)`, preserving the original endpoint-inclusive rollout.
+    The optional `midpoint` rule uses `F^{-1}((k - 0.5) / N)` for ablations.
     """
 
     if n_steps <= 0:
@@ -43,7 +47,18 @@ def build_rf_time_quantile_levels(
     sigma_max_value = float(sigma_max)
     if sigma_max_value <= 0.0:
         raise ValueError(f"sigma_max must be > 0 for RF time levels, got {sigma_max}")
-    probs = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=device)
+    rule = str(quantile_rule).strip().lower()
+    if rule == "right_endpoint":
+        probs = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=device)
+    elif rule == "midpoint":
+        probs_positive = (torch.arange(1, int(n_steps) + 1, device=device, dtype=torch.float32) - 0.5) / float(
+            n_steps
+        )
+        probs = torch.cat([torch.zeros(1, device=device, dtype=probs_positive.dtype), probs_positive])
+    else:
+        raise ValueError(
+            f"Unsupported RF quantile rule '{quantile_rule}'. Expected one of: right_endpoint, midpoint."
+        )
     mode = str(distribution).strip().lower()
     if mode == "u_shaped":
         # Inverse CDF of Beta(1/2, 1/2): F^{-1}(u) = sin^2(pi u / 2).
@@ -55,6 +70,53 @@ def build_rf_time_quantile_levels(
             f"Unsupported RF time distribution '{distribution}'. Expected one of: u_shaped, uniform."
         )
     return t_levels * sigma_max_value
+
+
+def resolve_rf_stage_t_distribution(
+    stage_name: str,
+    *,
+    reflow_distribution: str = "u_shaped",
+) -> str:
+    """Resolve the clean/robust RF timestep law used by a named training stage."""
+
+    stage = str(stage_name).strip().lower()
+    if stage in ("rf_stage1", "stage1", "data_noise"):
+        return "uniform"
+    if stage in ("rf_reflow", "reflow"):
+        mode = str(reflow_distribution).strip().lower()
+        if mode not in ("u_shaped", "uniform"):
+            raise ValueError(
+                f"Unsupported RF reflow timestep distribution '{reflow_distribution}'. "
+                "Expected one of: uniform, u_shaped."
+            )
+        return mode
+    raise ValueError(
+        f"Unsupported RF stage '{stage_name}'. Expected one of: rf_stage1, rf_reflow, stage1, reflow, data_noise."
+    )
+
+
+def build_rf_stage_time_quantile_levels(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    stage_name: str,
+    reflow_distribution: str = "u_shaped",
+    quantile_rule: str = "right_endpoint",
+) -> torch.Tensor:
+    """Build the RF time grid aligned to the clean timestep law of a named stage."""
+
+    distribution = resolve_rf_stage_t_distribution(
+        stage_name,
+        reflow_distribution=reflow_distribution,
+    )
+    return build_rf_time_quantile_levels(
+        sigma_max,
+        n_steps,
+        device,
+        distribution=distribution,
+        quantile_rule=quantile_rule,
+    )
 
 
 def _truncated_log_sigma_cdf_bounds(

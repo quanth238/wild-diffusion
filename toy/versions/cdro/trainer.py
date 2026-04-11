@@ -9,7 +9,12 @@ from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.trainer_common import generate_reflow_pairs
-from ...shared.sigma import sample_target_indices, sample_target_indices_log_normal
+from ...shared.sigma import (
+    build_rf_stage_time_quantile_levels,
+    resolve_rf_stage_t_distribution,
+    sample_target_indices,
+    sample_target_indices_log_normal,
+)
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
 from .diffusion import (
@@ -33,14 +38,84 @@ def _is_rf_objective(cfg) -> bool:
     return str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
 
 
+def _resolve_attack_num_steps(cfg) -> tuple[int, str]:
+    """Resolve the CDRO inner attack count with legacy `inner_steps` fallback."""
+
+    explicit = getattr(cfg, "attack_num_steps", None)
+    if explicit is not None:
+        resolved = int(explicit)
+        if resolved not in (1, 2):
+            raise ValueError(f"attack_num_steps must be one of (1, 2), got {explicit}")
+        return resolved, "attack_num_steps"
+    legacy = int(getattr(cfg, "inner_steps", 1))
+    if legacy <= 0:
+        return 0, "inner_steps_legacy"
+    return legacy, "inner_steps_legacy"
+
+
 def _resolve_rf_cdro_pair_source(cfg) -> str:
     mode = str(getattr(cfg, "rf_cdro_pair_source", "auto")).strip().lower()
     if mode == "auto":
-        baseline_mode = str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower()
-        return "reflow" if baseline_mode == "strong" else "data_noise"
+        return "staged"
     if mode not in ("reflow", "data_noise"):
         raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
     return mode
+
+
+def _resolve_rf_cdro_stage_steps(total_steps: int, stage1_fraction: float, pair_source: str) -> tuple[int, int]:
+    total_steps = max(int(total_steps), 0)
+    mode = str(pair_source).strip().lower()
+    if mode == "data_noise":
+        return total_steps, 0
+    if mode == "reflow":
+        return 0, total_steps
+    if total_steps <= 1:
+        return total_steps, 0
+    stage1_steps = int(round(float(total_steps) * float(stage1_fraction)))
+    stage1_steps = max(1, min(stage1_steps, total_steps - 1))
+    return stage1_steps, total_steps - stage1_steps
+
+
+def _build_rf_cdro_stage_grid_info(
+    cfg,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    time_horizon: float,
+    stage_name: str,
+) -> dict:
+    """Build the RF rollout grid and derived local-cap stats for one robust stage."""
+
+    distribution = resolve_rf_stage_t_distribution(
+        stage_name,
+        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+    )
+    sigma_levels = build_rf_stage_time_quantile_levels(
+        float(getattr(cfg, "sigma_max", 1.0)),
+        int(getattr(cfg, "n_steps_path", 1)),
+        device=device,
+        stage_name=stage_name,
+        reflow_distribution=distribution,
+        quantile_rule=str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
+    ).to(device=device, dtype=dtype)
+    transition_deltas = build_transition_deltas_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        time_horizon=time_horizon,
+    ).to(device=device, dtype=dtype)
+    radius_by_step = build_constraint_radii_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        total_budget=float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
+        time_horizon=time_horizon,
+    ).to(device=device, dtype=dtype)
+    return {
+        "stage_name": str(stage_name),
+        "distribution": str(distribution),
+        "sigma_levels": sigma_levels,
+        "transition_deltas": transition_deltas,
+        "radius_by_step": radius_by_step,
+    }
 
 
 def _path_average_training_loss(
@@ -50,6 +125,7 @@ def _path_average_training_loss(
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
     *,
+    x_left: Optional[torch.Tensor] = None,
     x_right: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Average weighted denoise loss over all rollout timesteps k=1..N."""
@@ -72,6 +148,7 @@ def _path_average_training_loss(
             states[:, step_idx + 1],
             x0,
             sigma,
+            x_left=x_left,
             x_right=x_right,
         )
         total_loss = loss_step if total_loss is None else (total_loss + loss_step)
@@ -85,6 +162,7 @@ def _path_outer_loss_backward(
     states_ctrl: torch.Tensor,
     states_ref: torch.Tensor,
     x0: torch.Tensor,
+    x_left: Optional[torch.Tensor],
     x_right: Optional[torch.Tensor],
     sigma_levels: torch.Tensor,
     lambda_ctrl: float,
@@ -118,6 +196,7 @@ def _path_outer_loss_backward(
                     states_ctrl[:, step_idx + 1],
                     x0,
                     sigma,
+                    x_left=x_left,
                     x_right=x_right,
                 )
             else:
@@ -128,6 +207,7 @@ def _path_outer_loss_backward(
                         states_ctrl[:, step_idx + 1],
                         x0,
                         sigma,
+                        x_left=x_left,
                         x_right=x_right,
                     )
 
@@ -138,6 +218,7 @@ def _path_outer_loss_backward(
                     states_ref[:, step_idx + 1],
                     x0,
                     sigma,
+                    x_left=x_left,
                     x_right=x_right,
                 )
             else:
@@ -205,6 +286,7 @@ def _path_clean_only_loss_backward(
     denoiser,
     states_ref: torch.Tensor,
     x0: torch.Tensor,
+    x_left: Optional[torch.Tensor],
     x_right: Optional[torch.Tensor],
     sigma_levels: torch.Tensor,
     lambda_ref: float,
@@ -233,6 +315,7 @@ def _path_clean_only_loss_backward(
                 states_ref[:, step_idx + 1],
                 x0,
                 sigma,
+                x_left=x_left,
                 x_right=x_right,
             )
             chunk_outer = lambda_ref * clean_loss_step / float(n_steps)
@@ -261,6 +344,7 @@ def train_trajectory_robust_cdro(
     history_state: Optional[dict] = None,
     optimizer_theta_state: Optional[dict] = None,
     ema_state_dict: Optional[dict] = None,
+    rf_reflow_teacher_state_dict: Optional[dict] = None,
     return_state: bool = False,
 ):
     """Route-A CDRO training with u-space local caps and greedy denoiser-dependent attacks."""
@@ -345,57 +429,147 @@ def train_trajectory_robust_cdro(
     step_size = float(cfg.cdro_step_size)
     total_budget = float(cfg.cdro_total_budget_rho)
     time_horizon = float(cfg.cdro_time_horizon)
-    transition_deltas = build_transition_deltas_for_objective(
-        cfg=cfg,
-        sigma_levels=sigma_levels,
-        time_horizon=time_horizon,
-    ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
     path_batch_equiv_evals = _path_batch_equiv_denoiser_evals(sigma_levels)
     cumulative_batch_equiv_evals = (
         float(history["batch_equiv_denoiser_evals_cumulative"][-1])
         if history["batch_equiv_denoiser_evals_cumulative"]
         else 0.0
     )
+    attack_num_steps, attack_num_steps_source = _resolve_attack_num_steps(cfg)
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
     ema_model = init_ema_model(denoiser, cfg, ema_state_dict=ema_state_dict)
+    rf_pair_source = _resolve_rf_cdro_pair_source(cfg) if _is_rf_objective(cfg) else "data_noise"
+    history["rf_pair_source_resolved"] = rf_pair_source
+    history["attack_num_steps_resolved"] = int(attack_num_steps)
+    history["attack_num_steps_source"] = str(attack_num_steps_source)
+    history["control_u_radius"] = float((total_budget / time_horizon) ** 0.5 if time_horizon > 0.0 else 0.0)
+    rf_pair_teacher = None
+    rf_stage1_steps = 0
+    rf_reflow_steps = 0
+    rf_stage_grids = {}
+    transition_deltas = build_transition_deltas_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        time_horizon=time_horizon,
+    ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
     radius_by_step = build_constraint_radii_for_objective(
         cfg=cfg,
         sigma_levels=sigma_levels,
         total_budget=total_budget,
         time_horizon=time_horizon,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
-    rf_pair_source = _resolve_rf_cdro_pair_source(cfg) if _is_rf_objective(cfg) else "data_noise"
-    history["rf_pair_source_resolved"] = rf_pair_source
-    rf_pair_teacher = None
-    if _is_rf_objective(cfg) and rf_pair_source == "reflow":
-        rf_pair_teacher = copy.deepcopy(denoiser).eval()
-        set_requires_grad(rf_pair_teacher, False)
+    if _is_rf_objective(cfg):
+        rf_stage1_steps, rf_reflow_steps = _resolve_rf_cdro_stage_steps(
+            int(cfg.steps),
+            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+            rf_pair_source,
+        )
+        rf_stage_grids = {
+            "rf_stage1": _build_rf_cdro_stage_grid_info(
+                cfg,
+                device=sigma_levels.device,
+                dtype=sigma_levels.dtype,
+                time_horizon=time_horizon,
+                stage_name="rf_stage1",
+            ),
+            "rf_reflow": _build_rf_cdro_stage_grid_info(
+                cfg,
+                device=sigma_levels.device,
+                dtype=sigma_levels.dtype,
+                time_horizon=time_horizon,
+                stage_name="rf_reflow",
+            ),
+        }
+        rf_eval_stage = "rf_reflow" if int(rf_reflow_steps) > 0 else "rf_stage1"
+        transition_deltas = rf_stage_grids[rf_eval_stage]["transition_deltas"]
+        radius_by_step = rf_stage_grids[rf_eval_stage]["radius_by_step"]
+        history["transition_deltas"] = [float(v.item()) for v in transition_deltas.detach().cpu()]
+        history["rf_stage1_steps"] = int(rf_stage1_steps)
+        history["rf_reflow_steps"] = int(rf_reflow_steps)
+        history.setdefault("rf_stage", [])
+        history.setdefault("rf_t_distribution", [])
+        history["rf_stage1_t_distribution_resolved"] = str(rf_stage_grids["rf_stage1"]["distribution"])
+        history["rf_reflow_t_distribution_resolved"] = str(rf_stage_grids["rf_reflow"]["distribution"])
+        history["rf_eval_t_distribution_resolved"] = str(rf_stage_grids[rf_eval_stage]["distribution"])
+        history["rf_cdro_quantile_rule_resolved"] = str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint"))
+        history["rf_stage_transition_deltas"] = {
+            stage_name: [float(v.item()) for v in stage_info["transition_deltas"].detach().cpu()]
+            for stage_name, stage_info in rf_stage_grids.items()
+        }
+        if rf_reflow_teacher_state_dict is not None:
+            rf_pair_teacher = copy.deepcopy(denoiser).eval()
+            rf_pair_teacher.load_state_dict(rf_reflow_teacher_state_dict, strict=True)
+            set_requires_grad(rf_pair_teacher, False)
+            history.setdefault("rf_reflow_teacher_refresh_step", int(rf_stage1_steps))
+    else:
+        history["transition_deltas"] = [float(v.item()) for v in transition_deltas.detach().cpu()]
+
+    print(
+        f"[cdro] resolved attack_num_steps={attack_num_steps} "
+        f"source={attack_num_steps_source} pair_source={rf_pair_source} "
+        f"control_u_radius={history['control_u_radius']:.6f}"
+        + (
+            ""
+            if not _is_rf_objective(cfg)
+            else " "
+            + "rf_stage1_t_distribution="
+            + str(history.get("rf_stage1_t_distribution_resolved", ""))
+            + " "
+            + "rf_reflow_t_distribution="
+            + str(history.get("rf_reflow_t_distribution_resolved", ""))
+        ),
+        flush=True,
+    )
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
-        x0 = sample_train_batch(
+        x_data = sample_train_batch(
             cfg,
             centers,
             train_pool=train_pool,
             sample_train_batch_fn=sample_train_batch_fn,
             sample_population_batch_fn=sample_population_batch_fn,
         )
-        rf_pair_right = None
-        if rf_pair_teacher is not None:
-            x0, rf_pair_right = generate_reflow_pairs(
-                rf_pair_teacher,
-                sigma_levels,
-                x0,
-                sample_terminal_batch_fn=None,
-            )
-        if cfg.use_log_normal_sigma_sampling:
+        x0 = x_data
+        rf_pair_left = None
+        current_rf_stage = None
+        current_sigma_levels = sigma_levels
+        current_transition_deltas = transition_deltas
+        current_radius_by_step = radius_by_step
+        if _is_rf_objective(cfg):
+            if step <= int(rf_stage1_steps):
+                rf_pair_left = torch.randn_like(x_data)
+                x0 = x_data
+                current_rf_stage = "rf_stage1"
+            else:
+                if rf_pair_teacher is None:
+                    teacher_source = ema_model if ema_model is not None else denoiser
+                    rf_pair_teacher = copy.deepcopy(teacher_source).eval()
+                    set_requires_grad(rf_pair_teacher, False)
+                    history.setdefault("rf_reflow_teacher_refresh_step", int(step - 1))
+                rf_pair_left, x0 = generate_reflow_pairs(
+                    rf_pair_teacher,
+                    rf_stage_grids["rf_reflow"]["sigma_levels"],
+                    x_data,
+                    sample_terminal_batch_fn=None,
+                )
+                current_rf_stage = "rf_reflow"
+            stage_grid = rf_stage_grids[current_rf_stage]
+            current_sigma_levels = stage_grid["sigma_levels"]
+            current_transition_deltas = stage_grid["transition_deltas"]
+            current_radius_by_step = stage_grid["radius_by_step"]
+            history["rf_stage"].append(current_rf_stage)
+            history["rf_t_distribution"].append(str(stage_grid["distribution"]))
+        if _is_rf_objective(cfg):
+            indices = sample_target_indices(x0.shape[0], current_sigma_levels)
+        elif cfg.use_log_normal_sigma_sampling:
             indices = sample_target_indices_log_normal(
                 x0.shape[0],
-                sigma_levels,
+                current_sigma_levels,
                 p_mean=cfg.p_mean,
                 p_std=cfg.p_std,
             )
         else:
-            indices = sample_target_indices(x0.shape[0], sigma_levels)
+            indices = sample_target_indices(x0.shape[0], current_sigma_levels)
 
         raw_lambda_ref = float(cfg.outer_clean_weight)
         raw_lambda_ctrl = float(cfg.outer_attack_weight)
@@ -406,10 +580,10 @@ def train_trajectory_robust_cdro(
         lambda_ctrl = raw_lambda_ctrl / mixture_mass
         phi_lr_scale = 1.0 if lambda_ctrl > 0.0 else 0.0
         control_updates_enabled = lambda_ctrl > 0.0
-        attack_enabled = bool(control_updates_enabled and cfg.inner_steps > 0)
+        attack_enabled = bool(control_updates_enabled and attack_num_steps > 0)
         rollout_schedules = _build_rollout_noise_schedules(
             x0=x0,
-            sigma_levels=sigma_levels,
+            sigma_levels=current_sigma_levels,
             antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
         )
         rollout_multiplier = float(len(rollout_schedules))
@@ -424,20 +598,20 @@ def train_trajectory_robust_cdro(
                     x0=x0,
                     target_indices=indices,
                     attack_net=denoiser,
-                    sigma_levels=sigma_levels,
-                    inner_steps=int(cfg.inner_steps),
+                    sigma_levels=current_sigma_levels,
+                    inner_steps=int(attack_num_steps),
                     step_size=step_size,
                     total_budget=total_budget,
                     time_horizon=time_horizon,
                     eps_schedule=eps_schedule,
-                    rf_pair_right=rf_pair_right,
+                    rf_pair_left=rf_pair_left,
                 )
             else:
                 roll = rollout_controlled_ve(
                     x0=x0,
                     target_indices=indices,
                     control_net=None,
-                    sigma_levels=sigma_levels,
+                    sigma_levels=current_sigma_levels,
                     grad_through_control=False,
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=None,
@@ -445,12 +619,12 @@ def train_trajectory_robust_cdro(
                     time_horizon=time_horizon,
                     eps_schedule=eps_schedule,
                     cfg=cfg,
-                    rf_pair_right=rf_pair_right,
+                    rf_pair_left=rf_pair_left,
                 )
             rollouts.append(roll)
         if attack_enabled:
             attack_construction_units = (
-                path_batch_equiv_evals * float(max(int(cfg.inner_steps), 0)) * rollout_multiplier
+                path_batch_equiv_evals * float(max(int(attack_num_steps), 0)) * rollout_multiplier
             )
 
         if attack_enabled:
@@ -463,10 +637,11 @@ def train_trajectory_robust_cdro(
                         denoiser,
                         roll.states_ctrl,
                         x0,
-                        sigma_levels,
+                        current_sigma_levels,
+                        x_left=roll.x_left,
                         x_right=roll.x_right,
                     )
-                transport_chunk = _control_transport_cost(roll.control_path, transition_deltas)
+                transport_chunk = _control_transport_cost(roll.control_path, current_transition_deltas)
                 attack_loss_inner = (
                     attack_loss_chunk if attack_loss_inner is None else (attack_loss_inner + attack_loss_chunk)
                 )
@@ -480,7 +655,7 @@ def train_trajectory_robust_cdro(
             attack_loss_inner = torch.zeros((), device=x0.device, dtype=x0.dtype)
             transport_inner = None
             for roll in rollouts:
-                transport_chunk = _control_transport_cost(roll.control_path, transition_deltas)
+                transport_chunk = _control_transport_cost(roll.control_path, current_transition_deltas)
                 transport_inner = transport_chunk if transport_inner is None else (transport_inner + transport_chunk)
             transport_inner = transport_inner / rollout_multiplier
             inner_obj = torch.zeros((), device=x0.device, dtype=x0.dtype)
@@ -491,7 +666,7 @@ def train_trajectory_robust_cdro(
         delta_norm_max_values = []
         delta_ratio_mean_values = []
         delta_ratio_max_values = []
-        radius = radius_by_step.view(1, -1)
+        radius = current_radius_by_step.view(1, -1)
         for roll in rollouts:
             delta_l2 = pathwise_l2(roll.delta_path)
             delta_ratio = delta_l2 / radius.to(device=delta_l2.device, dtype=delta_l2.dtype).clamp_min(1e-8)
@@ -517,8 +692,9 @@ def train_trajectory_robust_cdro(
                     denoiser=denoiser,
                     states_ref=roll.states_ref,
                     x0=x0,
+                    x_left=roll.x_left,
                     x_right=roll.x_right,
-                    sigma_levels=sigma_levels,
+                    sigma_levels=current_sigma_levels,
                     lambda_ref=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
                 )
@@ -537,8 +713,9 @@ def train_trajectory_robust_cdro(
                     states_ctrl=roll.states_ctrl,
                     states_ref=roll.states_ref,
                     x0=x0,
+                    x_left=roll.x_left,
                     x_right=roll.x_right,
-                    sigma_levels=sigma_levels,
+                    sigma_levels=current_sigma_levels,
                     lambda_ctrl=lambda_ctrl_scaled,
                     lambda_ref=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
@@ -596,19 +773,19 @@ def train_trajectory_robust_cdro(
             and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(cfg.steps))
         )
         if run_diag:
-            if lambda_ctrl > 0.0 and cfg.inner_steps > 0:
+            if lambda_ctrl > 0.0 and attack_num_steps > 0:
                 set_requires_grad(denoiser, False)
                 roll_cur_diag = rollout_path_heuristic_attack(
                     cfg=cfg,
                     x0=x0,
                     target_indices=indices,
                     attack_net=denoiser,
-                    sigma_levels=sigma_levels,
-                    inner_steps=int(cfg.inner_steps),
+                    sigma_levels=current_sigma_levels,
+                    inner_steps=int(attack_num_steps),
                     step_size=step_size,
                     total_budget=total_budget,
                     time_horizon=time_horizon,
-                    rf_pair_right=rf_pair_right,
+                    rf_pair_left=rf_pair_left,
                 )
                 set_requires_grad(denoiser, True)
             else:
@@ -617,14 +794,14 @@ def train_trajectory_robust_cdro(
                         x0=x0,
                         target_indices=indices,
                         control_net=None,
-                        sigma_levels=sigma_levels,
+                        sigma_levels=current_sigma_levels,
                         grad_through_control=False,
                         control_radius_kappa=cfg.control_radius_kappa,
                         kappa_by_step=None,
                         total_budget=total_budget,
                         time_horizon=time_horizon,
                         cfg=cfg,
-                        rf_pair_right=rf_pair_right,
+                        rf_pair_left=rf_pair_left,
                     )
 
             with torch.no_grad():
@@ -634,7 +811,8 @@ def train_trajectory_robust_cdro(
                         denoiser,
                         roll_cur_diag.states_ctrl,
                         x0,
-                        sigma_levels,
+                        current_sigma_levels,
+                        x_left=roll_cur_diag.x_left,
                         x_right=roll_cur_diag.x_right,
                     )
                     inner_obj_cur = inner_objective_attack_only(attack_cur)
@@ -643,14 +821,14 @@ def train_trajectory_robust_cdro(
                     x0=x0,
                     target_indices=indices,
                     control_net=None,
-                    sigma_levels=sigma_levels,
+                    sigma_levels=current_sigma_levels,
                     grad_through_control=False,
                     control_radius_kappa=cfg.control_radius_kappa,
                     kappa_by_step=None,
                     total_budget=total_budget,
                     time_horizon=time_horizon,
                     cfg=cfg,
-                    rf_pair_right=rf_pair_right,
+                    rf_pair_left=rf_pair_left,
                 )
                 with autocast_context(sigma_levels.device, amp_dtype):
                     attack_zero = _path_average_training_loss(
@@ -658,7 +836,8 @@ def train_trajectory_robust_cdro(
                         denoiser,
                         roll_zero_diag.states_ctrl,
                         x0,
-                        sigma_levels,
+                        current_sigma_levels,
+                        x_left=roll_zero_diag.x_left,
                         x_right=roll_zero_diag.x_right,
                     )
                     inner_obj_zero = inner_objective_attack_only(attack_zero)
@@ -673,7 +852,7 @@ def train_trajectory_robust_cdro(
                     delta_ratio_max,
                 ) = _rollout_delta_diagnostics(
                     roll_cur_diag,
-                    radius_by_step=radius_by_step,
+                    radius_by_step=current_radius_by_step,
                 )
 
             history["diag_step"].append(int(step))
@@ -716,6 +895,9 @@ def train_trajectory_robust_cdro(
             "completed_steps": int(cfg.steps),
             "optimizer_theta_state": optimizer_theta.state_dict(),
             "ema_state_dict": None if ema_model is None else copy.deepcopy(ema_model.state_dict()),
+            "rf_reflow_teacher_state_dict": (
+                None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict())
+            ),
             "resume_robust_state_dict": resume_robust_state_dict,
         }
         if ema_model is not None:

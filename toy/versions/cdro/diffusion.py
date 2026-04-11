@@ -133,10 +133,14 @@ def build_time_deltas(
     return dt
 
 
-def _build_rf_path_deltas(sigma_levels: torch.Tensor) -> torch.Tensor:
+def _build_rf_path_deltas(sigma_levels: torch.Tensor, *, sigma_max: Optional[float] = None) -> torch.Tensor:
     """Return physical straight-path RF increments over the normalized t-grid."""
 
-    t_levels = rf_time_levels_from_sigma_levels(sigma_levels)
+    if sigma_max is None:
+        t_levels = rf_time_levels_from_sigma_levels(sigma_levels)
+    else:
+        sigma_max_value = max(float(sigma_max), 1e-8)
+        t_levels = (sigma_levels / sigma_max_value).clamp(0.0, 1.0)
     dt = t_levels[1:] - t_levels[:-1]
     total = float(dt.sum().item())
     if total <= 0.0:
@@ -153,7 +157,10 @@ def build_transition_deltas_for_objective(
     """Build method time deltas for the configured generative family."""
 
     if _is_rf_objective(cfg):
-        dt = _build_rf_path_deltas(sigma_levels)
+        dt = _build_rf_path_deltas(
+            sigma_levels,
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+        )
         total = float(dt.sum().item())
         return dt * (float(time_horizon) / total)
     n_steps = int(sigma_levels.numel() - 1)
@@ -295,29 +302,29 @@ def _l2_normalize_per_sample(value: torch.Tensor, eps: float = 1e-12) -> torch.T
     return (flat / norm).reshape_as(value)
 
 
-def _rf_terminal_noise(
+def _rf_pair_left_source(
     *,
     x0: torch.Tensor,
     sigma_levels: torch.Tensor,
     eps_schedule: Optional[torch.Tensor],
-    rf_pair_right: Optional[torch.Tensor] = None,
+    rf_pair_left: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Resolve one terminal-noise sample per batch element for RF forward paths."""
+    """Resolve the RF source endpoint x_L for the active pair law."""
 
     del sigma_levels
-    if rf_pair_right is not None:
-        if tuple(rf_pair_right.shape) != tuple(x0.shape):
+    if rf_pair_left is not None:
+        if tuple(rf_pair_left.shape) != tuple(x0.shape):
             raise ValueError(
-                f"rf_pair_right must match x0 shape {tuple(x0.shape)}, got {tuple(rf_pair_right.shape)}"
+                f"rf_pair_left must match x0 shape {tuple(x0.shape)}, got {tuple(rf_pair_left.shape)}"
             )
-        return rf_pair_right.to(device=x0.device, dtype=x0.dtype)
+        return rf_pair_left.to(device=x0.device, dtype=x0.dtype)
     if eps_schedule is None:
         terminal_eps = torch.randn_like(x0)
     elif eps_schedule.ndim == x0.ndim + 1:
         terminal_eps = eps_schedule[-1].to(device=x0.device, dtype=x0.dtype)
     else:
         terminal_eps = eps_schedule.to(device=x0.device, dtype=x0.dtype)
-    # Straight-path RF uses z ~ N(0, I); sigma_max only defines the inherited time grid.
+    # Straight-path RF stage-1 pairs use x_L = z ~ N(0, I).
     return terminal_eps
 
 
@@ -333,7 +340,7 @@ def rollout_path_heuristic_attack(
     total_budget: float,
     time_horizon: float,
     eps_schedule: Optional[torch.Tensor] = None,
-    rf_pair_right: Optional[torch.Tensor] = None,
+    rf_pair_left: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
     """Greedy Route-A CDRO attack with literal u-space drift controls."""
 
@@ -354,20 +361,27 @@ def rollout_path_heuristic_attack(
     control_radius = _build_control_radius(total_budget, time_horizon)
     amp_dtype = resolve_amp_dtype(x0.device, getattr(cfg, "amp_dtype", "auto"))
     rf_objective = _is_rf_objective(cfg)
-    rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
-    z_terminal = (
-        _rf_terminal_noise(
+    rf_path_dt = (
+        _build_rf_path_deltas(
+            sigma_levels,
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+        )
+        if rf_objective
+        else None
+    )
+    x_left = (
+        _rf_pair_left_source(
             x0=x0,
             sigma_levels=sigma_levels,
             eps_schedule=eps_schedule,
-            rf_pair_right=rf_pair_right,
+            rf_pair_left=rf_pair_left,
         )
         if rf_objective
         else None
     )
 
-    x_ref = x0.detach()
-    x_ctrl = x0.detach()
+    x_ref = x_left.detach() if rf_objective else x0.detach()
+    x_ctrl = x_left.detach() if rf_objective else x0.detach()
     path_ref = [x_ref]
     path_ctrl = [x_ctrl]
     path_delta = []
@@ -383,7 +397,7 @@ def rollout_path_heuristic_attack(
             # The reference path follows the normalized RF straight path.
             # The auxiliary CDRO clock only scales control magnitudes and budgets.
             delta_t = float(rf_path_dt[k].item())
-            base_increment = delta_t * (z_terminal - x0)
+            base_increment = delta_t * (x0 - x_left)
         else:
             variance_increment = sigma_next.square() - sigma_k.square()
             if float(variance_increment.item()) < -1e-12:
@@ -409,7 +423,8 @@ def rollout_path_heuristic_attack(
                     candidate,
                     x0,
                     sigma_batch,
-                    x_right=z_terminal,
+                    x_left=x_left,
+                    x_right=x0,
                 )
             grad = torch.autograd.grad(step_loss, control)[0]
             grad_unit = _l2_normalize_per_sample(grad)
@@ -427,7 +442,8 @@ def rollout_path_heuristic_attack(
                         candidate,
                         x0,
                         sigma_batch,
-                        x_right=z_terminal,
+                        x_left=x_left,
+                        x_right=x0,
                     )
                 grad = torch.autograd.grad(step_loss, control)[0]
 
@@ -457,8 +473,8 @@ def rollout_path_heuristic_attack(
     return RolloutResult(
         x_target=x_target,
         sigma_target=sigma_target,
-        x_left=x0,
-        x_right=z_terminal,
+        x_left=x_left,
+        x_right=x0 if rf_objective else None,
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,
@@ -478,7 +494,7 @@ def rollout_controlled_ve(
     total_budget: Optional[float] = None,
     time_horizon: float = 1.0,
     cfg=None,
-    rf_pair_right: Optional[torch.Tensor] = None,
+    rf_pair_left: Optional[torch.Tensor] = None,
 ) -> RolloutResult:
     """Reference VE rollout for CDRO.
 
@@ -503,19 +519,26 @@ def rollout_controlled_ve(
             sigma_min=float(sigma_levels[1].item()),
             sigma_max=float(sigma_levels[-1].item()),
         )
-    rf_path_dt = _build_rf_path_deltas(sigma_levels) if rf_objective else None
-    z_terminal = (
-        _rf_terminal_noise(
+    rf_path_dt = (
+        _build_rf_path_deltas(
+            sigma_levels,
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+        )
+        if rf_objective
+        else None
+    )
+    x_left = (
+        _rf_pair_left_source(
             x0=x0,
             sigma_levels=sigma_levels,
             eps_schedule=eps_schedule,
-            rf_pair_right=rf_pair_right,
+            rf_pair_left=rf_pair_left,
         )
         if rf_objective
         else None
     )
 
-    x_ref = x0
+    x_ref = x_left if rf_objective else x0
     path_ref = [x_ref]
     path_ctrl = [x_ref]
     path_delta = []
@@ -526,7 +549,7 @@ def rollout_controlled_ve(
         sigma_next = sigma_levels[k + 1]
         if rf_objective:
             delta_t = float(rf_path_dt[k].item())
-            x_ref = x_ref + delta_t * (z_terminal - x0)
+            x_ref = x_ref + delta_t * (x0 - x_left)
         else:
             variance_increment = sigma_next.square() - sigma_k.square()
             if float(variance_increment.item()) < -1e-12:
@@ -549,8 +572,8 @@ def rollout_controlled_ve(
     return RolloutResult(
         x_target=x_target,
         sigma_target=sigma_target,
-        x_left=x0,
-        x_right=z_terminal,
+        x_left=x_left,
+        x_right=x0 if rf_objective else None,
         states_ref=states_ref,
         states_ctrl=states_ctrl,
         delta_path=delta_path,

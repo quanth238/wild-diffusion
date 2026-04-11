@@ -42,7 +42,7 @@ if __package__ is None or __package__ == "":
     from toy.process_title import apply_process_title, build_process_title
     from toy.shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from toy.shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
-    from toy.shared.reverse import sample_reverse_paths
+    from toy.shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths
     from toy.shared.sigma import (
         build_rf_time_quantile_levels,
         build_sigma_levels,
@@ -61,7 +61,7 @@ else:
     from ..process_title import apply_process_title, build_process_title
     from ..shared.ema import ema_config_dict, init_ema_model, update_ema_model
     from ..shared.objective import build_training_state, compute_training_loss, weighted_denoise_loss
-    from ..shared.reverse import sample_reverse_paths
+    from ..shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths
     from ..shared.sigma import (
         build_rf_time_quantile_levels,
         build_sigma_levels,
@@ -550,7 +550,7 @@ def _compute_fid_for_model(
                 stochastic=True,
                 sample_terminal_batch_fn=dataset.sample_terminal_batch,
             )
-        images = states[:, 0]
+        images = states[:, generated_data_path_index_from_denoiser(denoiser)]
         images = ((images + 1.0) * 127.5).clamp(0.0, 255.0).to(torch.uint8)
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])

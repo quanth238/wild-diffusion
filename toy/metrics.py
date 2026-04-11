@@ -246,16 +246,27 @@ def compute_x0_recovery_vs_terminal_step(
     forward_paths: torch.Tensor,
     sigma_levels: torch.Tensor,
     reverse_fn: Callable,
+    target_x: torch.Tensor = None,
 ) -> Dict[str, list]:
     """For each terminal level k, measure x0 recovery MSE after reverse rollout."""
 
-    # For each terminal step k, start reverse from x_k and measure x0 recovery MSE.
     n_steps = int(sigma_levels.numel() - 1)
-    x0 = forward_paths[:, 0]
+    family = str(getattr(denoiser, "generative_family", "")).strip().lower()
+    x0 = target_x if target_x is not None else forward_paths[:, 0]
     out = {"step": [], "sigma": [], "x0_mse": []}
     for k in range(1, n_steps + 1):
-        rev_k = reverse_fn(denoiser=denoiser, x_terminal=forward_paths[:, k], sigma_levels=sigma_levels[: k + 1])
-        x0_mse = per_sample_squared_l2(rev_k[:, 0] - x0).mean()
+        if family == "rectified_flow":
+            sigma_k = torch.full(
+                (forward_paths.shape[0],),
+                float(sigma_levels[k].item()),
+                device=forward_paths.device,
+                dtype=forward_paths.dtype,
+            )
+            x0_pred = denoiser(forward_paths[:, k], sigma_k)
+            x0_mse = per_sample_squared_l2(x0_pred - x0).mean()
+        else:
+            rev_k = reverse_fn(denoiser=denoiser, x_terminal=forward_paths[:, k], sigma_levels=sigma_levels[: k + 1])
+            x0_mse = per_sample_squared_l2(rev_k[:, 0] - x0).mean()
         out["step"].append(k)
         out["sigma"].append(float(sigma_levels[k].item()))
         out["x0_mse"].append(float(x0_mse.item()))

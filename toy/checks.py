@@ -162,6 +162,7 @@ def gradient_check_denoiser(
             roll.x_target,
             x0,
             roll.sigma_target,
+            x_left=getattr(roll, "x_left", None),
             x_right=getattr(roll, "x_right", None),
         )
 
@@ -231,6 +232,7 @@ def gradient_check_control(
             roll.x_target,
             x0,
             roll.sigma_target,
+            x_left=getattr(roll, "x_left", None),
             x_right=getattr(roll, "x_right", None),
         )
         return inner_objective_attack_only(train_loss)

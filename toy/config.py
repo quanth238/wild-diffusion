@@ -67,6 +67,7 @@ class ToyConfig:
     lr_theta: float = 1e-3
     lr_phi: float = 5e-4
     inner_steps: int = 1
+    attack_num_steps: Optional[int] = None  # None -> use legacy inner_steps, else {1,2} for CDRO attack steps
     clip_phi_grad: float = 1.0
     training_objective: str = "edm"  # edm|score|rf
     score_matching_weight_power: float = 2.0  # lambda(sigma)=sigma^p in score objective
@@ -79,6 +80,7 @@ class ToyConfig:
     rf_pseudo_huber_delta: float = 0.1
     rf_edm_init_ckpt_path: str = ""
     rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise
+    rf_cdro_quantile_rule: str = "right_endpoint"  # right_endpoint|midpoint
 
     # Data.
     n_modes: int = 8

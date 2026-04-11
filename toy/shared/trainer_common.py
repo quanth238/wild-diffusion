@@ -9,8 +9,17 @@ from .ema import init_ema_model, update_ema_model
 from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import has_nan_or_inf, scalarize
 from .objective import build_rectified_flow_state, build_training_state, compute_training_loss, weighted_denoise_loss
-from .reverse import reverse_paths_from_terminal, sample_reverse_paths
-from .sigma import assign_sigmas_to_nearest_levels, sample_sigmas_log_normal, sample_target_indices
+from .reverse import (
+    generated_data_path_index_from_denoiser,
+    sample_rectified_flow_paths_from_source,
+    sample_reverse_paths,
+)
+from .sigma import (
+    assign_sigmas_to_nearest_levels,
+    resolve_rf_stage_t_distribution,
+    sample_sigmas_log_normal,
+    sample_target_indices,
+)
 from .train_utils import sample_train_batch
 
 
@@ -85,16 +94,15 @@ def generate_reflow_pairs(
     z = _sample_terminal_like(x_template, sample_terminal_batch_fn=sample_terminal_batch_fn)
     was_training = teacher.training
     teacher.eval()
-    paths = reverse_paths_from_terminal(
+    paths = sample_rectified_flow_paths_from_source(
         denoiser=teacher,
-        x_terminal=z,
+        x_source=z,
         sigma_levels=sigma_levels,
-        stochastic=False,
     )
     if was_training:
         teacher.train()
-    x_generated = paths[:, 0].detach()
-    return x_generated, z.detach()
+    x_generated = paths[:, -1].detach()
+    return z.detach(), x_generated
 
 
 def _train_rf_pair_stage(
@@ -131,8 +139,8 @@ def _train_rf_pair_stage(
             sample_population_batch_fn=sample_population_batch_fn,
         )
         if reflow_teacher is None:
-            x_left = x_template
-            x_right = _sample_terminal_like(x_template, sample_terminal_batch_fn=sample_terminal_batch_fn)
+            x_right = x_template
+            x_left = _sample_terminal_like(x_template, sample_terminal_batch_fn=sample_terminal_batch_fn)
             reflow_fwd_units = 0.0
         else:
             x_left, x_right = generate_reflow_pairs(
@@ -156,7 +164,7 @@ def _train_rf_pair_stage(
 
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(sigma_levels.device, amp_dtype):
-            loss = compute_training_loss(cfg, denoiser, x_t, x_left, sigma, x_right=x_right)
+            loss = compute_training_loss(cfg, denoiser, x_t, x_right, sigma, x_left=x_left, x_right=x_right)
         if has_nan_or_inf(loss):
             raise RuntimeError(f"NaN/Inf detected in {stage_name} RF baseline loss.")
         loss.backward()
@@ -172,7 +180,7 @@ def _train_rf_pair_stage(
         history["loss"].append(scalarize(loss))
         with torch.no_grad():
             with autocast_context(sigma_levels.device, amp_dtype):
-                proxy_loss = weighted_denoise_loss(denoiser, x_t, x_left, sigma, cfg.sigma_data)
+                proxy_loss = weighted_denoise_loss(denoiser, x_t, x_right, sigma, cfg.sigma_data)
         history["proxy_weighted_denoise_loss"].append(scalarize(proxy_loss))
         history.setdefault("rf_stage", []).append(stage_name)
         history.setdefault("rf_t_mean", []).append(float(t.detach().mean().item()))
@@ -222,6 +230,14 @@ def _train_strong_rf_baseline(
         int(cfg.steps),
         float(getattr(cfg, "rf_stage1_fraction", 0.5)),
     )
+    rf_stage1_t_distribution = resolve_rf_stage_t_distribution(
+        "rf_stage1",
+        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+    )
+    rf_reflow_t_distribution = resolve_rf_stage_t_distribution(
+        "rf_reflow",
+        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+    )
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     ema_model = init_ema_model(denoiser, ema_cfg)
@@ -239,7 +255,7 @@ def _train_strong_rf_baseline(
         stage_name="rf_stage1",
         num_steps=stage1_steps,
         global_step_offset=0,
-        t_distribution="uniform",
+        t_distribution=rf_stage1_t_distribution,
         train_pool=train_pool,
         sample_train_batch_fn=sample_train_batch_fn,
         sample_population_batch_fn=sample_population_batch_fn,
@@ -266,7 +282,7 @@ def _train_strong_rf_baseline(
             stage_name="rf_reflow",
             num_steps=reflow_steps,
             global_step_offset=stage1_steps,
-            t_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            t_distribution=rf_reflow_t_distribution,
             train_pool=train_pool,
             sample_train_batch_fn=sample_train_batch_fn,
             sample_population_batch_fn=sample_population_batch_fn,
@@ -400,4 +416,4 @@ def sample_with_denoiser(denoiser, sigma_levels, n_samples, device, sample_termi
         stochastic=True,
         sample_terminal_batch_fn=sample_terminal_batch_fn,
     )
-    return states[:, 0]
+    return states[:, generated_data_path_index_from_denoiser(denoiser)]

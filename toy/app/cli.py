@@ -49,6 +49,8 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--baseline-steps-override must be >= 0, got {cfg.baseline_steps_override}")
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
+    if cfg.attack_num_steps is not None and int(cfg.attack_num_steps) not in (1, 2):
+        raise ValueError(f"--attack-num-steps must be one of (1, 2), got {cfg.attack_num_steps}")
     if cfg.training_objective not in ("edm", "score", "rf"):
         raise ValueError(
             f"--training-objective must be one of ('edm', 'score', 'rf'), got {cfg.training_objective}"
@@ -69,6 +71,11 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             "--rf-reflow-t-distribution must be one of ('u_shaped', 'uniform'), got "
             f"{cfg.rf_reflow_t_distribution}"
+        )
+    if str(cfg.rf_cdro_quantile_rule).lower() not in ("right_endpoint", "midpoint"):
+        raise ValueError(
+            "--rf-cdro-quantile-rule must be one of ('right_endpoint', 'midpoint'), got "
+            f"{cfg.rf_cdro_quantile_rule}"
         )
     if str(cfg.rf_loss).lower() not in ("pseudo_huber", "mse"):
         raise ValueError(f"--rf-loss must be one of ('pseudo_huber', 'mse'), got {cfg.rf_loss}")
@@ -322,6 +329,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-theta", type=float, default=ToyConfig.lr_theta)
     parser.add_argument("--lr-phi", type=float, default=ToyConfig.lr_phi)
     parser.add_argument("--inner-steps", type=int, default=ToyConfig.inner_steps)
+    parser.add_argument("--attack-num-steps", type=int, default=ToyConfig.attack_num_steps, choices=[1, 2])
     parser.add_argument("--clip-phi-grad", type=float, default=ToyConfig.clip_phi_grad)
     parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score", "rf"])
     parser.add_argument("--score-matching-weight-power", type=float, default=ToyConfig.score_matching_weight_power)
@@ -337,6 +345,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=ToyConfig.rf_reflow_t_distribution,
         choices=["u_shaped", "uniform"],
+    )
+    parser.add_argument(
+        "--rf-cdro-quantile-rule",
+        type=str,
+        default=ToyConfig.rf_cdro_quantile_rule,
+        choices=["right_endpoint", "midpoint"],
     )
     parser.add_argument("--rf-loss", type=str, default=ToyConfig.rf_loss, choices=["pseudo_huber", "mse"])
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=ToyConfig.rf_pseudo_huber_delta)

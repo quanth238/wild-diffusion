@@ -28,9 +28,10 @@ from ..diagnostics_backends.provider import build_diagnostics_bundle
 from ..shared.ema import ema_config_dict
 from ..shared.objective import terminal_prior_scale_from_objective
 from ..shared.sigma import (
-    build_rf_time_quantile_levels,
+    build_rf_stage_time_quantile_levels,
     build_sigma_levels,
     build_sigma_levels_from_warmup_quantiles,
+    resolve_rf_stage_t_distribution,
     sample_target_indices,
 )
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
@@ -50,8 +51,10 @@ from ..metrics import (
     evaluate_nearest_reference_distance,
     summarize_attack_gap_windows,
 )
-from ..trainer import reverse_paths_from_terminal, train_baseline
+from ..shared.reverse import generated_data_path_index_from_denoiser, sample_rectified_flow_paths_from_source
+from ..trainer import reverse_paths_from_terminal, sample_reverse_paths, train_baseline
 from ..utils import as_jsonable_metrics, ensure_dir, pick_device, set_seed, tensor_to_numpy
+from ..versions.cdro.trainer import _resolve_rf_cdro_pair_source, _resolve_rf_cdro_stage_steps
 from ..versions.registry import resolve_method_module
 
 
@@ -110,13 +113,51 @@ def _build_family_sigma_levels(cfg, device: torch.device) -> torch.Tensor:
 
     objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
     if objective == "rf":
-        return build_rf_time_quantile_levels(
+        return build_rf_stage_time_quantile_levels(
             float(getattr(cfg, "sigma_max", 1.0)),
             int(getattr(cfg, "n_steps_path", 1)),
             device=device,
-            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            stage_name="rf_reflow",
+            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
     return build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+
+
+def _is_cdro_rf_port(cfg, method_name: str) -> bool:
+    """Return whether the active run is the paper-port CDRO-RF configuration."""
+
+    return (
+        str(method_name).strip().lower() == "cdro"
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+    )
+
+
+def _resolve_cdro_attack_num_steps(cfg) -> tuple[int, str]:
+    """Resolve CDRO attack steps with legacy `inner_steps` fallback."""
+
+    explicit = getattr(cfg, "attack_num_steps", None)
+    if explicit is not None:
+        resolved = int(explicit)
+        if resolved not in (1, 2):
+            raise ValueError(f"attack_num_steps must be one of (1, 2), got {explicit}")
+        return resolved, "attack_num_steps"
+    legacy = int(getattr(cfg, "inner_steps", 1))
+    if legacy <= 0:
+        return 0, "inner_steps_legacy"
+    return legacy, "inner_steps_legacy"
+
+
+def _resolve_rf_cdro_eval_stage(cfg, total_steps: int) -> str:
+    """Resolve which RF stage law should drive final CDRO-RF evaluation grids."""
+
+    pair_source = _resolve_rf_cdro_pair_source(cfg)
+    stage1_steps, reflow_steps = _resolve_rf_cdro_stage_steps(
+        int(total_steps),
+        float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+        pair_source,
+    )
+    del stage1_steps
+    return "rf_reflow" if int(reflow_steps) > 0 else "rf_stage1"
 
 
 def _checkpoint_state_dict_for_rf_init(payload: Any) -> tuple[Dict[str, torch.Tensor], str]:
@@ -403,7 +444,11 @@ def _compute_weighted_accounting(
             robust_n_fwd_inputgrad = _sum_float_series(
                 history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
             )
-            attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
+            if method_name == "cdro":
+                cdro_attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
+                attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cdro_attack_num_steps) > 0)
+            else:
+                attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
             if method_name == "cdro":
                 robust_n_fwd = float(path_steps * robust_steps_total) if attack_enabled else 0.0
             else:
@@ -727,12 +772,13 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     path_steps = max(int(getattr(cfg, "n_steps_path", 0)), 0)
     if path_steps <= 0:
         return 0.0
-    attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(getattr(cfg, "inner_steps", 0)) > 0
+    attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
+    attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(attack_num_steps) > 0
     clean_enabled = float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
     rollout_multiplier = 2.0 if bool(getattr(cfg, "cdro_antithetic_rollouts", False)) else 1.0
     if not attack_enabled:
         return float(path_steps if clean_enabled else 0.0) * rollout_multiplier
-    attack_construction_units = float(path_steps * max(int(getattr(cfg, "inner_steps", 0)), 0)) * rollout_multiplier
+    attack_construction_units = float(path_steps * max(int(attack_num_steps), 0)) * rollout_multiplier
     attack_eval_units = float(path_steps * 2) * rollout_multiplier
     clean_eval_units = float(path_steps if clean_enabled else 0) * rollout_multiplier
     return attack_construction_units + attack_eval_units + clean_eval_units
@@ -781,57 +827,63 @@ def _resolve_phase_steps(
             )
     elif str(method_name).lower() == "cdro":
         cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
-        split_mode = "cdro_baseline_steps_override" if baseline_steps_override > 0 else "cdro_fixed_fraction_warmup"
-        if baseline_steps_override > 0:
-            baseline_steps = int(cfg.baseline_steps_override)
+        cdro_attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            baseline_steps = 0
+            robust_steps = total_steps
+            split_mode = "cdro_rf_shared_edm_warm_start"
         else:
-            cdro_reference_warmup_fraction = float(getattr(cfg, "cdro_warmup_fraction", 0.0))
-            wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
-                cfg,
-                train_pool_size=train_pool_size,
-                warmup_fraction=cdro_reference_warmup_fraction,
-            )
-            if weighted_calibration is not None:
-                wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
-                    _estimate_wdro_warmup_weighted_compute_fraction(
-                        cfg,
-                        train_pool_size=train_pool_size,
+            split_mode = "cdro_baseline_steps_override" if baseline_steps_override > 0 else "cdro_fixed_fraction_warmup"
+            if baseline_steps_override > 0:
+                baseline_steps = int(cfg.baseline_steps_override)
+            else:
+                cdro_reference_warmup_fraction = float(getattr(cfg, "cdro_warmup_fraction", 0.0))
+                wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
+                    cfg,
+                    train_pool_size=train_pool_size,
+                    warmup_fraction=cdro_reference_warmup_fraction,
+                )
+                if weighted_calibration is not None:
+                    wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
+                        _estimate_wdro_warmup_weighted_compute_fraction(
+                            cfg,
+                            train_pool_size=train_pool_size,
+                            calibration=weighted_calibration,
+                            warmup_fraction=cdro_reference_warmup_fraction,
+                        )
+                    )
+                    cdro_robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
+                        n_steps_path=int(getattr(cfg, "n_steps_path", 0)),
+                        inner_steps=int(cdro_attack_num_steps),
+                        outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
+                        outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
+                        antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
                         calibration=weighted_calibration,
-                        warmup_fraction=cdro_reference_warmup_fraction,
                     )
-                )
-                cdro_robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
-                    n_steps_path=int(getattr(cfg, "n_steps_path", 0)),
-                    inner_steps=int(getattr(cfg, "inner_steps", 0)),
-                    outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
-                    outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
-                    antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
-                    calibration=weighted_calibration,
-                )
-                baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(
-                    steps=1,
-                    calibration=weighted_calibration,
-                )
-                if (
-                    wdro_warmup_weighted_compute_fraction is not None
-                    and cdro_robust_step_weighted_units is not None
-                    and baseline_step_weighted_units is not None
-                ):
-                    baseline_steps = solve_warmup_steps_for_target_compute_fraction(
-                        total_steps=int(total_steps),
-                        target_warmup_compute_fraction=float(wdro_warmup_weighted_compute_fraction),
-                        baseline_step_compute_units=float(baseline_step_weighted_units),
-                        robust_step_compute_units=float(cdro_robust_step_weighted_units),
+                    baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(
+                        steps=1,
+                        calibration=weighted_calibration,
                     )
-                    split_mode = "cdro_weighted_compute_matched_warmup"
+                    if (
+                        wdro_warmup_weighted_compute_fraction is not None
+                        and cdro_robust_step_weighted_units is not None
+                        and baseline_step_weighted_units is not None
+                    ):
+                        baseline_steps = solve_warmup_steps_for_target_compute_fraction(
+                            total_steps=int(total_steps),
+                            target_warmup_compute_fraction=float(wdro_warmup_weighted_compute_fraction),
+                            baseline_step_compute_units=float(baseline_step_weighted_units),
+                            robust_step_compute_units=float(cdro_robust_step_weighted_units),
+                        )
+                        split_mode = "cdro_weighted_compute_matched_warmup"
+                    else:
+                        baseline_steps = int(total_steps * cdro_reference_warmup_fraction)
+                        split_mode = "cdro_fixed_fraction_warmup_unweighted_fallback"
                 else:
                     baseline_steps = int(total_steps * cdro_reference_warmup_fraction)
                     split_mode = "cdro_fixed_fraction_warmup_unweighted_fallback"
-            else:
-                baseline_steps = int(total_steps * cdro_reference_warmup_fraction)
-                split_mode = "cdro_fixed_fraction_warmup_unweighted_fallback"
-        baseline_steps = max(0, min(baseline_steps, total_steps))
-        robust_steps = max(total_steps - baseline_steps, 0)
+            baseline_steps = max(0, min(baseline_steps, total_steps))
+            robust_steps = max(total_steps - baseline_steps, 0)
 
     return {
         "total_steps": int(total_steps),
@@ -1112,27 +1164,35 @@ def _build_baseline_gate(
             attack_net=baseline_eval,
         )
         gate_ref_paths = gate_roll.states_ref[:, : gate_terminal_step + 1]
-        gate_rev_det = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=gate_ref_paths[:, -1],
-            sigma_levels=sigma_levels_gate,
-            stochastic=False,
-        )
-    gate_endpoint_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_rev_det[:, 0]))
-    gate_endpoint_recovery_mse = float((gate_rev_det[:, 0] - x_gate).reshape(x_gate.shape[0], -1).pow(2).mean().item())
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            sigma_gate = torch.full(
+                (gate_ref_paths.shape[0],),
+                float(sigma_levels_gate[-1].item()),
+                device=x_gate.device,
+                dtype=x_gate.dtype,
+            )
+            gate_endpoint = baseline_eval(gate_ref_paths[:, -1], sigma_gate)
+        else:
+            gate_rev_det = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=gate_ref_paths[:, -1],
+                sigma_levels=sigma_levels_gate,
+                stochastic=False,
+            )
+            gate_endpoint = gate_rev_det[:, 0]
+    gate_endpoint_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_endpoint))
+    gate_endpoint_recovery_mse = float((gate_endpoint - x_gate).reshape(x_gate.shape[0], -1).pow(2).mean().item())
     with autocast_context(x_gate.device, amp_dtype):
-        gate_gen_paths = reverse_paths_from_terminal(
+        gate_gen_paths = sample_reverse_paths(
             denoiser=baseline_eval,
-            x_terminal=_sample_terminal_batch_for_objective(
-                cfg=cfg,
-                dataset=dataset,
-                batch_size=int(cfg.eval_samples),
-                sigma_levels=sigma_levels,
-            ),
             sigma_levels=sigma_levels,
+            n_samples=int(cfg.eval_samples),
+            device=x_gate.device,
             stochastic=True,
+            sample_terminal_batch_fn=dataset.sample_terminal_batch,
         )
-    gate_generated_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_gen_paths[:, 0]))
+    gate_generated = gate_gen_paths[:, generated_data_path_index_from_denoiser(baseline_eval)]
+    gate_generated_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_generated))
     baseline_gate = diagnostics.build_baseline_gate(
         cfg,
         {
@@ -1207,6 +1267,8 @@ def _run_robust_phase(
             elif method_name in ("clean", "wdro", "cdro"):
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["ema_state_dict"] = trainer_state_in.get("ema_state_dict")
+                if method_name == "cdro":
+                    trainer_kwargs["rf_reflow_teacher_state_dict"] = trainer_state_in.get("rf_reflow_teacher_state_dict")
             else:
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
         else:
@@ -1288,6 +1350,7 @@ def run_experiment(cfg) -> dict:
     )
     method = resolve_method_module(cfg.method_version)
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
+    is_cdro_rf = _is_cdro_rf_port(cfg, method_name)
     rollout_kwargs = _method_rollout_kwargs(cfg, method)
     if not getattr(method, "IMPLEMENTED", True):
         raise NotImplementedError(
@@ -1349,6 +1412,24 @@ def run_experiment(cfg) -> dict:
     robust_steps_for_phase = int(phase_steps["robust_steps"])
     cfg_baseline = replace(cfg, steps=baseline_steps_for_phase)
     cfg_robust = replace(cfg, steps=robust_steps_for_phase)
+    rf_cdro_eval_stage = None
+    rf_cdro_stage1_t_distribution = None
+    rf_cdro_reflow_t_distribution = None
+    rf_cdro_eval_t_distribution = None
+    if _is_cdro_rf_port(cfg, method_name):
+        rf_cdro_eval_stage = _resolve_rf_cdro_eval_stage(cfg_robust, robust_steps_for_phase)
+        rf_cdro_stage1_t_distribution = resolve_rf_stage_t_distribution(
+            "rf_stage1",
+            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+        rf_cdro_reflow_t_distribution = resolve_rf_stage_t_distribution(
+            "rf_reflow",
+            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+        rf_cdro_eval_t_distribution = resolve_rf_stage_t_distribution(
+            rf_cdro_eval_stage,
+            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
     if cfg.sigma_data <= 0:
         cfg.sigma_data = dataset.estimate_sigma_data()
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
@@ -1358,11 +1439,13 @@ def run_experiment(cfg) -> dict:
     sigma_levels = baseline_sigma_levels
     if method_name == "cdro":
         if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
-            sigma_levels = build_rf_time_quantile_levels(
+            sigma_levels = build_rf_stage_time_quantile_levels(
                 float(cfg.sigma_max),
                 int(cfg.n_steps_path),
                 device=device,
-                distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+                stage_name=str(rf_cdro_eval_stage),
+                reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+                quantile_rule=str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
             )
         else:
             sigma_levels = build_sigma_levels_from_warmup_quantiles(
@@ -1397,6 +1480,11 @@ def run_experiment(cfg) -> dict:
     robust = model_bundle.robust
     control = model_bundle.control
     rf_edm_init_report = _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle)
+    if is_cdro_rf and not rf_edm_init_report.get("enabled"):
+        raise RuntimeError(
+            "CDRO-RF requires a shared EDM warm-start checkpoint. "
+            "Set --rf-edm-init-ckpt-path to the shared 5% EDM warm-start artifact."
+        )
     if rf_edm_init_report.get("enabled"):
         print(
             "[rf-init] loaded EDM warm start "
@@ -1432,7 +1520,7 @@ def run_experiment(cfg) -> dict:
         json.dumps(baseline_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     baseline_ckpt_path = _resolve_baseline_ckpt_path(cfg, baseline_signature)
-    baseline_ckpt_enabled = bool(getattr(cfg, "baseline_ckpt_enabled", True))
+    baseline_ckpt_enabled = bool(getattr(cfg, "baseline_ckpt_enabled", True)) and not is_cdro_rf
     baseline_ckpt_force_retrain = bool(getattr(cfg, "baseline_ckpt_force_retrain", False))
     baseline_ckpt_strict_meta = bool(getattr(cfg, "baseline_ckpt_strict_meta", True))
     baseline_ckpt_loaded = False
@@ -1554,6 +1642,15 @@ def run_experiment(cfg) -> dict:
         }
         baseline_gate["eval_seed"] = int(gate_eval_seed)
         baseline_gate["eval_seed_scoped"] = False
+    elif is_cdro_rf and baseline_steps_for_phase <= 0:
+        baseline_gate = {
+            "passed": True,
+            "skipped_for_cdro_rf_warm_start": True,
+            "checks": [],
+            "failed_checks": [],
+        }
+        baseline_gate["eval_seed"] = int(gate_eval_seed)
+        baseline_gate["eval_seed_scoped"] = False
     else:
         t_phase = time.perf_counter()
 
@@ -1670,35 +1767,41 @@ def run_experiment(cfg) -> dict:
             device=device,
             dtype=ref_paths_plot.dtype,
         )
-    # Deterministic reverse for pairwise-recovery diagnostics.
-    with autocast_context(device, amp_dtype):
-        rev_baseline_from_ref = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=ref_paths_plot[:, -1],
-            sigma_levels=sigma_levels_plot,
-            stochastic=False,
-        )
-        rev_baseline_from_attack = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=ctrl_paths_plot[:, -1],
-            sigma_levels=sigma_levels_plot,
-            stochastic=False,
-        )
-        # Optional stochastic reverse for visualization of clustered generative behavior.
-        rev_baseline_from_ref_plot = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=ref_paths_plot[:, -1],
-            sigma_levels=sigma_levels_plot,
-            stochastic=cfg.plot_stochastic_backward,
-            noise_schedule=shared_reverse_noise,
-        )
-        rev_baseline_from_attack_plot = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=ctrl_paths_plot[:, -1],
-            sigma_levels=sigma_levels_plot,
-            stochastic=cfg.plot_stochastic_backward,
-            noise_schedule=shared_reverse_noise,
-        )
+    if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+        rev_baseline_from_ref = ref_paths_plot.clone()
+        rev_baseline_from_attack = ctrl_paths_plot.clone()
+        rev_baseline_from_ref_plot = rev_baseline_from_ref
+        rev_baseline_from_attack_plot = rev_baseline_from_attack
+    else:
+        # Deterministic reverse for pairwise-recovery diagnostics.
+        with autocast_context(device, amp_dtype):
+            rev_baseline_from_ref = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=ref_paths_plot[:, -1],
+                sigma_levels=sigma_levels_plot,
+                stochastic=False,
+            )
+            rev_baseline_from_attack = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=ctrl_paths_plot[:, -1],
+                sigma_levels=sigma_levels_plot,
+                stochastic=False,
+            )
+            # Optional stochastic reverse for visualization of clustered generative behavior.
+            rev_baseline_from_ref_plot = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=ref_paths_plot[:, -1],
+                sigma_levels=sigma_levels_plot,
+                stochastic=cfg.plot_stochastic_backward,
+                noise_schedule=shared_reverse_noise,
+            )
+            rev_baseline_from_attack_plot = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=ctrl_paths_plot[:, -1],
+                sigma_levels=sigma_levels_plot,
+                stochastic=cfg.plot_stochastic_backward,
+                noise_schedule=shared_reverse_noise,
+            )
     paired_reverse_delta_plot = compute_paired_reverse_delta_by_step(
         reverse_paths_ref=rev_baseline_from_ref_plot,
         reverse_paths_attack=rev_baseline_from_attack_plot,
@@ -1739,12 +1842,14 @@ def run_experiment(cfg) -> dict:
             forward_paths=demo_roll.states_ref,
             sigma_levels=sigma_levels,
             reverse_fn=reverse_paths_from_terminal,
+            target_x=x_demo,
         )
         recovery_attack_curve = compute_x0_recovery_vs_terminal_step(
             denoiser=baseline_eval,
             forward_paths=demo_roll.states_ctrl,
             sigma_levels=sigma_levels,
             reverse_fn=reverse_paths_from_terminal,
+            target_x=x_demo,
         )
     bayes_terminal_mse = diagnostics.estimate_bayes_terminal_mse(
         dataset,
@@ -1774,44 +1879,66 @@ def run_experiment(cfg) -> dict:
             device=noise_ref.device,
             dtype=noise_ref.dtype,
         )
-    baseline_terminal = (
-        shared_gen_terminal
-        if shared_gen_terminal is not None
-        else _sample_terminal_batch_for_objective(
-            cfg=cfg,
-            dataset=dataset,
-            batch_size=int(cfg.eval_samples),
-            sigma_levels=sigma_levels,
-        )
+    eval_objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
+    if shared_gen_terminal is not None and eval_objective == "rf":
+        with autocast_context(device, amp_dtype):
+            baseline_gen_paths = sample_rectified_flow_paths_from_source(
+                denoiser=baseline_eval,
+                x_source=shared_gen_terminal,
+                sigma_levels=sigma_levels,
+            )
+    elif shared_gen_terminal is not None:
+        with autocast_context(device, amp_dtype):
+            baseline_gen_paths = reverse_paths_from_terminal(
+                denoiser=baseline_eval,
+                x_terminal=shared_gen_terminal,
+                sigma_levels=sigma_levels,
+                stochastic=True,
+                noise_schedule=shared_gen_reverse_noise,
+            )
+    else:
+        with autocast_context(device, amp_dtype):
+            baseline_gen_paths = sample_reverse_paths(
+                denoiser=baseline_eval,
+                sigma_levels=sigma_levels,
+                n_samples=int(cfg.eval_samples),
+                device=device,
+                stochastic=True,
+                sample_terminal_batch_fn=dataset.sample_terminal_batch,
+            )
+    baseline_gen_np = tensor_to_numpy(
+        baseline_gen_paths[:, generated_data_path_index_from_denoiser(baseline_eval)]
     )
-    robust_terminal = (
-        shared_gen_terminal
-        if shared_gen_terminal is not None
-        else _sample_terminal_batch_for_objective(
-            cfg=cfg,
-            dataset=dataset,
-            batch_size=int(cfg.eval_samples),
-            sigma_levels=sigma_levels,
-        )
+    if shared_gen_terminal is not None and eval_objective == "rf":
+        with autocast_context(device, amp_dtype):
+            robust_gen_paths = sample_rectified_flow_paths_from_source(
+                denoiser=robust,
+                x_source=shared_gen_terminal,
+                sigma_levels=sigma_levels,
+            )
+    elif shared_gen_terminal is not None:
+        with autocast_context(device, amp_dtype):
+            robust_gen_paths = reverse_paths_from_terminal(
+                denoiser=robust,
+                x_terminal=shared_gen_terminal,
+                sigma_levels=sigma_levels,
+                stochastic=True,
+                noise_schedule=shared_gen_reverse_noise,
+            )
+    else:
+        with autocast_context(device, amp_dtype):
+            robust_gen_paths = sample_reverse_paths(
+                denoiser=robust,
+                sigma_levels=sigma_levels,
+                n_samples=int(cfg.eval_samples),
+                device=device,
+                stochastic=True,
+                sample_terminal_batch_fn=dataset.sample_terminal_batch,
+            )
+    robust_gen_np = tensor_to_numpy(
+        robust_gen_paths[:, generated_data_path_index_from_denoiser(robust)]
     )
-    with autocast_context(device, amp_dtype):
-        baseline_gen_paths = reverse_paths_from_terminal(
-            denoiser=baseline_eval,
-            x_terminal=baseline_terminal,
-            sigma_levels=sigma_levels,
-            stochastic=True,
-            noise_schedule=shared_gen_reverse_noise,
-        )
-    baseline_gen_np = tensor_to_numpy(baseline_gen_paths[:, 0])
-    with autocast_context(device, amp_dtype):
-        robust_gen_paths = reverse_paths_from_terminal(
-            denoiser=robust,
-            x_terminal=robust_terminal,
-            sigma_levels=sigma_levels,
-            stochastic=True,
-            noise_schedule=shared_gen_reverse_noise,
-        )
-    robust_gen_np = tensor_to_numpy(robust_gen_paths[:, 0])
+    reverse_endpoint_idx = generated_data_path_index_from_denoiser(baseline_eval)
     runtime_sec["post_train_eval"] = float(time.perf_counter() - t_post_eval)
     val_pool_np = tensor_to_numpy(dataset.val_pool)
     train_pool_np = tensor_to_numpy(dataset.train_pool) if dataset.train_pool is not None else None
@@ -1949,6 +2076,7 @@ def run_experiment(cfg) -> dict:
     runtime_sec["baseline_weighted_compute_units"] = weighted_accounting["baseline"]["weighted_compute_units"]
     runtime_sec["baseline_train_wall_clock_sec_effective"] = baseline_train_wall_clock_sec_effective
 
+    cdro_attack_num_steps, cdro_attack_num_steps_source = _resolve_cdro_attack_num_steps(cfg)
     metrics = {
         "flow_debug": {
             "flow_mode": flow_mode,
@@ -1958,6 +2086,9 @@ def run_experiment(cfg) -> dict:
             "outer_attack_weight": float(cfg.outer_attack_weight),
             "outer_clean_weight": float(cfg.outer_clean_weight),
             "inner_steps": int(cfg.inner_steps),
+            "attack_num_steps": None if getattr(cfg, "attack_num_steps", None) is None else int(cfg.attack_num_steps),
+            "cdro_attack_num_steps_resolved": int(cdro_attack_num_steps),
+            "cdro_attack_num_steps_source": str(cdro_attack_num_steps_source),
             "v1_dual_lambda_enabled": bool(cfg.v1_dual_lambda_enabled),
             "v1_energy_budget_rho": float(cfg.v1_energy_budget_rho),
             "v1_lambda_init": float(cfg.v1_lambda_init),
@@ -1995,10 +2126,16 @@ def run_experiment(cfg) -> dict:
             "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
             "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
             "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            "rf_cdro_quantile_rule": str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
             "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
             "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
             "rf_edm_init": rf_edm_init_report,
             "rf_cdro_pair_source": str(getattr(cfg, "rf_cdro_pair_source", "auto")),
+            "rf_cdro_stage1_t_distribution": rf_cdro_stage1_t_distribution,
+            "rf_cdro_reflow_t_distribution": rf_cdro_reflow_t_distribution,
+            "rf_cdro_eval_stage": rf_cdro_eval_stage,
+            "rf_cdro_eval_t_distribution": rf_cdro_eval_t_distribution,
+            "rf_cdro_time_grid_distribution": rf_cdro_eval_t_distribution,
             "wild_update_interval": int(getattr(cfg, "wild_update_interval", 0)),
             "wild_cache_batches": int(getattr(cfg, "wild_cache_batches", 0)),
             "wild_inner_steps": int(getattr(cfg, "wild_inner_steps", 0)),
@@ -2150,6 +2287,22 @@ def run_experiment(cfg) -> dict:
             "baseline_rf_t_mean_curve": [float(v) for v in history_baseline.get("rf_t_mean", [])],
             "baseline_rf_stage1_steps": int(history_baseline.get("rf_stage1_steps", 0) or 0),
             "baseline_rf_reflow_steps": int(history_baseline.get("rf_reflow_steps", 0) or 0),
+            "robust_rf_stage_curve": [str(v) for v in history_robust.get("rf_stage", [])],
+            "robust_rf_t_distribution_curve": [str(v) for v in history_robust.get("rf_t_distribution", [])],
+            "robust_rf_stage1_t_distribution_resolved": str(
+                history_robust.get("rf_stage1_t_distribution_resolved", "")
+            ),
+            "robust_rf_reflow_t_distribution_resolved": str(
+                history_robust.get("rf_reflow_t_distribution_resolved", "")
+            ),
+            "robust_rf_eval_t_distribution_resolved": str(
+                history_robust.get("rf_eval_t_distribution_resolved", "")
+            ),
+            "robust_rf_cdro_quantile_rule_resolved": str(
+                history_robust.get("rf_cdro_quantile_rule_resolved", "")
+            ),
+            "robust_rf_stage1_steps": int(history_robust.get("rf_stage1_steps", 0) or 0),
+            "robust_rf_reflow_steps": int(history_robust.get("rf_reflow_steps", 0) or 0),
             "robust_outer_loss": summarize_series(history_robust["outer_loss"]),
             "robust_outer_loss_attack": summarize_series(history_robust.get("outer_loss_attack", [])),
             "robust_outer_loss_clean": summarize_series(history_robust.get("outer_loss_clean", [])),
@@ -2227,6 +2380,9 @@ def run_experiment(cfg) -> dict:
         "generalization_debug": denoise_gap,
         "constraint_debug": {
             "constraint_radius_source": constraint_radius_source,
+            "cdro_control_u_radius": history_robust.get("control_u_radius"),
+            "cdro_transition_deltas": [float(v) for v in history_robust.get("transition_deltas", [])],
+            "cdro_rf_stage_transition_deltas": history_robust.get("rf_stage_transition_deltas"),
             "use_time_dependent_kappa": bool(cfg.use_time_dependent_kappa),
             "kappa_base": float(cfg.control_radius_kappa),
             "kappa_low_multiplier": float(cfg.kappa_low_multiplier),
@@ -2249,10 +2405,20 @@ def run_experiment(cfg) -> dict:
             "terminal_sigma_for_plot": float(sigma_levels[terminal_step].item()),
             "plot_stochastic_backward": bool(cfg.plot_stochastic_backward),
             "baseline_x0_mse_from_ref_terminal": float(
-                (rev_baseline_from_ref[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item()
+                (rev_baseline_from_ref[:, reverse_endpoint_idx] - x_demo)
+                .reshape(x_demo.shape[0], -1)
+                .pow(2)
+                .sum(dim=1)
+                .mean()
+                .item()
             ),
             "baseline_x0_mse_from_attack_terminal": float(
-                (rev_baseline_from_attack[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item()
+                (rev_baseline_from_attack[:, reverse_endpoint_idx] - x_demo)
+                .reshape(x_demo.shape[0], -1)
+                .pow(2)
+                .sum(dim=1)
+                .mean()
+                .item()
             ),
             "bayes_posterior_mean_mse_at_terminal_sigma": (
                 None if bayes_terminal_mse is None else float(bayes_terminal_mse)
@@ -2261,15 +2427,22 @@ def run_experiment(cfg) -> dict:
                 None
                 if bayes_terminal_mse is None
                 else float(
-                    ((rev_baseline_from_ref[:, 0] - x_demo).reshape(x_demo.shape[0], -1).pow(2).sum(dim=1).mean().item())
+                    (
+                        (rev_baseline_from_ref[:, reverse_endpoint_idx] - x_demo)
+                        .reshape(x_demo.shape[0], -1)
+                        .pow(2)
+                        .sum(dim=1)
+                        .mean()
+                        .item()
+                    )
                     / max(bayes_terminal_mse, 1e-12)
                 )
             ),
             "baseline_plot_endpoint_mode_metrics_ref_terminal": dataset.evaluate_sample_metrics(
-                tensor_to_numpy(rev_baseline_from_ref_plot[:, 0])
+                tensor_to_numpy(rev_baseline_from_ref_plot[:, reverse_endpoint_idx])
             ),
             "baseline_plot_endpoint_mode_metrics_attack_terminal": dataset.evaluate_sample_metrics(
-                tensor_to_numpy(rev_baseline_from_attack_plot[:, 0])
+                tensor_to_numpy(rev_baseline_from_attack_plot[:, reverse_endpoint_idx])
             ),
             "baseline_path_mse_by_step_from_ref_terminal": compute_path_mse_by_step(rev_baseline_from_ref, ref_paths_plot),
             "baseline_path_mse_by_step_from_attack_terminal": compute_path_mse_by_step(

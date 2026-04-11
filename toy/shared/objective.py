@@ -88,9 +88,10 @@ def predict_velocity(
 
     if hasattr(denoiser, "predict_velocity"):
         return denoiser.predict_velocity(x_t, sigma)
-    t = batch_scalar_like(rf_time_from_sigma(sigma, sigma_max).clamp_min(1e-6), x_t)
-    x0_pred = denoiser(x_t, sigma)
-    return (x_t - x0_pred) / t.clamp_min(1e-8)
+    t = rf_time_from_sigma(sigma, sigma_max)
+    one_minus_t = batch_scalar_like((1.0 - t).clamp_min(1e-6), x_t)
+    x_right_pred = denoiser(x_t, sigma)
+    return (x_right_pred - x_t) / one_minus_t.clamp_min(1e-8)
 
 
 def weighted_denoise_loss(
@@ -145,23 +146,29 @@ def _regression_loss_from_error(
 def weighted_rectified_flow_loss(
     denoiser,
     x_t: torch.Tensor,
-    x_left: torch.Tensor,
+    x_clean: torch.Tensor,
     sigma: torch.Tensor,
     sigma_max: float,
     *,
+    x_left: torch.Tensor = None,
     x_right: torch.Tensor = None,
     loss_kind: str = "mse",
     pseudo_huber_delta: float = 0.1,
 ) -> torch.Tensor:
     """Compute RF velocity regression under an explicit or inferred path pair."""
 
-    t = rf_time_from_sigma(sigma, sigma_max).clamp_min(1e-6)
+    t = rf_time_from_sigma(sigma, sigma_max)
     pred_velocity = predict_velocity(denoiser, x_t, sigma, sigma_max=sigma_max)
-    if x_right is None:
-        # Backward-compatible path: valid when x_t lies on the unperturbed RF
-        # straight path from x_left to the sampled terminal endpoint.
-        target_velocity = (x_t - x_left) / batch_scalar_like(t, x_t).clamp_min(1e-8)
+    if x_right is None and x_left is None:
+        # Stage-1 RF path: x_t = (1 - t) z + t x_clean with target d = x_clean - z.
+        one_minus_t = batch_scalar_like((1.0 - t).clamp_min(1e-6), x_t)
+        target_velocity = (x_clean - x_t) / one_minus_t.clamp_min(1e-8)
     else:
+        if x_right is not None and x_left is None:
+            # Backward-compatible explicit-pair call sites passed `x_clean` as the left endpoint.
+            x_left = x_clean
+        if x_left is None or x_right is None:
+            raise ValueError("RF explicit-pair loss requires both x_left and x_right when either is provided.")
         target_velocity = x_right - x_left
     return _regression_loss_from_error(
         pred_velocity - target_velocity,
@@ -197,14 +204,14 @@ def build_training_state(
         sigma_max = float(getattr(cfg, "sigma_max", 1.0))
         terminal_scale = terminal_prior_scale_from_objective(objective, sigma_max)
         if sample_terminal_batch_fn is None:
-            x_terminal = torch.randn_like(x_clean) * terminal_scale
+            x_source = torch.randn_like(x_clean) * terminal_scale
         else:
-            x_terminal = sample_terminal_batch_fn(x_clean.shape[0], terminal_scale).to(
+            x_source = sample_terminal_batch_fn(x_clean.shape[0], terminal_scale).to(
                 device=x_clean.device,
                 dtype=x_clean.dtype,
             )
         t = batch_scalar_like(rf_time_from_sigma(sigma, sigma_max), x_clean)
-        return (1.0 - t) * x_clean + t * x_terminal
+        return (1.0 - t) * x_source + t * x_clean
     raise ValueError(f"Unsupported training objective '{objective}'. Expected one of: edm, score, rf.")
 
 
@@ -215,6 +222,7 @@ def compute_training_loss(
     x_clean: torch.Tensor,
     sigma: torch.Tensor,
     *,
+    x_left: torch.Tensor = None,
     x_right: torch.Tensor = None,
 ) -> torch.Tensor:
     """Dispatch train loss by objective kind: EDM, score matching, or rectified flow."""
@@ -237,6 +245,7 @@ def compute_training_loss(
             x_clean,
             sigma,
             sigma_max=float(getattr(cfg, "sigma_max", 1.0)),
+            x_left=x_left,
             x_right=x_right,
             loss_kind=str(getattr(cfg, "rf_loss", "mse")),
             pseudo_huber_delta=float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),

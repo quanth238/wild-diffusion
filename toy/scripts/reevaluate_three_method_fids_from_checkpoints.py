@@ -25,7 +25,7 @@ from toy.config import ToyConfig  # noqa: E402
 from toy.data_backends.provider import build_dataset_bundle  # noqa: E402
 from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
-from toy.shared.reverse import sample_reverse_paths  # noqa: E402
+from toy.shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
 from toy.shared.sigma import build_rf_time_quantile_levels, build_sigma_levels  # noqa: E402
 from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
@@ -311,7 +311,7 @@ def _sample_reverse_x0(
             stochastic=True,
             sample_terminal_batch_fn=sample_terminal_batch_fn,
         )
-    return states[:, 0]
+    return states[:, generated_data_path_index_from_denoiser(denoiser)]
 
 
 @torch.no_grad()

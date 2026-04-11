@@ -33,12 +33,41 @@ def _is_rectified_flow_model(denoiser) -> bool:
 
 
 @torch.no_grad()
-def _sample_rectified_flow_paths_from_terminal(
+def sample_rectified_flow_paths_from_source(
+    denoiser,
+    x_source: torch.Tensor,
+    sigma_levels: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic RF integration from source noise at t=0 to the data endpoint at t=1."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    x = x_source.clone()
+    states = [x]
+    t_levels = rf_time_levels_from_sigma_levels(sigma_levels).to(device=x.device, dtype=x.dtype)
+
+    for k in range(n_steps):
+        sigma = torch.full((x.shape[0],), float(sigma_levels[k].item()), device=x.device, dtype=x.dtype)
+        t_cur = float(t_levels[k].item())
+        t_next = float(t_levels[k + 1].item())
+        dt = max(t_next - t_cur, 0.0)
+        velocity = predict_velocity(
+            denoiser,
+            x,
+            sigma,
+            sigma_max=float(sigma_levels[-1].item()),
+        )
+        x = x + dt * velocity
+        states.append(x)
+    return torch.stack(states, dim=1)
+
+
+@torch.no_grad()
+def _reverse_rectified_flow_paths_from_terminal(
     denoiser,
     x_terminal: torch.Tensor,
     sigma_levels: torch.Tensor,
 ) -> torch.Tensor:
-    """Deterministic reverse-time RF integration from terminal noise to x0."""
+    """Deterministic reverse-time RF integration from the data endpoint back to source noise."""
 
     n_steps = int(sigma_levels.numel() - 1)
     x = x_terminal.clone()
@@ -72,7 +101,7 @@ def sample_reverse_paths(
     noise_schedule: Optional[torch.Tensor] = None,
     sample_terminal_batch_fn=None,
 ) -> torch.Tensor:
-    """Generate full reverse trajectories from sigma_N to sigma_0."""
+    """Generate family-aware sample paths from the model prior/source state."""
 
     terminal_scale = terminal_prior_scale_from_family(
         getattr(denoiser, "generative_family", ""),
@@ -83,9 +112,9 @@ def sample_reverse_paths(
     else:
         x = sample_terminal_batch_fn(n_samples, terminal_scale).to(device=device, dtype=sigma_levels.dtype)
     if _is_rectified_flow_model(denoiser):
-        return _sample_rectified_flow_paths_from_terminal(
+        return sample_rectified_flow_paths_from_source(
             denoiser=denoiser,
-            x_terminal=x,
+            x_source=x,
             sigma_levels=sigma_levels,
         )
     n_steps = sigma_levels.numel() - 1
@@ -130,7 +159,7 @@ def reverse_paths_from_terminal(
     """Reverse trajectories from provided terminal states x_k at the final index."""
 
     if _is_rectified_flow_model(denoiser):
-        return _sample_rectified_flow_paths_from_terminal(
+        return _reverse_rectified_flow_paths_from_terminal(
             denoiser=denoiser,
             x_terminal=x_terminal,
             sigma_levels=sigma_levels,
@@ -167,3 +196,15 @@ def reverse_paths_from_terminal(
         states[k - 1] = x
 
     return torch.stack(states, dim=1)
+
+
+def generated_data_path_index_from_family(generative_family: str) -> int:
+    """Return the path index that corresponds to the generated data endpoint."""
+
+    return -1 if str(generative_family).strip().lower() == "rectified_flow" else 0
+
+
+def generated_data_path_index_from_denoiser(denoiser) -> int:
+    """Return the path index of generated samples for the provided model family."""
+
+    return generated_data_path_index_from_family(getattr(denoiser, "generative_family", ""))
