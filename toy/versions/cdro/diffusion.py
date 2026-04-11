@@ -6,7 +6,7 @@ import torch
 
 from ...shared.objective import compute_training_loss, rf_time_levels_from_sigma_levels
 from ...shared.runtime import autocast_context, resolve_amp_dtype
-from ...shared.sigma import build_log_sigma_quantile_cell_edges
+from ...shared.sigma import build_log_sigma_quantile_ladder
 
 
 @dataclass
@@ -157,7 +157,31 @@ def build_transition_deltas_for_objective(
         total = float(dt.sum().item())
         return dt * (float(time_horizon) / total)
     n_steps = int(sigma_levels.numel() - 1)
-    z_edges = build_log_sigma_quantile_cell_edges(
+    ladder = _build_checked_warmup_quantile_ladder(cfg=cfg, sigma_levels=sigma_levels)
+    z_edges = ladder.log_sigma_edges
+    sigma_min = float(getattr(cfg, "sigma_min", 0.0))
+    sigma_max = float(getattr(cfg, "sigma_max", 0.0))
+    log_span = math.log(sigma_max) - math.log(sigma_min)
+    if log_span <= 0.0:
+        raise ValueError("Log-sigma continuation span must be positive.")
+    tau_edges = float(time_horizon) * (z_edges - math.log(sigma_min)) / log_span
+    dt = tau_edges[1:] - tau_edges[:-1]
+    if torch.any(dt <= 0):
+        raise ValueError("All continuation transition sizes Delta_tau_k must be strictly positive.")
+    return dt
+
+
+def _build_checked_warmup_quantile_ladder(
+    *,
+    cfg,
+    sigma_levels: torch.Tensor,
+    atol: float = 1e-6,
+    rtol: float = 1e-5,
+):
+    """Build the config-implied warmup ladder and assert it matches runtime sigma levels."""
+
+    n_steps = int(sigma_levels.numel() - 1)
+    ladder = build_log_sigma_quantile_ladder(
         float(getattr(cfg, "sigma_min", 0.0)),
         float(getattr(cfg, "sigma_max", 0.0)),
         n_steps,
@@ -166,14 +190,24 @@ def build_transition_deltas_for_objective(
         device=sigma_levels.device,
         dtype=sigma_levels.dtype,
     )
-    log_span = math.log(float(getattr(cfg, "sigma_max", 0.0))) - math.log(float(getattr(cfg, "sigma_min", 0.0)))
-    if log_span <= 0.0:
-        raise ValueError("Log-sigma continuation span must be positive.")
-    tau_edges = float(time_horizon) * (z_edges - math.log(float(getattr(cfg, "sigma_min", 0.0)))) / log_span
-    dt = tau_edges[1:] - tau_edges[:-1]
-    if torch.any(dt <= 0):
-        raise ValueError("All continuation transition sizes Delta_tau_k must be strictly positive.")
-    return dt
+    expected = ladder.sigma_levels
+    if sigma_levels.shape != expected.shape:
+        raise ValueError(
+            "Runtime sigma_levels shape does not match the warmup-quantile ladder implied by cfg: "
+            f"got {tuple(sigma_levels.shape)} vs expected {tuple(expected.shape)}."
+        )
+    if not torch.allclose(sigma_levels, expected, atol=float(atol), rtol=float(rtol)):
+        diff = (sigma_levels - expected).abs()
+        flat_idx = int(diff.reshape(-1).argmax().item())
+        max_abs = float(diff.reshape(-1)[flat_idx].item())
+        expected_flat = expected.reshape(-1)
+        rel_base = expected_flat.abs().clamp_min(torch.finfo(expected.dtype).eps)
+        max_rel = float((diff.reshape(-1)[flat_idx] / rel_base[flat_idx]).item())
+        raise ValueError(
+            "Runtime sigma_levels is not the midpoint ladder implied by the configured warmup quantile law. "
+            f"max_abs_diff={max_abs:.3e} max_rel_diff={max_rel:.3e} at flat_index={flat_idx}."
+        )
+    return ladder
 
 
 def _build_time_deltas_for_objective(

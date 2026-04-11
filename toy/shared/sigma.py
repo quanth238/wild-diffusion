@@ -1,7 +1,16 @@
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+
+@dataclass(frozen=True)
+class LogSigmaQuantileLadder:
+    """Shared midpoint/edge representation for the warmup-quantile VE ladder."""
+
+    sigma_levels: torch.Tensor
+    log_sigma_edges: torch.Tensor
 
 
 def build_sigma_levels(sigma_min: float, sigma_max: float, n_steps: int, device: torch.device) -> torch.Tensor:
@@ -115,6 +124,29 @@ def build_sigma_levels_from_warmup_quantiles(
 ) -> torch.Tensor:
     """Build the positive continuation ladder from warmup-law midpoint quantiles."""
 
+    return build_log_sigma_quantile_ladder(
+        sigma_min,
+        sigma_max,
+        n_steps,
+        p_mean=p_mean,
+        p_std=p_std,
+        device=device,
+        dtype=torch.float32,
+    ).sigma_levels
+
+
+def build_log_sigma_quantile_ladder(
+    sigma_min: float,
+    sigma_max: float,
+    n_steps: int,
+    *,
+    p_mean: float = -1.2,
+    p_std: float = 1.2,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> LogSigmaQuantileLadder:
+    """Build midpoint states and exact cell edges from one shared quantile ladder."""
+
     if n_steps <= 0:
         raise ValueError(f"n_steps must be > 0, got {n_steps}")
     normal, cdf_min, cdf_max = _truncated_log_sigma_cdf_bounds(
@@ -123,13 +155,41 @@ def build_sigma_levels_from_warmup_quantiles(
         p_mean=p_mean,
         p_std=p_std,
     )
-    probs = (torch.arange(1, n_steps + 1, dtype=torch.float64) - 0.5) / float(n_steps)
-    trunc_cdf = cdf_min + probs * (cdf_max - cdf_min)
-    z = normal.icdf(trunc_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
-    sigma_positive = torch.exp(z).to(device=device, dtype=torch.float32)
-    if not torch.all(sigma_positive[1:] > sigma_positive[:-1]):
+    out_device = torch.device("cpu") if device is None else device
+    out_dtype = torch.float32 if dtype is None else dtype
+
+    mass = cdf_max - cdf_min
+    probs_mid = (torch.arange(1, n_steps + 1, dtype=torch.float64) - 0.5) / float(n_steps)
+    trunc_mid_cdf = cdf_min + probs_mid * mass
+    z_mid = normal.icdf(trunc_mid_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
+
+    z_min = torch.tensor(math.log(float(sigma_min)), dtype=torch.float64)
+    z_max = torch.tensor(math.log(float(sigma_max)), dtype=torch.float64)
+    if n_steps == 1:
+        z_edges = torch.stack([z_min, z_max])
+    else:
+        probs_edge = torch.arange(1, n_steps, dtype=torch.float64) / float(n_steps)
+        trunc_edge_cdf = cdf_min + probs_edge * mass
+        z_inner = normal.icdf(trunc_edge_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
+        z_edges = torch.cat([z_min.view(1), z_inner, z_max.view(1)])
+
+    sigma_positive = torch.exp(z_mid)
+    if sigma_positive.numel() > 1 and not torch.all(sigma_positive[1:] > sigma_positive[:-1]):
         raise ValueError("Warmup-quantile continuation ladder must be strictly increasing.")
-    return torch.cat([torch.zeros(1, device=device, dtype=sigma_positive.dtype), sigma_positive])
+    if not torch.all(z_edges[1:] > z_edges[:-1]):
+        raise ValueError("Warmup-quantile cell edges must be strictly increasing.")
+
+    sigma_levels = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.float64),
+            sigma_positive,
+        ]
+    ).to(device=out_device, dtype=out_dtype)
+    log_sigma_edges = z_edges.to(device=out_device, dtype=out_dtype)
+    return LogSigmaQuantileLadder(
+        sigma_levels=sigma_levels,
+        log_sigma_edges=log_sigma_edges,
+    )
 
 
 def build_log_sigma_quantile_cell_edges(
@@ -144,29 +204,15 @@ def build_log_sigma_quantile_cell_edges(
 ) -> torch.Tensor:
     """Build exact log-sigma cell edges for the midpoint-quantile continuation grid."""
 
-    if n_steps <= 0:
-        raise ValueError(f"n_steps must be > 0, got {n_steps}")
-    normal, cdf_min, cdf_max = _truncated_log_sigma_cdf_bounds(
-        sigma_min=sigma_min,
-        sigma_max=sigma_max,
+    return build_log_sigma_quantile_ladder(
+        sigma_min,
+        sigma_max,
+        n_steps,
         p_mean=p_mean,
         p_std=p_std,
-    )
-    out_device = torch.device("cpu") if device is None else device
-    out_dtype = torch.float32 if dtype is None else dtype
-
-    z_min = torch.tensor(math.log(float(sigma_min)), dtype=torch.float64)
-    z_max = torch.tensor(math.log(float(sigma_max)), dtype=torch.float64)
-    if n_steps == 1:
-        z_edges = torch.stack([z_min, z_max])
-    else:
-        probs = torch.arange(1, n_steps, dtype=torch.float64) / float(n_steps)
-        trunc_cdf = cdf_min + probs * (cdf_max - cdf_min)
-        z_inner = normal.icdf(trunc_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
-        z_edges = torch.cat([z_min.view(1), z_inner, z_max.view(1)])
-    if not torch.all(z_edges[1:] > z_edges[:-1]):
-        raise ValueError("Warmup-quantile cell edges must be strictly increasing.")
-    return z_edges.to(device=out_device, dtype=out_dtype)
+        device=device,
+        dtype=dtype,
+    ).log_sigma_edges
 
 
 def sample_target_indices(batch_size: int, sigma_levels: torch.Tensor) -> torch.Tensor:
