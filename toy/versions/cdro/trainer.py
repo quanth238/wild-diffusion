@@ -12,14 +12,17 @@ from ...shared.trainer_common import generate_reflow_pairs
 from ...shared.sigma import (
     build_rf_stage_time_quantile_levels,
     resolve_rf_stage_t_distribution,
+    sample_log_sigma_stratified_quantile_ladder,
     sample_target_indices,
     sample_target_indices_log_normal,
 )
 from ...shared.train_utils import pathwise_l2, sample_train_batch
 from ...utils import has_nan_or_inf, scalarize
 from .diffusion import (
+    STOCHASTIC_STRATIFIED_QUANTILE_LADDER,
     build_constraint_radii_for_objective,
     build_transition_deltas_for_objective,
+    resolve_cdro_edm_ladder_mode,
     rollout_controlled_ve,
     rollout_path_heuristic_attack,
 )
@@ -36,6 +39,25 @@ def _control_transport_cost(control_path: torch.Tensor, transition_deltas: torch
 
 def _is_rf_objective(cfg) -> bool:
     return str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+
+
+def _sample_cdro_edm_step_ladder(cfg, sigma_levels: torch.Tensor) -> torch.Tensor:
+    """Sample one CDRO-EDM stratified ladder with the same support and step count."""
+
+    ladder = sample_log_sigma_stratified_quantile_ladder(
+        float(getattr(cfg, "sigma_min", 0.0)),
+        float(getattr(cfg, "sigma_max", 0.0)),
+        int(sigma_levels.numel() - 1),
+        p_mean=float(getattr(cfg, "p_mean", -1.2)),
+        p_std=float(getattr(cfg, "p_std", 1.2)),
+        device=sigma_levels.device,
+        dtype=sigma_levels.dtype,
+    )
+    return ladder.sigma_levels
+
+
+def _snapshot_tensor_values(value: torch.Tensor) -> list[float]:
+    return [float(v.item()) for v in value.detach().cpu()]
 
 
 def _resolve_attack_num_steps(cfg) -> tuple[int, str]:
@@ -439,10 +461,15 @@ def train_trajectory_robust_cdro(
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
     ema_model = init_ema_model(denoiser, cfg, ema_state_dict=ema_state_dict)
     rf_pair_source = _resolve_rf_cdro_pair_source(cfg) if _is_rf_objective(cfg) else "data_noise"
+    cdro_edm_ladder_mode = resolve_cdro_edm_ladder_mode(cfg)
+    use_stochastic_edm_ladders = bool(
+        not _is_rf_objective(cfg) and cdro_edm_ladder_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER
+    )
     history["rf_pair_source_resolved"] = rf_pair_source
     history["attack_num_steps_resolved"] = int(attack_num_steps)
     history["attack_num_steps_source"] = str(attack_num_steps_source)
     history["control_u_radius"] = float((total_budget / time_horizon) ** 0.5 if time_horizon > 0.0 else 0.0)
+    history["cdro_edm_ladder_mode_resolved"] = str(cdro_edm_ladder_mode)
     rf_pair_teacher = None
     rf_stage1_steps = 0
     rf_reflow_steps = 0
@@ -502,12 +529,17 @@ def train_trajectory_robust_cdro(
             set_requires_grad(rf_pair_teacher, False)
             history.setdefault("rf_reflow_teacher_refresh_step", int(rf_stage1_steps))
     else:
-        history["transition_deltas"] = [float(v.item()) for v in transition_deltas.detach().cpu()]
+        if use_stochastic_edm_ladders:
+            history["transition_deltas"] = []
+            history["transition_deltas_reference"] = _snapshot_tensor_values(transition_deltas)
+        else:
+            history["transition_deltas"] = _snapshot_tensor_values(transition_deltas)
 
     print(
         f"[cdro] resolved attack_num_steps={attack_num_steps} "
         f"source={attack_num_steps_source} pair_source={rf_pair_source} "
-        f"control_u_radius={history['control_u_radius']:.6f}"
+        f"control_u_radius={history['control_u_radius']:.6f} "
+        f"edm_ladder_mode={cdro_edm_ladder_mode}"
         + (
             ""
             if not _is_rf_objective(cfg)
@@ -559,6 +591,26 @@ def train_trajectory_robust_cdro(
             current_radius_by_step = stage_grid["radius_by_step"]
             history["rf_stage"].append(current_rf_stage)
             history["rf_t_distribution"].append(str(stage_grid["distribution"]))
+        elif use_stochastic_edm_ladders:
+            current_sigma_levels = _sample_cdro_edm_step_ladder(cfg, sigma_levels)
+            current_transition_deltas = build_transition_deltas_for_objective(
+                cfg=cfg,
+                sigma_levels=current_sigma_levels,
+                time_horizon=time_horizon,
+            ).to(device=current_sigma_levels.device, dtype=current_sigma_levels.dtype)
+            current_radius_by_step = build_constraint_radii_for_objective(
+                cfg=cfg,
+                sigma_levels=current_sigma_levels,
+                total_budget=total_budget,
+                time_horizon=time_horizon,
+            ).to(device=current_sigma_levels.device, dtype=current_sigma_levels.dtype)
+            if "stochastic_ladder_first_sigma_levels" not in history:
+                history["stochastic_ladder_first_sigma_levels"] = _snapshot_tensor_values(current_sigma_levels)
+                history["stochastic_ladder_first_transition_deltas"] = _snapshot_tensor_values(
+                    current_transition_deltas
+                )
+            history["stochastic_ladder_last_sigma_levels"] = _snapshot_tensor_values(current_sigma_levels)
+            history["stochastic_ladder_last_transition_deltas"] = _snapshot_tensor_values(current_transition_deltas)
         if _is_rf_objective(cfg):
             indices = sample_target_indices(x0.shape[0], current_sigma_levels)
         elif cfg.use_log_normal_sigma_sampling:

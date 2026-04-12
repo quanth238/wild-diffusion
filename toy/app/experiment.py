@@ -2098,6 +2098,7 @@ def run_experiment(cfg) -> dict:
             "cdro_step_size": float(getattr(cfg, "cdro_step_size", 0.0)),
             "cdro_total_budget_rho": float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
             "cdro_time_horizon": float(getattr(cfg, "cdro_time_horizon", 0.0)),
+            "cdro_edm_ladder_mode": str(getattr(cfg, "cdro_edm_ladder_mode", "deterministic_midpoint_quantile")),
             "cdro_warmup_fraction": float(getattr(cfg, "cdro_warmup_fraction", 0.0)),
             "cdro_antithetic_rollouts": bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
             "method_version": cfg.method_version,
@@ -2301,6 +2302,9 @@ def run_experiment(cfg) -> dict:
             "robust_rf_cdro_quantile_rule_resolved": str(
                 history_robust.get("rf_cdro_quantile_rule_resolved", "")
             ),
+            "robust_cdro_edm_ladder_mode_resolved": str(
+                history_robust.get("cdro_edm_ladder_mode_resolved", "")
+            ),
             "robust_rf_stage1_steps": int(history_robust.get("rf_stage1_steps", 0) or 0),
             "robust_rf_reflow_steps": int(history_robust.get("rf_reflow_steps", 0) or 0),
             "robust_outer_loss": summarize_series(history_robust["outer_loss"]),
@@ -2382,6 +2386,21 @@ def run_experiment(cfg) -> dict:
             "constraint_radius_source": constraint_radius_source,
             "cdro_control_u_radius": history_robust.get("control_u_radius"),
             "cdro_transition_deltas": [float(v) for v in history_robust.get("transition_deltas", [])],
+            "cdro_transition_deltas_reference": [
+                float(v) for v in history_robust.get("transition_deltas_reference", [])
+            ],
+            "cdro_stochastic_ladder_first_sigma_levels": [
+                float(v) for v in history_robust.get("stochastic_ladder_first_sigma_levels", [])
+            ],
+            "cdro_stochastic_ladder_first_transition_deltas": [
+                float(v) for v in history_robust.get("stochastic_ladder_first_transition_deltas", [])
+            ],
+            "cdro_stochastic_ladder_last_sigma_levels": [
+                float(v) for v in history_robust.get("stochastic_ladder_last_sigma_levels", [])
+            ],
+            "cdro_stochastic_ladder_last_transition_deltas": [
+                float(v) for v in history_robust.get("stochastic_ladder_last_transition_deltas", [])
+            ],
             "cdro_rf_stage_transition_deltas": history_robust.get("rf_stage_transition_deltas"),
             "use_time_dependent_kappa": bool(cfg.use_time_dependent_kappa),
             "kappa_base": float(cfg.control_radius_kappa),

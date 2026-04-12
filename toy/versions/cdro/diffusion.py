@@ -8,6 +8,9 @@ from ...shared.objective import compute_training_loss, rf_time_levels_from_sigma
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import build_log_sigma_quantile_ladder
 
+DETERMINISTIC_MIDPOINT_QUANTILE_LADDER = "deterministic_midpoint_quantile"
+STOCHASTIC_STRATIFIED_QUANTILE_LADDER = "stochastic_stratified_quantile"
+
 
 @dataclass
 class RolloutResult:
@@ -25,6 +28,22 @@ class RolloutResult:
 
 def _is_rf_objective(cfg) -> bool:
     return str(getattr(cfg, "training_objective", "edm")).lower() == "rf"
+
+
+def resolve_cdro_edm_ladder_mode(cfg) -> str:
+    """Resolve the CDRO-EDM continuation ladder construction mode."""
+
+    mode = str(
+        getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
+    ).strip().lower()
+    if mode in ("deterministic", "midpoint", "midpoint_quantile", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER):
+        return DETERMINISTIC_MIDPOINT_QUANTILE_LADDER
+    if mode in ("stochastic", "stratified", "stochastic_stratified", STOCHASTIC_STRATIFIED_QUANTILE_LADDER):
+        return STOCHASTIC_STRATIFIED_QUANTILE_LADDER
+    raise ValueError(
+        "--cdro-edm-ladder-mode must be one of "
+        f"('{DETERMINISTIC_MIDPOINT_QUANTILE_LADDER}', '{STOCHASTIC_STRATIFIED_QUANTILE_LADDER}'), got {mode}"
+    )
 
 
 def project_l2_ball(delta_raw: torch.Tensor, radius: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -163,9 +182,18 @@ def build_transition_deltas_for_objective(
         )
         total = float(dt.sum().item())
         return dt * (float(time_horizon) / total)
-    n_steps = int(sigma_levels.numel() - 1)
+    ladder_mode = resolve_cdro_edm_ladder_mode(cfg)
+    if ladder_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER:
+        return build_time_deltas(
+            sigma_levels,
+            time_horizon,
+            sigma_min=float(getattr(cfg, "sigma_min", 0.0)),
+            sigma_max=float(getattr(cfg, "sigma_max", 0.0)),
+        )
     ladder = _build_checked_warmup_quantile_ladder(cfg=cfg, sigma_levels=sigma_levels)
     z_edges = ladder.log_sigma_edges
+    if z_edges is None:
+        raise ValueError("Deterministic warmup-quantile cell edges are required for edge-based Delta_tau.")
     sigma_min = float(getattr(cfg, "sigma_min", 0.0))
     sigma_max = float(getattr(cfg, "sigma_max", 0.0))
     log_span = math.log(sigma_max) - math.log(sigma_min)

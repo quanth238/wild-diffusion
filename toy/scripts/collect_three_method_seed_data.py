@@ -285,6 +285,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
+    parser.add_argument(
+        "--cdro-edm-ladder-mode",
+        type=str,
+        default="stochastic_stratified_quantile",
+        choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
+    )
     parser.add_argument("--cdro-warmup-fraction", type=float, default=0.05)
     parser.add_argument("--cdro-antithetic-rollouts", action="store_true")
     parser.add_argument("--cdro-n-steps-path", type=int, default=0)
@@ -1340,6 +1346,7 @@ def _extract_cdro_row(
         "baseline_ckpt_loaded": bool(flow.get("baseline_ckpt_loaded", False)),
         "robust_resume_loaded": bool(flow.get("robust_resume_loaded", False)),
         "phase_step_split_mode": str(flow["phase_step_split_mode"]),
+        "cdro_edm_ladder_mode": str(flow.get("cdro_edm_ladder_mode", "deterministic_midpoint_quantile")),
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
@@ -1683,6 +1690,8 @@ def _build_run_toy_cmd(
                 str(args.cdro_total_budget_rho),
                 "--cdro-time-horizon",
                 str(args.cdro_time_horizon),
+                "--cdro-edm-ladder-mode",
+                str(args.cdro_edm_ladder_mode),
                 "--cdro-warmup-fraction",
                 str(args.cdro_warmup_fraction),
                 *(
@@ -2543,6 +2552,7 @@ def main() -> None:
             "cdro_expected_robust_step_weighted_units": float(cdro_robust_step_weighted_units),
             "cdro_effective_n_steps_path": int(_effective_cdro_n_steps_path(args)),
             "cdro_antithetic_rollouts": bool(args.cdro_antithetic_rollouts),
+            "cdro_edm_ladder_mode": str(args.cdro_edm_ladder_mode),
             "calibration": calibration,
         },
         "trajectories": {

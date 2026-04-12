@@ -125,6 +125,7 @@ class ToyConfig:
     cdro_step_size: float = 0.02
     cdro_total_budget_rho: float = 4.0
     cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
+    cdro_edm_ladder_mode: str = "stochastic_stratified_quantile"  # deterministic_midpoint_quantile|stochastic_stratified_quantile
     # Reference WDRO warmup step fraction. CDRO converts this into a target
     # weighted-compute warmup share, then solves for the baseline warmup steps
     # needed to match that share under CDRO's more expensive robust steps.

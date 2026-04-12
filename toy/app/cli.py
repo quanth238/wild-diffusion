@@ -126,6 +126,15 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--cdro-total-budget-rho must be >= 0, got {cfg.cdro_total_budget_rho}")
     if cfg.cdro_time_horizon <= 0:
         raise ValueError(f"--cdro-time-horizon must be > 0, got {cfg.cdro_time_horizon}")
+    if str(cfg.cdro_edm_ladder_mode).lower() not in (
+        "deterministic_midpoint_quantile",
+        "stochastic_stratified_quantile",
+    ):
+        raise ValueError(
+            "--cdro-edm-ladder-mode must be one of "
+            "('deterministic_midpoint_quantile', 'stochastic_stratified_quantile'), got "
+            f"{cfg.cdro_edm_ladder_mode}"
+        )
     if not (0.0 <= cfg.cdro_warmup_fraction <= 1.0):
         raise ValueError(f"--cdro-warmup-fraction must be in [0, 1], got {cfg.cdro_warmup_fraction}")
     if cfg.v12_step_size <= 0:
@@ -404,6 +413,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cdro-step-size", type=float, default=ToyConfig.cdro_step_size)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=ToyConfig.cdro_total_budget_rho)
     parser.add_argument("--cdro-time-horizon", type=float, default=ToyConfig.cdro_time_horizon)
+    parser.add_argument(
+        "--cdro-edm-ladder-mode",
+        type=str,
+        default=ToyConfig.cdro_edm_ladder_mode,
+        choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
+    )
     parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
     parser.add_argument(
         "--cdro-antithetic-rollouts",

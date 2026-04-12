@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
+    parser.add_argument(
+        "--cdro-edm-ladder-mode",
+        type=str,
+        default="stochastic_stratified_quantile",
+        choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
+    )
     parser.add_argument("--cdro-warmup-fraction", type=float, default=0.05)
     parser.add_argument("--match-reference-csv", type=str, default="")
     parser.add_argument("--match-reference-method", type=str, default="wdro")
@@ -530,6 +536,8 @@ def run_point(
         str(args.cdro_total_budget_rho),
         "--cdro-time-horizon",
         str(args.cdro_time_horizon),
+        "--cdro-edm-ladder-mode",
+        str(args.cdro_edm_ladder_mode),
         "--cdro-warmup-fraction",
         str(args.cdro_warmup_fraction),
     ]
@@ -733,6 +741,7 @@ def extract_cdro_row(
         "baseline_ckpt_requested": baseline_ckpt_requested,
         "baseline_ckpt_loaded": bool(flow["baseline_ckpt_loaded"]),
         "phase_step_split_mode": str(flow["phase_step_split_mode"]),
+        "cdro_edm_ladder_mode": str(flow.get("cdro_edm_ladder_mode", "deterministic_midpoint_quantile")),
         "train_wall_clock_complete": bool(
             compute_accounting.get("train_wall_clock_complete", train_wall_clock_sec is not None)
         ),
