@@ -4,6 +4,13 @@ This package is the canonical toy-side implementation in this repo.
 
 The current active workflow is Simpsons-MNIST RGB with `method_version=cdro`.
 
+Recent capability note:
+
+- The toy stack now also supports RF-family experiments alongside EDM-family ones.
+- Public comparison naming should read: `Baseline EDM`, `Wild-Diffusion`, `CDRO-EDM`, `RF`, `CDRO-RF`.
+- In plots/presentation, the historically named `wdro` method should display as `Wild-Diffusion`.
+- `Wild-Diffusion-RF` is still intentionally deferred.
+
 Important caveat:
 
 - The generic `toy/run_toy.py` CLI still supports many historical methods.
@@ -15,9 +22,10 @@ Use these first when the task is about the current working setup:
 
 - `toy/scripts/setup_simpsons_mnist_rgb.py`: prepare the RGB dataset and FID ref under `toy_data/simpsons_mnist_rgb/`.
 - `toy/scripts/run_simpsons_mnist_once.sh`: single smoke run. Defaults to `RUN_MODE=robust` and `METHOD_VERSION=cdro`, with smoke-scale training/eval sizes but the locked CDRO method knobs.
-- `toy/scripts/collect_three_method_seed_data.py`: canonical shared-grid collector for baseline EDM, WDRO, and CDRO.
+- `toy/scripts/collect_three_method_seed_data.py`: canonical family-aware collector for EDM/RF baselines and robust methods on a shared comparison schema.
 - `toy/scripts/run_simpsons_locked_default_percent_sweep.sh`: locked percent sweep launcher for the active Simpsons defaults.
 - `docs/SIMPSONS_DEFAULT_SETUP.md`: locked configuration, artifact roots, and canonical command examples.
+- `docs/RF_CDRO_RF_STATUS.md`: current RF / CDRO-RF implementation status and naming conventions.
 
 ## Core Files
 
@@ -25,6 +33,8 @@ Use these first when the task is about the current working setup:
 - `app/cli.py`: CLI parsing and validation.
 - `app/experiment.py`: orchestration, training, eval, metrics, and artifact writing.
 - `config.py`: full config dataclass, including CDRO/WDRO/WILD knobs.
+- `shared/trainer_common.py`: baseline training path, including the strong public RF baseline.
+- `shared/sigma.py`: family-aware EDM/RF grid helpers and RF quantile-grid construction.
 - `versions/registry.py`: resolves `--method-version`.
 - `compute_accounting.py`: weighted-compute accounting and warmup calibration.
 - `shared/`: version-agnostic diffusion, objective, runtime, and trainer utilities.
@@ -34,6 +44,7 @@ Use these first when the task is about the current working setup:
 
 - `cdro`: current active Simpsons method.
 - `wdro` and `wild`: retained comparison baselines for shared-grid evaluation.
+- `training_objective=rf`: rectified-flow family support under the same toy stack.
 - `clean`, `v1`, `v1.1`, `v1.2`, `v2`, `v2.1`: historical or ablation variants kept for reproducibility.
 
 Do not infer the active repo direction from the presence of those historical methods alone.

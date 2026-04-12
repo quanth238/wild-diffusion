@@ -8,11 +8,21 @@ These are the scripts that match the current working decision in this repo:
 
 - `setup_simpsons_mnist_rgb.py`: stage the RGB dataset under `toy_data/simpsons_mnist_rgb/` and build the FID ref.
 - `run_simpsons_mnist_once.sh`: single Simpsons smoke run. Defaults to `RUN_MODE=robust` and `METHOD_VERSION=cdro`, with smoke-scale training/eval sizes but the locked CDRO method knobs.
-- `collect_three_method_seed_data.py`: canonical weighted-grid collector for baseline EDM, WDRO, and CDRO.
+- `collect_three_method_seed_data.py`: canonical family-aware weighted-grid collector for EDM/RF baselines and robust methods.
 - `run_simpsons_locked_default_percent_sweep.sh`: locked percent sweep for the current Simpsons defaults.
 - `plot_three_method_fid_curves.py`: plotting for the collected three-method runs.
 - `reevaluate_three_method_fids_from_checkpoints.py`: re-run FID from saved checkpoints when needed.
 - `materialize_toy_pngs.py`: assemble checked-in PNG summaries from collected outputs.
+
+Current comparison naming convention:
+
+- `Baseline EDM`
+- `Wild-Diffusion`
+- `CDRO-EDM`
+- `RF`
+- `CDRO-RF`
+
+`Wild-Diffusion-RF` is still deferred.
 
 ## Shared Wrappers
 

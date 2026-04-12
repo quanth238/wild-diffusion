@@ -7,11 +7,12 @@ This is the shortest reliable map of the repo.
 If you are working on the current Simpsons-MNIST RGB setup, start here:
 
 - [docs/SIMPSONS_DEFAULT_SETUP.md](/root/wild-diffusion/docs/SIMPSONS_DEFAULT_SETUP.md): locked Simpsons defaults
+- [docs/RF_CDRO_RF_STATUS.md](/root/wild-diffusion/docs/RF_CDRO_RF_STATUS.md): current RF / CDRO-RF status note
 - [toy/README.md](/root/wild-diffusion/toy/README.md): current toy-side status
 - [toy/scripts/README.md](/root/wild-diffusion/toy/scripts/README.md): active vs historical scripts
 - [toy/scripts/run_simpsons_mnist_once.sh](/root/wild-diffusion/toy/scripts/run_simpsons_mnist_once.sh): single-run smoke wrapper
 - [toy/scripts/run_simpsons_locked_default_percent_sweep.sh](/root/wild-diffusion/toy/scripts/run_simpsons_locked_default_percent_sweep.sh): locked sweep launcher
-- [toy/scripts/collect_three_method_seed_data.py](/root/wild-diffusion/toy/scripts/collect_three_method_seed_data.py): shared weighted-grid collector for baseline/WDRO/CDRO
+- [toy/scripts/collect_three_method_seed_data.py](/root/wild-diffusion/toy/scripts/collect_three_method_seed_data.py): shared family-aware collector for EDM/RF baselines and robust comparisons
 
 ## Start Here
 

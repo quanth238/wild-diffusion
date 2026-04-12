@@ -18,6 +18,7 @@ Start here:
 
 - `docs/SIMPSONS_DEFAULT_SETUP.md`: locked default Simpsons configuration and canonical artifact paths.
 - `docs/CODEBASE_MAP.md`: code navigation map.
+- `docs/RF_CDRO_RF_STATUS.md`: current toy-side RF / CDRO-RF status note.
 - `toy/README.md`: toy-side current status.
 - `toy/scripts/README.md`: active vs historical script inventory.
 
