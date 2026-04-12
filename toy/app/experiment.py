@@ -32,6 +32,7 @@ from ..shared.sigma import (
     build_sigma_levels,
     build_sigma_levels_from_warmup_quantiles,
     resolve_rf_stage_t_distribution,
+    sample_log_sigma_stratified_quantile_ladder,
     sample_target_indices,
 )
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
@@ -56,6 +57,10 @@ from ..trainer import reverse_paths_from_terminal, sample_reverse_paths, train_b
 from ..utils import as_jsonable_metrics, ensure_dir, pick_device, set_seed, tensor_to_numpy
 from ..versions.cdro.trainer import _resolve_rf_cdro_pair_source, _resolve_rf_cdro_stage_steps
 from ..versions.registry import resolve_method_module
+
+
+DETERMINISTIC_MIDPOINT_QUANTILE_LADDER = "deterministic_midpoint_quantile"
+STOCHASTIC_STRATIFIED_QUANTILE_LADDER = "stochastic_stratified_quantile"
 
 
 def _capture_rng_state() -> Dict:
@@ -121,6 +126,120 @@ def _build_family_sigma_levels(cfg, device: torch.device) -> torch.Tensor:
             reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
     return build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+
+
+def _use_stochastic_cdro_eval_ladders(cfg, method_name: str) -> bool:
+    return (
+        str(method_name).strip().lower() == "cdro"
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf"
+        and str(
+            getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
+        ).strip().lower()
+        == STOCHASTIC_STRATIFIED_QUANTILE_LADDER
+    )
+
+
+def _sample_cdro_eval_sigma_levels(cfg, sigma_levels: torch.Tensor) -> torch.Tensor:
+    return sample_log_sigma_stratified_quantile_ladder(
+        float(cfg.sigma_min),
+        float(cfg.sigma_max),
+        int(cfg.n_steps_path),
+        p_mean=float(getattr(cfg, "p_mean", -1.2)),
+        p_std=float(getattr(cfg, "p_std", 1.2)),
+        device=sigma_levels.device,
+        dtype=sigma_levels.dtype,
+    ).sigma_levels
+
+
+def _sample_eval_generated_x0(
+    *,
+    denoiser,
+    cfg,
+    sigma_levels: torch.Tensor,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    dataset: DatasetBundle,
+    n_samples: int,
+    shared_terminal: Optional[torch.Tensor] = None,
+    shared_reverse_noise: Optional[torch.Tensor] = None,
+    sigma_levels_batches: Optional[list[torch.Tensor]] = None,
+    chunk_sizes: Optional[list[int]] = None,
+) -> torch.Tensor:
+    eval_objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
+    use_stochastic_cdro = sigma_levels_batches is not None
+    endpoint_idx = generated_data_path_index_from_denoiser(denoiser)
+
+    if not use_stochastic_cdro:
+        if shared_terminal is not None and eval_objective == "rf":
+            with autocast_context(device, amp_dtype):
+                gen_paths = sample_rectified_flow_paths_from_source(
+                    denoiser=denoiser,
+                    x_source=shared_terminal,
+                    sigma_levels=sigma_levels,
+                )
+        elif shared_terminal is not None:
+            with autocast_context(device, amp_dtype):
+                gen_paths = reverse_paths_from_terminal(
+                    denoiser=denoiser,
+                    x_terminal=shared_terminal,
+                    sigma_levels=sigma_levels,
+                    stochastic=True,
+                    noise_schedule=shared_reverse_noise,
+                )
+        else:
+            with autocast_context(device, amp_dtype):
+                gen_paths = sample_reverse_paths(
+                    denoiser=denoiser,
+                    sigma_levels=sigma_levels,
+                    n_samples=int(n_samples),
+                    device=device,
+                    stochastic=True,
+                    sample_terminal_batch_fn=dataset.sample_terminal_batch,
+                )
+        return gen_paths[:, endpoint_idx]
+
+    if eval_objective == "rf":
+        raise ValueError("Stochastic CDRO eval ladders are only defined for EDM.")
+
+    if chunk_sizes is None or len(chunk_sizes) != len(sigma_levels_batches):
+        raise ValueError("stochastic CDRO eval requires chunk_sizes aligned with sigma_levels_batches.")
+
+    chunks = []
+    start = 0
+    for sigma_levels_batch, cur in zip(sigma_levels_batches, chunk_sizes):
+        cur = int(cur)
+        if cur <= 0:
+            break
+        if shared_terminal is not None:
+            x_terminal_chunk = shared_terminal[start : start + cur]
+            noise_chunk = (
+                shared_reverse_noise[:, start : start + cur]
+                if shared_reverse_noise is not None
+                else None
+            )
+            with autocast_context(device, amp_dtype):
+                gen_paths = reverse_paths_from_terminal(
+                    denoiser=denoiser,
+                    x_terminal=x_terminal_chunk,
+                    sigma_levels=sigma_levels_batch,
+                    stochastic=True,
+                    noise_schedule=noise_chunk,
+                )
+        else:
+            with autocast_context(device, amp_dtype):
+                gen_paths = sample_reverse_paths(
+                    denoiser=denoiser,
+                    sigma_levels=sigma_levels_batch,
+                    n_samples=cur,
+                    device=device,
+                    stochastic=True,
+                    sample_terminal_batch_fn=dataset.sample_terminal_batch,
+                )
+        chunks.append(gen_paths[:, endpoint_idx])
+        start += cur
+    if not chunks:
+        raise ValueError("Expected at least one stochastic CDRO evaluation chunk.")
+    return torch.cat(chunks, dim=0)
 
 
 def _is_cdro_rf_port(cfg, method_name: str) -> bool:
@@ -1879,64 +1998,48 @@ def run_experiment(cfg) -> dict:
             device=noise_ref.device,
             dtype=noise_ref.dtype,
         )
+    use_stochastic_cdro_eval = _use_stochastic_cdro_eval_ladders(cfg, method_name)
+    eval_chunk_size = max(1, min(int(cfg.eval_samples), int(getattr(cfg, "fid_batch_size", 256))))
+    eval_chunk_sizes = None
+    eval_sigma_levels_batches = None
+    if use_stochastic_cdro_eval:
+        remaining = int(cfg.eval_samples)
+        eval_chunk_sizes = []
+        while remaining > 0:
+            cur = min(eval_chunk_size, remaining)
+            eval_chunk_sizes.append(int(cur))
+            remaining -= cur
+        eval_sigma_levels_batches = [_sample_cdro_eval_sigma_levels(cfg, sigma_levels) for _ in eval_chunk_sizes]
     eval_objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
-    if shared_gen_terminal is not None and eval_objective == "rf":
-        with autocast_context(device, amp_dtype):
-            baseline_gen_paths = sample_rectified_flow_paths_from_source(
-                denoiser=baseline_eval,
-                x_source=shared_gen_terminal,
-                sigma_levels=sigma_levels,
-            )
-    elif shared_gen_terminal is not None:
-        with autocast_context(device, amp_dtype):
-            baseline_gen_paths = reverse_paths_from_terminal(
-                denoiser=baseline_eval,
-                x_terminal=shared_gen_terminal,
-                sigma_levels=sigma_levels,
-                stochastic=True,
-                noise_schedule=shared_gen_reverse_noise,
-            )
-    else:
-        with autocast_context(device, amp_dtype):
-            baseline_gen_paths = sample_reverse_paths(
-                denoiser=baseline_eval,
-                sigma_levels=sigma_levels,
-                n_samples=int(cfg.eval_samples),
-                device=device,
-                stochastic=True,
-                sample_terminal_batch_fn=dataset.sample_terminal_batch,
-            )
     baseline_gen_np = tensor_to_numpy(
-        baseline_gen_paths[:, generated_data_path_index_from_denoiser(baseline_eval)]
+        _sample_eval_generated_x0(
+            denoiser=baseline_eval,
+            cfg=cfg,
+            sigma_levels=sigma_levels,
+            device=device,
+            amp_dtype=amp_dtype,
+            dataset=dataset,
+            n_samples=int(cfg.eval_samples),
+            shared_terminal=shared_gen_terminal,
+            shared_reverse_noise=shared_gen_reverse_noise,
+            sigma_levels_batches=eval_sigma_levels_batches,
+            chunk_sizes=eval_chunk_sizes,
+        )
     )
-    if shared_gen_terminal is not None and eval_objective == "rf":
-        with autocast_context(device, amp_dtype):
-            robust_gen_paths = sample_rectified_flow_paths_from_source(
-                denoiser=robust,
-                x_source=shared_gen_terminal,
-                sigma_levels=sigma_levels,
-            )
-    elif shared_gen_terminal is not None:
-        with autocast_context(device, amp_dtype):
-            robust_gen_paths = reverse_paths_from_terminal(
-                denoiser=robust,
-                x_terminal=shared_gen_terminal,
-                sigma_levels=sigma_levels,
-                stochastic=True,
-                noise_schedule=shared_gen_reverse_noise,
-            )
-    else:
-        with autocast_context(device, amp_dtype):
-            robust_gen_paths = sample_reverse_paths(
-                denoiser=robust,
-                sigma_levels=sigma_levels,
-                n_samples=int(cfg.eval_samples),
-                device=device,
-                stochastic=True,
-                sample_terminal_batch_fn=dataset.sample_terminal_batch,
-            )
     robust_gen_np = tensor_to_numpy(
-        robust_gen_paths[:, generated_data_path_index_from_denoiser(robust)]
+        _sample_eval_generated_x0(
+            denoiser=robust,
+            cfg=cfg,
+            sigma_levels=sigma_levels,
+            device=device,
+            amp_dtype=amp_dtype,
+            dataset=dataset,
+            n_samples=int(cfg.eval_samples),
+            shared_terminal=shared_gen_terminal,
+            shared_reverse_noise=shared_gen_reverse_noise,
+            sigma_levels_batches=eval_sigma_levels_batches,
+            chunk_sizes=eval_chunk_sizes,
+        )
     )
     reverse_endpoint_idx = generated_data_path_index_from_denoiser(baseline_eval)
     runtime_sec["post_train_eval"] = float(time.perf_counter() - t_post_eval)

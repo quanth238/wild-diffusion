@@ -27,11 +27,18 @@ from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
 from toy.shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
-from toy.shared.sigma import build_rf_time_quantile_levels, build_sigma_levels  # noqa: E402
+from toy.shared.sigma import (  # noqa: E402
+    build_rf_time_quantile_levels,
+    build_sigma_levels,
+    build_sigma_levels_from_warmup_quantiles,
+    sample_log_sigma_stratified_quantile_ladder,
+)
 from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
 
 
 _APPLIED_PROCESS_TITLE = apply_process_title()
+DETERMINISTIC_MIDPOINT_QUANTILE_LADDER = "deterministic_midpoint_quantile"
+STOCHASTIC_STRATIFIED_QUANTILE_LADDER = "stochastic_stratified_quantile"
 
 DEFAULT_TRAIN_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "train")
 DEFAULT_VAL_ROOT = os.path.join(ROOT_DIR, "toy_data", "simpsons_mnist_rgb", "imagefolder", "test")
@@ -61,6 +68,55 @@ class EvalContext:
     sigma_levels: torch.Tensor
     baseline_model: torch.nn.Module
     robust_model: torch.nn.Module
+
+
+def _canonical_method_name(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_stochastic_cdro_eval(cfg: ToyConfig, method_name: str) -> bool:
+    return (
+        _canonical_method_name(method_name) == "cdro"
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf"
+        and str(
+            getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
+        ).strip().lower()
+        == STOCHASTIC_STRATIFIED_QUANTILE_LADDER
+    )
+
+
+def _build_eval_sigma_levels(cfg: ToyConfig, *, device: torch.device, method_name: str) -> torch.Tensor:
+    if str(cfg.training_objective).strip().lower() == "rf":
+        return build_rf_time_quantile_levels(
+            float(cfg.sigma_max),
+            int(cfg.n_steps_path),
+            device=device,
+            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+    if _canonical_method_name(method_name) == "cdro":
+        return build_sigma_levels_from_warmup_quantiles(
+            float(cfg.sigma_min),
+            float(cfg.sigma_max),
+            int(cfg.n_steps_path),
+            device=device,
+            p_mean=float(getattr(cfg, "p_mean", -1.2)),
+            p_std=float(getattr(cfg, "p_std", 1.2)),
+        )
+    return build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
+
+
+def _sample_eval_sigma_levels(cfg: ToyConfig, method_name: str, sigma_levels: torch.Tensor) -> torch.Tensor:
+    if not _is_stochastic_cdro_eval(cfg, method_name):
+        return sigma_levels
+    return sample_log_sigma_stratified_quantile_ladder(
+        float(cfg.sigma_min),
+        float(cfg.sigma_max),
+        int(cfg.n_steps_path),
+        p_mean=float(getattr(cfg, "p_mean", -1.2)),
+        p_std=float(getattr(cfg, "p_std", 1.2)),
+        device=sigma_levels.device,
+        dtype=sigma_levels.dtype,
+    ).sigma_levels
 
 
 def parse_args() -> argparse.Namespace:
@@ -318,6 +374,8 @@ def _sample_reverse_x0(
 def _compute_fid_for_model(
     *,
     denoiser: torch.nn.Module,
+    cfg: ToyConfig,
+    method_name: str,
     sigma_levels: torch.Tensor,
     dataset,
     detector_net,
@@ -338,9 +396,10 @@ def _compute_fid_for_model(
     denoiser.eval()
     while n_done < num_images:
         cur = min(gen_batch, num_images - n_done)
+        sigma_levels_batch = _sample_eval_sigma_levels(cfg, method_name, sigma_levels)
         images = _sample_reverse_x0(
             denoiser=denoiser,
-            sigma_levels=sigma_levels,
+            sigma_levels=sigma_levels_batch,
             n_samples=cur,
             device=device,
             amp_dtype=amp_dtype,
@@ -356,7 +415,8 @@ def _compute_fid_for_model(
         if log_handle is not None:
             elapsed = time.perf_counter() - t_start
             log_handle.write(
-                f"[fid-only] progress images={n_done}/{num_images} batch={cur} elapsed_sec={elapsed:.2f}\n"
+                f"[fid-only] progress images={n_done}/{num_images} batch={cur} "
+                f"sigma_max={float(sigma_levels_batch[-1].item()):.6f} elapsed_sec={elapsed:.2f}\n"
             )
             log_handle.flush()
 
@@ -451,6 +511,7 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "amp_dtype",
         "allow_tf32",
         "batch_size",
+        "cdro_edm_ladder_mode",
         "cudnn_benchmark",
         "dataset_kind",
         "dataset_path",
@@ -466,6 +527,8 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "limited_data_enabled",
         "model_kind",
         "n_steps_path",
+        "p_mean",
+        "p_std",
         "rf_baseline_mode",
         "rf_cdro_pair_source",
         "rf_loss",
@@ -514,9 +577,10 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
     return cfg
 
 
-def _context_key_for_cfg(cfg: ToyConfig, device: torch.device) -> Tuple[object, ...]:
+def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str) -> Tuple[object, ...]:
     return (
         str(device),
+        _canonical_method_name(method_name),
         str(cfg.amp_dtype),
         str(cfg.dataset_kind),
         str(cfg.model_kind),
@@ -533,7 +597,10 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device) -> Tuple[object, 
         int(cfg.n_steps_path),
         float(cfg.sigma_min),
         float(cfg.sigma_max),
+        float(getattr(cfg, "p_mean", -1.2)),
+        float(getattr(cfg, "p_std", 1.2)),
         float(getattr(cfg, "sigma_data", -1.0)),
+        str(getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)),
         str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         bool(getattr(cfg, "allow_tf32", True)),
         bool(getattr(cfg, "cudnn_benchmark", True)),
@@ -549,7 +616,8 @@ def _get_or_build_context(
 ) -> EvalContext:
     cfg = _config_from_row(args, row)
     device = pick_device(str(cfg.device))
-    key = _context_key_for_cfg(cfg, device)
+    method_name = _canonical_method_name(row.get("method", row.get("robust_method", "")))
+    key = _context_key_for_cfg(cfg, device, method_name)
     cached = cache.get(key)
     if cached is not None:
         return cached
@@ -564,15 +632,7 @@ def _get_or_build_context(
     if float(getattr(cfg, "sigma_data", -1.0)) <= 0.0:
         cfg.sigma_data = float(dataset.estimate_sigma_data())
     model_bundle = build_model_bundle(cfg, dataset, float(cfg.sigma_data), device)
-    if str(cfg.training_objective).strip().lower() == "rf":
-        sigma_levels = build_rf_time_quantile_levels(
-            float(cfg.sigma_max),
-            int(cfg.n_steps_path),
-            device=device,
-            distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-        )
-    else:
-        sigma_levels = build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
+    sigma_levels = _build_eval_sigma_levels(cfg, device=device, method_name=method_name)
     context = EvalContext(
         key=key,
         cfg=cfg,
@@ -641,6 +701,9 @@ def _write_metrics_payload(
             "sigma_max": float(ctx.cfg.sigma_max),
             "sigma_data": float(ctx.cfg.sigma_data),
             "training_objective": str(ctx.cfg.training_objective),
+            "cdro_edm_ladder_mode": str(
+                getattr(ctx.cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
+            ),
             "rf_reflow_t_distribution": str(getattr(ctx.cfg, "rf_reflow_t_distribution", "u_shaped")),
             "amp_dtype": str(ctx.cfg.amp_dtype),
             "eval_seed_offset_metrics": int(ctx.cfg.eval_seed_offset_metrics),
@@ -665,6 +728,7 @@ def _write_metrics_payload(
                 "direct_fid_only": True,
                 "checkpoint_branch": branch,
                 "checkpoint_state_variant": str(checkpoint_state_variant),
+                "stochastic_cdro_eval": bool(_is_stochastic_cdro_eval(ctx.cfg, str(row.get("method", "")))),
             },
         },
         "runtime_sec": {
@@ -733,6 +797,8 @@ def _evaluate_checkpoint_fid(
         t_start = time.perf_counter()
         fid_value = _compute_fid_for_model(
             denoiser=model,
+            cfg=ctx.cfg,
+            method_name=str(row.get("method", "")),
             sigma_levels=ctx.sigma_levels,
             dataset=ctx.dataset,
             detector_net=detector_net,
