@@ -12,6 +12,12 @@ Canonical entrypoints:
 - Image-scale EDM/WDRO training: `python train.py ...`
 - Image generation from saved EDM checkpoints: `python generate.py ...`
 
+Weights & Biases:
+
+- Toy runs: add `--wandb --wandb-project <project>` to `python toy/run_toy.py ...`
+- Image runs: add `--wandb --wandb-project <project>` to `python train.py ...`
+- Optional flags on both paths: `--wandb-entity`, `--wandb-name`, `--wandb-group`, `--wandb-tags`, `--wandb-mode offline`
+
 Useful maps:
 
 - [toy/README.md](/root/wild-diffusion/toy/README.md): current toy-side status

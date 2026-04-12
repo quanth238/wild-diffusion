@@ -7,6 +7,7 @@ import dnnlib
 from torch_utils import distributed as dist
 # from training import training_loop
 from training import training_wdro_loop
+from wandb_utils import finish_run, init_wandb_run, log_artifact
 
 import warnings
 warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
@@ -80,6 +81,13 @@ def parse_int_list(s):
 @click.option('--seed',          help='Random seed  [default: random]', metavar='INT',              type=int)
 @click.option('--transfer',      help='Transfer learning from network pickle', metavar='PKL|URL',   type=str)
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
+@click.option('--wandb',         help='Enable Weights & Biases logging',                             is_flag=True)
+@click.option('--wandb-project', help='W&B project name', metavar='STR',                             type=str, default='wild-diffusion', show_default=True)
+@click.option('--wandb-entity',  help='W&B entity/team name', metavar='STR',                         type=str, default='')
+@click.option('--wandb-name',    help='W&B run name', metavar='STR',                                 type=str, default='')
+@click.option('--wandb-group',   help='W&B group name', metavar='STR',                               type=str, default='')
+@click.option('--wandb-tags',    help='Comma-separated W&B tags', metavar='CSV',                     type=str, default='')
+@click.option('--wandb-mode',    help='W&B mode', metavar='online|offline|disabled',                type=click.Choice(['online', 'offline', 'disabled']), default='online', show_default=True)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
 def main(**kwargs):
@@ -170,6 +178,15 @@ def main(**kwargs):
         debug_eval_ref_path=(opts.debug_eval_ref if opts.debug_eval_ref else None),
         debug_adv_num_visual=opts.debug_adv_visual,
     )
+    c.wandb_kwargs = dnnlib.EasyDict(
+        enabled=bool(opts.wandb),
+        project=opts.wandb_project,
+        entity=(opts.wandb_entity or None),
+        name=(opts.wandb_name or None),
+        group=(opts.wandb_group or None),
+        tags=opts.wandb_tags,
+        mode=opts.wandb_mode,
+    )
 
     # Random seed.
     if opts.seed is not None:
@@ -252,8 +269,43 @@ def main(**kwargs):
         dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
 
     # Train.
-    # training_loop.training_loop(**c)
-    training_wdro_loop.training_loop(**c)
+    wandb_run = None
+    try:
+        if dist.get_rank() == 0:
+            wandb_run = init_wandb_run(
+                enabled=bool(c.wandb_kwargs.enabled),
+                project=str(c.wandb_kwargs.project),
+                entity=c.wandb_kwargs.entity,
+                name=(c.wandb_kwargs.name or os.path.basename(c.run_dir)),
+                group=c.wandb_kwargs.group,
+                job_type='image-train',
+                tags=c.wandb_kwargs.tags,
+                mode=str(c.wandb_kwargs.mode),
+                run_dir=c.run_dir,
+                config=c,
+            )
+        c.wandb_run = wandb_run
+        # training_loop.training_loop(**c)
+        training_wdro_loop.training_loop(**c)
+        if dist.get_rank() == 0:
+            log_artifact(
+                wandb_run,
+                name=f"image-train-{os.path.basename(c.run_dir)}",
+                artifact_type='training-run',
+                paths=[
+                    os.path.join(c.run_dir, 'training_options.json'),
+                    os.path.join(c.run_dir, 'stats.jsonl'),
+                    os.path.join(c.run_dir, 'log.txt'),
+                ],
+                metadata={'run_dir': c.run_dir},
+            )
+    except Exception:
+        if dist.get_rank() == 0:
+            finish_run(wandb_run, exit_code=1)
+        raise
+    else:
+        if dist.get_rank() == 0:
+            finish_run(wandb_run, exit_code=0)
 
 #----------------------------------------------------------------------------
 

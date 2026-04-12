@@ -11,6 +11,7 @@ import torch.distributed as dist_torch
 from torch_utils import distributed as dist
 from torch_utils import misc
 from torch_utils import training_stats
+from wandb_utils import log_metrics, update_summary
 
 from training.wdro_utils import (
     _delta_to_bw_uint8,
@@ -68,6 +69,8 @@ def training_loop(
     debug_eval_num_visual = 32,     # Number of sample images to save per quick eval.
     debug_eval_ref_path = None,     # Optional local .npz for reference stats.
     debug_adv_num_visual = 16,      # Number of adversarial/raw debug images per WDRO refresh.
+    wandb_kwargs         = None,    # W&B init config, preserved in training options.
+    wandb_run            = None,    # Optional rank-0 W&B run handle.
     device              = torch.device('cuda'),
 ):
     # Initialize.
@@ -428,10 +431,26 @@ def training_loop(
         # Update logs.
         training_stats.default_collector.update()
         if dist.get_rank() == 0:
+            stats_payload = dict(training_stats.default_collector.as_dict(), timestamp=time.time())
             if stats_jsonl is None:
                 stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
-            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
+            stats_jsonl.write(json.dumps(stats_payload) + '\n')
             stats_jsonl.flush()
+            log_metrics(
+                wandb_run,
+                stats_payload,
+                step=int(cur_nimg // 1000),
+            )
+            update_summary(
+                wandb_run,
+                {
+                    'run_dir': run_dir,
+                    'status': 'running',
+                    'last_tick': int(cur_tick),
+                    'last_kimg': float(cur_nimg / 1e3),
+                },
+                prefix='image_train',
+            )
         dist.update_progress(cur_nimg // 1000, total_kimg)
         while next_tick_nimg is not None and cur_nimg >= next_tick_nimg:
             next_tick_nimg += tick_interval_nimg
@@ -445,6 +464,16 @@ def training_loop(
             break
 
     # Done.
+    if dist.get_rank() == 0:
+        update_summary(
+            wandb_run,
+            {
+                'run_dir': run_dir,
+                'status': 'completed',
+                'total_kimg': float(cur_nimg / 1e3),
+            },
+            prefix='image_train',
+        )
     dist.print0()
     dist.print0('Exiting...')
 

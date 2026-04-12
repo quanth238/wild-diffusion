@@ -333,6 +333,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robust-resume-ckpt-path", type=str, default=ToyConfig.robust_resume_ckpt_path)
     parser.add_argument("--robust-save-ckpt-path", type=str, default=ToyConfig.robust_save_ckpt_path)
     parser.add_argument("--baseline-steps-override", type=int, default=ToyConfig.baseline_steps_override)
+    parser.add_argument("--wandb", action="store_true", default=ToyConfig.wandb_enabled)
+    parser.add_argument("--wandb-project", type=str, default=ToyConfig.wandb_project)
+    parser.add_argument("--wandb-entity", type=str, default=ToyConfig.wandb_entity)
+    parser.add_argument("--wandb-name", type=str, default=ToyConfig.wandb_name)
+    parser.add_argument("--wandb-group", type=str, default=ToyConfig.wandb_group)
+    parser.add_argument("--wandb-tags", type=str, default=ToyConfig.wandb_tags)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default=ToyConfig.wandb_mode,
+        choices=["online", "offline", "disabled"],
+    )
 
     parser.add_argument("--hidden-dim", type=int, default=ToyConfig.hidden_dim)
     parser.add_argument("--lr-theta", type=float, default=ToyConfig.lr_theta)

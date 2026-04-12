@@ -19,6 +19,7 @@ import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
+from wandb_utils import log_metrics, update_summary
 
 #----------------------------------------------------------------------------
 
@@ -45,6 +46,8 @@ def training_loop(
     resume_state_dump   = None,     # Start from the given training state, None = reset training state.
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
+    wandb_kwargs        = None,     # W&B init config, preserved in training options.
+    wandb_run           = None,     # Optional rank-0 W&B run handle.
     device              = torch.device('cuda'),
 ):
     # Initialize.
@@ -195,10 +198,26 @@ def training_loop(
         # Update logs.
         training_stats.default_collector.update()
         if dist.get_rank() == 0:
+            stats_payload = dict(training_stats.default_collector.as_dict(), timestamp=time.time())
             if stats_jsonl is None:
                 stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
-            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
+            stats_jsonl.write(json.dumps(stats_payload) + '\n')
             stats_jsonl.flush()
+            log_metrics(
+                wandb_run,
+                stats_payload,
+                step=int(cur_nimg // 1000),
+            )
+            update_summary(
+                wandb_run,
+                {
+                    'run_dir': run_dir,
+                    'status': 'running',
+                    'last_tick': int(cur_tick),
+                    'last_kimg': float(cur_nimg / 1e3),
+                },
+                prefix='image_train',
+            )
         dist.update_progress(cur_nimg // 1000, total_kimg)
 
         # Update state.
@@ -210,6 +229,16 @@ def training_loop(
             break
 
     # Done.
+    if dist.get_rank() == 0:
+        update_summary(
+            wandb_run,
+            {
+                'run_dir': run_dir,
+                'status': 'completed',
+                'total_kimg': float(cur_nimg / 1e3),
+            },
+            prefix='image_train',
+        )
     dist.print0()
     dist.print0('Exiting...')
 

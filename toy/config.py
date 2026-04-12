@@ -61,6 +61,13 @@ class ToyConfig:
     robust_resume_ckpt_path: str = ""
     robust_save_ckpt_path: str = ""
     baseline_steps_override: int = 0
+    wandb_enabled: bool = False
+    wandb_project: str = "wild-diffusion"
+    wandb_entity: str = ""
+    wandb_name: str = ""
+    wandb_group: str = ""
+    wandb_tags: str = ""
+    wandb_mode: str = "online"
 
     # Model.
     hidden_dim: int = 128

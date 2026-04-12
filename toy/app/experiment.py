@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+from wandb_utils import finish_run, init_wandb_run, log_artifact, log_metrics, log_series, update_summary
 
 from ..checks import run_preflight_checks
 from ..compute_accounting import (
@@ -1462,10 +1463,33 @@ def run_experiment(cfg) -> dict:
     ensure_dir(cfg.outdir)
     exp_dir = os.path.join(cfg.outdir, cfg.exp_name)
     ensure_dir(exp_dir)
+    wandb_run = init_wandb_run(
+        enabled=bool(getattr(cfg, "wandb_enabled", False)),
+        project=str(getattr(cfg, "wandb_project", "wild-diffusion")),
+        entity=str(getattr(cfg, "wandb_entity", "")).strip() or None,
+        name=str(getattr(cfg, "wandb_name", "")).strip() or str(cfg.exp_name),
+        group=str(getattr(cfg, "wandb_group", "")).strip() or str(cfg.method_version),
+        job_type="toy-train",
+        tags=str(getattr(cfg, "wandb_tags", "")).strip(),
+        mode=str(getattr(cfg, "wandb_mode", "online")),
+        run_dir=exp_dir,
+        config=vars(cfg),
+    )
     flow_mode = (
         "baseline_only"
         if cfg.baseline_only
         else ("robust_forced_no_gate" if not cfg.baseline_gate_enabled else "robust_with_gate")
+    )
+    update_summary(
+        wandb_run,
+        {
+            "exp_dir": exp_dir,
+            "method_version": str(cfg.method_version),
+            "dataset_kind": str(cfg.dataset_kind),
+            "flow_mode": flow_mode,
+            "status": "running",
+        },
+        prefix="toy_run",
     )
     method = resolve_method_module(cfg.method_version)
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
@@ -2938,6 +2962,74 @@ def run_experiment(cfg) -> dict:
             run_wall_start=run_wall_start,
         )
 
+    log_metrics(
+        wandb_run,
+        {
+            "final/baseline_gate_passed": bool(metrics["baseline_gate"]["passed"]),
+            "final/attack_training_executed": bool(metrics["baseline_gate"]["attack_training_executed"]),
+            "final/runtime_total_sec": float(runtime_sec["total"]),
+            "final/train_wall_clock_sec": runtime_sec["train_wall_clock_sec"],
+            "final/weighted_compute_units": runtime_sec["weighted_compute_units"],
+            "final/baseline_fid": metrics["sample_quality_debug"].get("baseline_fid"),
+            "final/robust_fid": metrics["sample_quality_debug"].get("robust_fid"),
+        },
+        step=int(runtime_sec["effective_train_images_seen_total"] or 0),
+    )
+    log_series(
+        wandb_run,
+        metric_name="baseline/loss",
+        values=history_baseline.get("loss", []),
+    )
+    log_series(
+        wandb_run,
+        metric_name="baseline/proxy_weighted_denoise_loss",
+        values=history_baseline.get("proxy_weighted_denoise_loss", []),
+    )
+    log_series(
+        wandb_run,
+        metric_name="robust/outer_loss",
+        values=history_robust.get("outer_loss", []),
+    )
+    log_series(
+        wandb_run,
+        metric_name="robust/inner_obj",
+        values=history_robust.get("inner_obj", []),
+    )
+    log_series(
+        wandb_run,
+        metric_name="robust/energy",
+        values=history_robust.get("energy", []),
+    )
+    update_summary(
+        wandb_run,
+        payload,
+        prefix="toy_payload",
+    )
+    update_summary(
+        wandb_run,
+        {
+            "exp_dir": exp_dir,
+            "status": "completed",
+        },
+        prefix="toy_run",
+    )
+    log_artifact(
+        wandb_run,
+        name=f"toy-run-{cfg.exp_name}",
+        artifact_type="experiment-run",
+        paths=[
+            os.path.join(exp_dir, "metrics.json"),
+            os.path.join(exp_dir, "forward_backward_baseline_attack.png"),
+            os.path.join(exp_dir, "debug_losses_and_recovery.png"),
+        ],
+        metadata={
+            "exp_name": cfg.exp_name,
+            "method_version": cfg.method_version,
+            "dataset_kind": cfg.dataset_kind,
+            "exp_dir": exp_dir,
+        },
+    )
+
     print("[result] metrics summary", flush=True)
     print(f"  dataset_debug: {metrics['dataset_debug']}", flush=True)
     print(f"  objective_debug: {metrics['objective_debug']}", flush=True)
@@ -3005,4 +3097,5 @@ def run_experiment(cfg) -> dict:
         flush=True,
     )
     print(f"[result] artifacts saved to: {exp_dir}", flush=True)
+    finish_run(wandb_run, exit_code=0)
     return payload
