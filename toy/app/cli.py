@@ -552,6 +552,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_v1_dual_lambda = bool(args_dict.pop("disable_v1_dual_lambda"))
     disable_wild_fixed_noise_inner = bool(args_dict.pop("disable_wild_fixed_noise_inner"))
     collapse_v_l2_tol_legacy = args_dict.pop("collapse_v_l2_tol")
+    args_dict["wandb_enabled"] = bool(args_dict.pop("wandb"))
 
     cfg = ToyConfig(**args_dict)
     if skip_checks:
