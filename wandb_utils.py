@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -9,6 +10,10 @@ def _import_wandb():
     except ImportError:
         return None
     return wandb
+
+
+def _warn(message: str) -> None:
+    print(f"[wandb] warning: {message}", file=sys.stderr, flush=True)
 
 
 def wandb_is_available() -> bool:
@@ -65,10 +70,11 @@ def init_wandb_run(
 
     wandb = _import_wandb()
     if wandb is None:
-        raise RuntimeError(
-            "wandb logging was requested, but the package is not installed. "
-            "Install it with `python3 -m pip install wandb`."
+        _warn(
+            "logging was requested, but the package is not installed; "
+            "continuing with wandb disabled."
         )
+        return None
 
     init_kwargs = {
         "project": str(project),
@@ -81,7 +87,32 @@ def init_wandb_run(
         "config": _to_jsonable(config or {}),
         "dir": run_dir or os.getcwd(),
     }
-    return wandb.init(**init_kwargs)
+
+    def _init_with_mode(selected_mode: str):
+        return wandb.init(**{**init_kwargs, "mode": str(selected_mode)})
+
+    try:
+        return _init_with_mode(str(mode))
+    except Exception as exc:
+        requested_mode = str(mode).strip().lower()
+        if requested_mode == "online":
+            _warn(
+                f"init failed in online mode ({type(exc).__name__}: {exc}); "
+                "retrying in offline mode."
+            )
+            try:
+                run = _init_with_mode("offline")
+            except Exception as offline_exc:
+                _warn(
+                    "offline fallback also failed "
+                    f"({type(offline_exc).__name__}: {offline_exc}); continuing with wandb disabled."
+                )
+                return None
+            _warn("wandb is running in offline fallback mode.")
+            return run
+
+        _warn(f"init failed ({type(exc).__name__}: {exc}); continuing with wandb disabled.")
+        return None
 
 
 def log_metrics(run: Any, metrics: Mapping[str, Any], *, step: Optional[int] = None, commit: bool = True) -> None:
@@ -90,7 +121,10 @@ def log_metrics(run: Any, metrics: Mapping[str, Any], *, step: Optional[int] = N
     payload = _to_jsonable(metrics)
     if not isinstance(payload, dict):
         return
-    run.log(payload, step=step, commit=commit)
+    try:
+        run.log(payload, step=step, commit=commit)
+    except Exception as exc:
+        _warn(f"log_metrics failed ({type(exc).__name__}: {exc}); continuing.")
 
 
 def _flatten_scalars(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -110,17 +144,23 @@ def update_summary(run: Any, payload: Mapping[str, Any], *, prefix: Optional[str
         return
     normalized = _to_jsonable(payload)
     summary_payload = _flatten_scalars(normalized, prefix=prefix or "")
-    for key, value in summary_payload.items():
-        run.summary[key] = value
+    try:
+        for key, value in summary_payload.items():
+            run.summary[key] = value
+    except Exception as exc:
+        _warn(f"update_summary failed ({type(exc).__name__}: {exc}); continuing.")
 
 
 def log_series(run: Any, *, metric_name: str, values: Sequence[Any], start_step: int = 1) -> None:
     if run is None:
         return
-    for idx, value in enumerate(values, start=start_step):
-        if not isinstance(value, (int, float)):
-            continue
-        run.log({metric_name: float(value)}, step=int(idx))
+    try:
+        for idx, value in enumerate(values, start=start_step):
+            if not isinstance(value, (int, float)):
+                continue
+            run.log({metric_name: float(value)}, step=int(idx))
+    except Exception as exc:
+        _warn(f"log_series failed ({type(exc).__name__}: {exc}); continuing.")
 
 
 def log_artifact(
@@ -149,10 +189,16 @@ def log_artifact(
             artifact.add_file(str(path), name=path.name)
         added_any = True
     if added_any:
-        run.log_artifact(artifact)
+        try:
+            run.log_artifact(artifact)
+        except Exception as exc:
+            _warn(f"log_artifact failed ({type(exc).__name__}: {exc}); continuing.")
 
 
 def finish_run(run: Any, *, exit_code: int = 0) -> None:
     if run is None:
         return
-    run.finish(exit_code=exit_code)
+    try:
+        run.finish(exit_code=exit_code)
+    except Exception as exc:
+        _warn(f"finish_run failed ({type(exc).__name__}: {exc}); continuing.")

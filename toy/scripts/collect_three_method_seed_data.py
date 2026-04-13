@@ -194,6 +194,9 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "off", "bfloat16", "float16", "bf16", "fp16", "half"],
     )
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", type=str, default="GM-CDRO")
+    parser.add_argument("--wandb-entity", type=str, default="lechibachh")
     parser.add_argument("--use-ema-eval", action="store_true")
     parser.add_argument("--ema-mode", type=str, default="official", choices=["official", "fixed"])
     parser.add_argument("--ema-decay", type=float, default=0.999)
@@ -1624,6 +1627,16 @@ def _build_run_toy_cmd(
     ]
     if compute_fid:
         cmd.append("--compute-fid")
+    if bool(getattr(args, "wandb", False)):
+        cmd.extend(
+            [
+                "--wandb",
+                "--wandb-project",
+                str(args.wandb_project),
+                "--wandb-entity",
+                str(args.wandb_entity),
+            ]
+        )
     _append_rf_cli_args(cmd, args)
     append_ema_cli_args(cmd, args)
     if fixed_warmup_steps is not None and int(fixed_warmup_steps) > 0:

@@ -1465,7 +1465,7 @@ def run_experiment(cfg) -> dict:
     ensure_dir(exp_dir)
     wandb_run = init_wandb_run(
         enabled=bool(getattr(cfg, "wandb_enabled", False)),
-        project=str(getattr(cfg, "wandb_project", "wild-diffusion")),
+        project=str(getattr(cfg, "wandb_project", "GM-CDRO")),
         entity=str(getattr(cfg, "wandb_entity", "")).strip() or None,
         name=str(getattr(cfg, "wandb_name", "")).strip() or str(cfg.exp_name),
         group=str(getattr(cfg, "wandb_group", "")).strip() or str(cfg.method_version),
