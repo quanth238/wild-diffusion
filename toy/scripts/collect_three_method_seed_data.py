@@ -161,8 +161,10 @@ FID_EVAL_TEMPLATES = {
     },
 }
 TRANSITION_SENTINEL_ROBUST_COUNT = 3
-DEFAULT_WALL_CLOCK_MODE = "current_sec_per_kimg"
+DEFAULT_WALL_CLOCK_MODE = "observed"
 DEFAULT_WALL_CLOCK_SEC_PER_KIMG = 0.629646
+_OBSERVED_SOURCE_CSV_CACHE: Dict[str, Dict[Tuple[int, int], Dict[str, str]]] = {}
+_OBSERVED_METRICS_RUNTIME_CACHE: Dict[str, Dict] = {}
 
 
 def _grid_template_names() -> List[str]:
@@ -393,6 +395,13 @@ def _optional_float(value) -> Optional[float]:
     return float(parsed)
 
 
+def _optional_int(value) -> Optional[int]:
+    parsed = _optional_float(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
 def _optional_bool(value, *, default: bool = False) -> bool:
     if value is None:
         return bool(default)
@@ -404,6 +413,174 @@ def _optional_bool(value, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "n", "off", ""}:
         return False
     return bool(default)
+
+
+def _source_csv_rows_by_seed_step(path: str) -> Dict[Tuple[int, int], Dict[str, str]]:
+    indexed = _OBSERVED_SOURCE_CSV_CACHE.get(path)
+    if indexed is not None:
+        return indexed
+    indexed = {}
+    for row in load_csv_rows(path):
+        seed = _optional_int(row.get("seed"))
+        step = _optional_int(row.get("step"))
+        if seed is None or step is None:
+            continue
+        indexed[(int(seed), int(step))] = row
+    _OBSERVED_SOURCE_CSV_CACHE[path] = indexed
+    return indexed
+
+
+def _recover_observed_wall_clock_from_source_csv(
+    *,
+    source_csv: str,
+    seed: Optional[int],
+    step: Optional[int],
+) -> Optional[Dict]:
+    if seed is None or step is None:
+        return None
+    if not source_csv or not os.path.isfile(source_csv):
+        return None
+    source_row = _source_csv_rows_by_seed_step(source_csv).get((int(seed), int(step)))
+    if not isinstance(source_row, dict):
+        return None
+    train_wall_clock_sec = _optional_float(source_row.get("train_wall_clock_sec", source_row.get("train_elapsed_sec")))
+    if train_wall_clock_sec is None:
+        return None
+    return {
+        "train_wall_clock_sec": float(train_wall_clock_sec),
+        "train_elapsed_sec": float(train_wall_clock_sec),
+        "train_gpu_hours": _optional_float(source_row.get("train_gpu_hours")),
+        "train_wall_clock_complete": _optional_bool(
+            source_row.get("train_wall_clock_complete"),
+            default=(train_wall_clock_sec is not None),
+        ),
+        "train_wall_clock_source": str(source_row.get("train_wall_clock_source") or "observed_source_csv"),
+    }
+
+
+def _recover_observed_wall_clock_from_metrics_path(metrics_path: str) -> Optional[Dict]:
+    cached = _OBSERVED_METRICS_RUNTIME_CACHE.get(metrics_path)
+    if cached is not None:
+        return cached
+    if not metrics_path or not os.path.isfile(metrics_path):
+        return None
+    try:
+        payload = load_json(metrics_path)
+    except Exception:
+        return None
+    metrics = payload.get("metrics", {})
+    flow = metrics.get("flow_debug", {})
+    runtime = flow.get("runtime", {})
+    compute_accounting = flow.get("compute_accounting", {})
+    train_wall_clock_sec = _optional_float(
+        compute_accounting.get("train_wall_clock_sec", runtime.get("train_wall_clock_sec", runtime.get("effective_train_total")))
+    )
+    if train_wall_clock_sec is None:
+        return None
+    recovered = {
+        "train_wall_clock_sec": float(train_wall_clock_sec),
+        "train_elapsed_sec": float(train_wall_clock_sec),
+        "train_gpu_hours": _optional_float(compute_accounting.get("train_gpu_hours", runtime.get("train_gpu_hours"))),
+        "train_wall_clock_complete": _optional_bool(
+            compute_accounting.get("train_wall_clock_complete", runtime.get("train_wall_clock_complete")),
+            default=(train_wall_clock_sec is not None),
+        ),
+        "train_wall_clock_source": "observed_metrics_runtime",
+        "baseline_train_wall_clock_sec_effective": _optional_float(runtime.get("baseline_train_wall_clock_sec_effective")),
+        "robust_train_wall_clock_sec_effective": _optional_float(runtime.get("robust_phase")),
+        "baseline_train_wall_clock_source": str(
+            runtime.get("baseline_train_wall_clock_sec_effective_source")
+            or runtime.get("baseline_reference_train_wall_clock_source")
+            or "observed_metrics_runtime"
+        ),
+    }
+    _OBSERVED_METRICS_RUNTIME_CACHE[metrics_path] = recovered
+    return recovered
+
+
+def _is_synthetic_wall_clock_source(value) -> bool:
+    source = str(value or "").strip()
+    return source.startswith("current_sec_per_kimg:")
+
+
+def _clear_unrecovered_observed_wall_clock(row: Dict) -> Dict:
+    out = dict(row)
+    if _is_synthetic_wall_clock_source(out.get("train_wall_clock_source")):
+        out["train_wall_clock_sec"] = None
+        out["train_elapsed_sec"] = None
+        out["train_gpu_hours"] = None
+        out["train_wall_clock_complete"] = False
+        out["train_wall_clock_source"] = "observed_runtime_missing"
+        out["baseline_train_wall_clock_sec_effective"] = None
+        out["robust_train_wall_clock_sec_effective"] = None
+        if not str(out.get("baseline_train_wall_clock_source", "")).strip() or _is_synthetic_wall_clock_source(
+            out.get("baseline_train_wall_clock_source")
+        ):
+            out["baseline_train_wall_clock_source"] = "observed_runtime_missing"
+        if not str(out.get("robust_train_wall_clock_source", "")).strip() or _is_synthetic_wall_clock_source(
+            out.get("robust_train_wall_clock_source")
+        ):
+            out["robust_train_wall_clock_source"] = "observed_runtime_missing"
+        return out
+    if _is_synthetic_wall_clock_source(out.get("baseline_train_wall_clock_source")):
+        out["baseline_train_wall_clock_sec_effective"] = None
+        out["baseline_train_wall_clock_source"] = "observed_runtime_missing"
+    if _is_synthetic_wall_clock_source(out.get("robust_train_wall_clock_source")):
+        out["robust_train_wall_clock_sec_effective"] = None
+        out["robust_train_wall_clock_source"] = "observed_runtime_missing"
+    return out
+
+
+def _recover_observed_wall_clock_accounting(*, row: Dict, args: argparse.Namespace) -> Dict:
+    out = dict(row)
+    if str(args.wall_clock_mode) == "current_sec_per_kimg":
+        return out
+
+    recovered = None
+    for metrics_key in ("metrics_path", "reeval_metrics_path"):
+        metrics_path = str(out.get(metrics_key, "")).strip()
+        if not metrics_path:
+            continue
+        recovered = _recover_observed_wall_clock_from_metrics_path(metrics_path)
+        if recovered is not None:
+            break
+
+    if recovered is None:
+        source_csv = str(out.get("source_csv", "")).strip()
+        recovered = _recover_observed_wall_clock_from_source_csv(
+            source_csv=source_csv,
+            seed=_optional_int(out.get("seed")),
+            step=_optional_int(out.get("step")),
+        )
+
+    if recovered is None:
+        return _clear_unrecovered_observed_wall_clock(out)
+
+    train_wall_clock_sec = _optional_float(recovered.get("train_wall_clock_sec"))
+    if train_wall_clock_sec is not None:
+        out["train_wall_clock_sec"] = float(train_wall_clock_sec)
+        out["train_elapsed_sec"] = float(train_wall_clock_sec)
+    train_gpu_hours = _optional_float(recovered.get("train_gpu_hours"))
+    if train_gpu_hours is None and train_wall_clock_sec is not None:
+        train_gpu_hours = float(train_wall_clock_sec) * float(max(int(args.train_accelerator_count), 0)) / 3600.0
+    if train_gpu_hours is not None:
+        out["train_gpu_hours"] = float(train_gpu_hours)
+    out["train_wall_clock_complete"] = bool(
+        recovered.get("train_wall_clock_complete", train_wall_clock_sec is not None)
+    )
+    out["train_wall_clock_source"] = str(recovered.get("train_wall_clock_source") or "observed_artifact_runtime")
+
+    baseline_train_wall_clock_sec = _optional_float(recovered.get("baseline_train_wall_clock_sec_effective"))
+    if baseline_train_wall_clock_sec is not None:
+        out["baseline_train_wall_clock_sec_effective"] = float(baseline_train_wall_clock_sec)
+    robust_train_wall_clock_sec = _optional_float(recovered.get("robust_train_wall_clock_sec_effective"))
+    if robust_train_wall_clock_sec is not None:
+        out["robust_train_wall_clock_sec_effective"] = float(robust_train_wall_clock_sec)
+    if baseline_train_wall_clock_sec is not None:
+        out["baseline_train_wall_clock_source"] = str(
+            recovered.get("baseline_train_wall_clock_source") or "observed_artifact_runtime"
+        )
+    return out
 
 
 def _validate_wall_clock_args(args: argparse.Namespace) -> None:
@@ -437,7 +614,7 @@ def _batch_equiv_wall_clock_sec(
 
 
 def _apply_wall_clock_accounting(*, row: Dict, args: argparse.Namespace) -> Dict:
-    out = dict(row)
+    out = _recover_observed_wall_clock_accounting(row=row, args=args)
     source_label = _wall_clock_source_label(args)
     if str(args.wall_clock_mode) != "current_sec_per_kimg":
         if not str(out.get("train_wall_clock_source", "")).strip():

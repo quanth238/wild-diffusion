@@ -90,7 +90,7 @@ This is the locked active setup for Simpsons-MNIST RGB work in this repo.
 - Default WDRO/CDRO FID mode: `posthoc_from_checkpoints`
 - Primary metric: `weighted_compute_units`
 - Secondary metric: `train_wall_clock_sec`
-- Default wall-clock accounting: normalize batch-equivalent training compute to the current optimized baseline speed with `--wall-clock-mode current_sec_per_kimg`
+- Default wall-clock accounting: preserve observed training runtime with `--wall-clock-mode observed`
 - Current normalized wall-clock calibration: `0.629646 sec/kimg`
 - Shared weighted cap: `200000`
 - Dense checkpoints are still saved on the shared comparison grid, plus exact warmup-support checkpoints.
@@ -155,8 +155,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --hidden-dim 64 \
   --eval-samples 2000 \
   --fid-samples 2000 \
-  --wall-clock-mode current_sec_per_kimg \
-  --wall-clock-sec-per-kimg 0.629646 \
+  --wall-clock-mode observed \
   --debug-eval-batch 64 \
   --debug-terminal-step 20 \
   --log-every 200 \
