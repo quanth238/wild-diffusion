@@ -538,15 +538,6 @@ def rollout_controlled_ve(
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
     rf_objective = bool(cfg is not None and _is_rf_objective(cfg))
-    if cfg is not None:
-        _ = build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
-    else:
-        _ = build_time_deltas(
-            sigma_levels,
-            time_horizon,
-            sigma_min=float(sigma_levels[1].item()),
-            sigma_max=float(sigma_levels[-1].item()),
-        )
     rf_path_dt = (
         _build_rf_path_deltas(
             sigma_levels,
