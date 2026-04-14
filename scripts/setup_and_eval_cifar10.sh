@@ -46,6 +46,8 @@ GEN_BATCH="${GEN_BATCH:-128}"
 FID_BATCH="${FID_BATCH:-64}"
 GEN_STEPS="${GEN_STEPS:-18}"
 CLASS_IDX="${CLASS_IDX:-}" # optional
+FID_BACKEND="${FID_BACKEND:-edm}" # edm|pytorch_fid
+REUSE_GENERATED_SAMPLES="${REUSE_GENERATED_SAMPLES:-1}" # 1|0
 
 REF_MODE="${REF_MODE:-auto}" # auto|compute|url|path
 REF_URL="${REF_URL:-https://nvlabs-fi-cdn.nvidia.com/edm/fid-refs/cifar10-32x32.npz}"
@@ -124,8 +126,11 @@ else
   echo "[INFO] INSTALL_DEPS=0 (reusing packages from current environment)"
 fi
 
-python - <<'PY'
+python - <<PY
+import os
 modules = ["torch", "torchvision", "click", "numpy", "psutil", "scipy", "tqdm", "requests"]
+if os.environ.get("FID_BACKEND", "edm") == "pytorch_fid":
+    modules.append("pytorch_fid")
 missing = []
 for name in modules:
     try:
@@ -330,22 +335,39 @@ if [[ "${REF_MODE}" == "auto" ]]; then
     REF_INPUT="${REF_PATH}"
   elif [[ -f "${CIFAR_DIR}/dataset.json" ]]; then
     REF_MODE="compute"
-  else
+  elif [[ "${FID_BACKEND}" == "edm" ]]; then
     REF_MODE="url"
+  else
+    REF_MODE="compute"
   fi
 fi
 
 if [[ "${REF_MODE}" == "compute" ]]; then
   mkdir -p "$(dirname "${REF_PATH}")"
-  ref_cmd=(
-    torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py ref
-    "--data=${CIFAR_DIR}"
-    "--dest=${REF_PATH}"
-    "--batch=${FID_BATCH}"
-  )
-  echo "[INFO] Building local reference stats: ${REF_PATH}"
-  echo "[CMD] ${ref_cmd[*]}"
-  "${ref_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/ref.log"
+  if [[ "${FID_BACKEND}" == "pytorch_fid" && -f "${REF_PATH}" ]]; then
+    echo "[INFO] Reusing existing pytorch-fid reference stats: ${REF_PATH}"
+  elif [[ "${FID_BACKEND}" == "pytorch_fid" ]]; then
+    ref_cmd=(
+      python scripts/pytorch_fid_recursive.py save-stats
+      "--images=${CIFAR_DIR}"
+      "--dest=${REF_PATH}"
+      "--device=cuda"
+      "--batch-size=${FID_BATCH}"
+    )
+    echo "[INFO] Building local pytorch-fid reference stats: ${REF_PATH}"
+    echo "[CMD] ${ref_cmd[*]}"
+    "${ref_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/ref.log"
+  else
+    ref_cmd=(
+      torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py ref
+      "--data=${CIFAR_DIR}"
+      "--dest=${REF_PATH}"
+      "--batch=${FID_BATCH}"
+    )
+    echo "[INFO] Building local reference stats: ${REF_PATH}"
+    echo "[CMD] ${ref_cmd[*]}"
+    "${ref_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/ref.log"
+  fi
   REF_INPUT="${REF_PATH}"
 elif [[ "${REF_MODE}" == "path" ]]; then
   if [[ ! -f "${REF_PATH}" ]]; then
@@ -354,6 +376,10 @@ elif [[ "${REF_MODE}" == "path" ]]; then
   fi
   REF_INPUT="${REF_PATH}"
 elif [[ "${REF_MODE}" == "url" ]]; then
+  if [[ "${FID_BACKEND}" != "edm" ]]; then
+    echo "[ERROR] REF_MODE=url is only supported with FID_BACKEND=edm"
+    exit 1
+  fi
   REF_INPUT="${REF_URL}"
 else
   echo "[ERROR] REF_MODE must be one of: auto, compute, url, path"
@@ -386,18 +412,33 @@ if [[ -n "${EXTRA_GEN_ARGS}" ]]; then
   gen_cmd+=("${extra_gen[@]}")
 fi
 
-echo "[INFO] Generating images for evaluation..."
-echo "[CMD] ${gen_cmd[*]}"
-"${gen_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/generate.log"
+PNG_COUNT_EXISTING="$(find "${SAMPLES_DIR}" -type f -name '*.png' | wc -l | awk '{print $1}')"
+if [[ "${REUSE_GENERATED_SAMPLES}" == "1" && "${PNG_COUNT_EXISTING}" -ge "${NUM_IMAGES}" ]]; then
+  echo "[INFO] Reusing existing generated images in ${SAMPLES_DIR} (${PNG_COUNT_EXISTING} pngs)"
+else
+  echo "[INFO] Generating images for evaluation..."
+  echo "[CMD] ${gen_cmd[*]}"
+  "${gen_cmd[@]}" 2>&1 | tee "${EVAL_DIR}/generate.log"
+fi
 
-fid_cmd=(
-  torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py calc
-  "--images=${SAMPLES_DIR}"
-  "--ref=${REF_INPUT}"
-  "--num=${NUM_IMAGES}"
-  "--seed=${SEED_START}"
-  "--batch=${FID_BATCH}"
-)
+if [[ "${FID_BACKEND}" == "pytorch_fid" ]]; then
+  fid_cmd=(
+    python scripts/pytorch_fid_recursive.py calc
+    "--images=${SAMPLES_DIR}"
+    "--ref=${REF_INPUT}"
+    "--device=cuda"
+    "--batch-size=${FID_BATCH}"
+  )
+else
+  fid_cmd=(
+    torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" fid.py calc
+    "--images=${SAMPLES_DIR}"
+    "--ref=${REF_INPUT}"
+    "--num=${NUM_IMAGES}"
+    "--seed=${SEED_START}"
+    "--batch=${FID_BATCH}"
+  )
+fi
 if [[ -n "${EXTRA_FID_ARGS}" ]]; then
   # shellcheck disable=SC2206
   extra_fid=( ${EXTRA_FID_ARGS} )
@@ -417,6 +458,9 @@ value = None
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
         s = line.strip()
+        m = re.search(r"FID:\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)", s)
+        if m:
+            value = m.group(1)
         if re.fullmatch(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", s):
             value = s
 print("" if value is None else value)
@@ -428,6 +472,7 @@ FINISH_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
 export RUN_DIR NETWORK_PKL EVAL_DIR SAMPLES_DIR REF_INPUT FID_VALUE PNG_COUNT FINISH_TIME
 export NUM_IMAGES SEED_START SEED_END GEN_BATCH FID_BATCH GEN_STEPS NPROC_PER_NODE
+export FID_BACKEND
 python - <<'PY'
 import json
 import os
@@ -449,6 +494,7 @@ result = {
     "gen_steps": int(os.environ["GEN_STEPS"]),
     "nproc_per_node": int(os.environ["NPROC_PER_NODE"]),
     "fid": None if os.environ["FID_VALUE"] == "" else float(os.environ["FID_VALUE"]),
+    "fid_backend": os.environ["FID_BACKEND"],
 }
 
 json_path = os.path.join(os.environ["EVAL_DIR"], "evaluation_result.json")
