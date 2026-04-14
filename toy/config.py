@@ -87,7 +87,6 @@ class ToyConfig:
     rf_pseudo_huber_delta: float = 0.1
     rf_edm_init_ckpt_path: str = ""
     rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise
-    rf_cdro_quantile_rule: str = "right_endpoint"  # legacy deterministic RF-grid ablation only
 
     # Data.
     n_modes: int = 8

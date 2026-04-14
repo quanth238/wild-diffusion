@@ -72,11 +72,6 @@ def _validate_config(cfg: ToyConfig) -> None:
             "--rf-reflow-t-distribution must be one of ('u_shaped', 'uniform'), got "
             f"{cfg.rf_reflow_t_distribution}"
         )
-    if str(cfg.rf_cdro_quantile_rule).lower() not in ("right_endpoint", "midpoint"):
-        raise ValueError(
-            "--rf-cdro-quantile-rule must be one of ('right_endpoint', 'midpoint'), got "
-            f"{cfg.rf_cdro_quantile_rule}"
-        )
     if str(cfg.rf_loss).lower() not in ("pseudo_huber", "mse"):
         raise ValueError(f"--rf-loss must be one of ('pseudo_huber', 'mse'), got {cfg.rf_loss}")
     if float(cfg.rf_pseudo_huber_delta) <= 0:
@@ -366,12 +361,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=ToyConfig.rf_reflow_t_distribution,
         choices=["u_shaped", "uniform"],
-    )
-    parser.add_argument(
-        "--rf-cdro-quantile-rule",
-        type=str,
-        default=ToyConfig.rf_cdro_quantile_rule,
-        choices=["right_endpoint", "midpoint"],
     )
     parser.add_argument("--rf-loss", type=str, default=ToyConfig.rf_loss, choices=["pseudo_huber", "mse"])
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=ToyConfig.rf_pseudo_huber_delta)

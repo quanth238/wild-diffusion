@@ -32,16 +32,14 @@ def build_rf_time_quantile_levels(
     device: torch.device,
     *,
     distribution: str = "u_shaped",
-    quantile_rule: str = "right_endpoint",
 ) -> torch.Tensor:
-    """Build an RF solver/continuation ladder from normalized-time cell edges.
+    """Build a right-endpoint RF solver/continuation ladder.
 
     The returned tensor still uses the repo's sigma-shaped API, with
     `sigma = t * sigma_max`; unlike EDM ladders, these values are RF clock
     coordinates rather than noise scales. The positive levels `sigma_levels[1:]`
-    are quantiles of the chosen RF time law. The default `right_endpoint` rule
-    uses `F^{-1}(k / N)`, preserving the original endpoint-inclusive rollout.
-    The optional `midpoint` rule uses `F^{-1}((k - 0.5) / N)` for ablations.
+    are right-endpoint quantiles `F^{-1}(k / N)` of the chosen RF time law,
+    preserving endpoint-inclusive solver/reference rollouts.
     """
 
     if n_steps <= 0:
@@ -49,18 +47,7 @@ def build_rf_time_quantile_levels(
     sigma_max_value = float(sigma_max)
     if sigma_max_value <= 0.0:
         raise ValueError(f"sigma_max must be > 0 for RF time levels, got {sigma_max}")
-    rule = str(quantile_rule).strip().lower()
-    if rule == "right_endpoint":
-        probs = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=device)
-    elif rule == "midpoint":
-        probs_positive = (torch.arange(1, int(n_steps) + 1, device=device, dtype=torch.float32) - 0.5) / float(
-            n_steps
-        )
-        probs = torch.cat([torch.zeros(1, device=device, dtype=probs_positive.dtype), probs_positive])
-    else:
-        raise ValueError(
-            f"Unsupported RF quantile rule '{quantile_rule}'. Expected one of: right_endpoint, midpoint."
-        )
+    probs = torch.linspace(0.0, 1.0, int(n_steps) + 1, device=device)
     mode = str(distribution).strip().lower()
     if mode == "u_shaped":
         # Inverse CDF of Beta(1/2, 1/2): F^{-1}(u) = sin^2(pi u / 2).
@@ -150,7 +137,6 @@ def build_rf_stage_time_quantile_levels(
     *,
     stage_name: str,
     reflow_distribution: str = "u_shaped",
-    quantile_rule: str = "right_endpoint",
 ) -> torch.Tensor:
     """Build the RF time grid aligned to the clean timestep law of a named stage."""
 
@@ -163,7 +149,6 @@ def build_rf_stage_time_quantile_levels(
         n_steps,
         device,
         distribution=distribution,
-        quantile_rule=quantile_rule,
     )
 
 

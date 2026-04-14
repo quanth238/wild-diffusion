@@ -107,7 +107,7 @@ def _build_rf_cdro_stage_grid_info(
     time_horizon: float,
     stage_name: str,
 ) -> dict:
-    """Build the RF rollout grid and derived local-cap stats for one robust stage."""
+    """Build the deterministic RF solver/reference grid for one robust stage."""
 
     distribution = resolve_rf_stage_t_distribution(
         stage_name,
@@ -119,7 +119,6 @@ def _build_rf_cdro_stage_grid_info(
         device=device,
         stage_name=stage_name,
         reflow_distribution=distribution,
-        quantile_rule=str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
     ).to(device=device, dtype=dtype)
     transition_deltas = build_transition_deltas_for_objective(
         cfg=cfg,
@@ -563,7 +562,6 @@ def train_trajectory_robust_cdro(
         history["rf_stage1_t_distribution_resolved"] = str(rf_stage_grids["rf_stage1"]["distribution"])
         history["rf_reflow_t_distribution_resolved"] = str(rf_stage_grids["rf_reflow"]["distribution"])
         history["rf_eval_t_distribution_resolved"] = str(rf_stage_grids[rf_eval_stage]["distribution"])
-        history["rf_cdro_quantile_rule_resolved"] = ""
         history["rf_stage_transition_deltas"] = {
             stage_name: [float(v.item()) for v in stage_info["transition_deltas"].detach().cpu()]
             for stage_name, stage_info in rf_stage_grids.items()

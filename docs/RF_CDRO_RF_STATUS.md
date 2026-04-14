@@ -62,8 +62,8 @@ stage-matched RF time law:
 - conditional on the sampled nodes, the RF reference path remains the straight
   path `x_ref(t) = x_L + t d`
 
-The older deterministic RF quantile grid remains available only as a legacy
-reference/ablation path through `rf_cdro_quantile_rule`.
+Deterministic right-endpoint RF grids remain only as solver/reference grids for
+sampling, evaluation, and frozen-teacher reflow pair generation.
 
 ## What Is Still Deferred
 

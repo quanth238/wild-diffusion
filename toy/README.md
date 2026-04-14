@@ -34,7 +34,7 @@ Use these first when the task is about the current working setup:
 - `app/experiment.py`: orchestration, training, eval, metrics, and artifact writing.
 - `config.py`: full config dataclass, including CDRO/WDRO/WILD knobs.
 - `shared/trainer_common.py`: baseline training path, including the strong public RF baseline.
-- `shared/sigma.py`: family-aware EDM/RF grid helpers and RF quantile-grid construction.
+- `shared/sigma.py`: family-aware EDM/RF grid helpers, including RF solver and stratified training grids.
 - `versions/registry.py`: resolves `--method-version`.
 - `compute_accounting.py`: weighted-compute accounting and warmup calibration.
 - `shared/`: version-agnostic diffusion, objective, runtime, and trainer utilities.
