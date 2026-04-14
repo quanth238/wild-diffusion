@@ -197,7 +197,6 @@ def cdro_robust_step_weighted_compute_units(
     inner_steps: int,
     outer_attack_weight: float,
     outer_clean_weight: float,
-    antithetic_rollouts: bool,
     calibration: Dict[str, Any],
 ) -> Optional[float]:
     """Weighted compute for one CDRO robust optimizer step under the current objective."""
@@ -213,11 +212,10 @@ def cdro_robust_step_weighted_compute_units(
     attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(inner_steps) > 0)
     clean_enabled = bool(float(outer_clean_weight) > 0.0)
     active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
-    rollout_multiplier = 2.0 if bool(antithetic_rollouts) else 1.0
     return weighted_compute_units(
-        n_fwd=float(path_steps) * rollout_multiplier if attack_enabled else 0.0,
-        n_fwd_inputgrad=float(path_steps * max(int(inner_steps), 0)) * rollout_multiplier if attack_enabled else 0.0,
-        n_fwd_parambackward=float(path_steps * active_outer_branches) * rollout_multiplier,
+        n_fwd=float(path_steps) if attack_enabled else 0.0,
+        n_fwd_inputgrad=float(path_steps * max(int(inner_steps), 0)) if attack_enabled else 0.0,
+        n_fwd_parambackward=float(path_steps * active_outer_branches),
         calibration=calibration,
     )
 

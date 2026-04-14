@@ -11,6 +11,7 @@ One fresh exception now exists for the next image-scale step:
 The active Simpsons decision is:
 
 - Locked Simpsons method: `method_version=cdro`
+- Locked Simpsons regime: CDRO-EDM, Simpsons-MNIST RGB 5%, seed 0, official EMA, warmup 0.2, rho 32, CDRO path steps 32
 - Canonical workflow root: `toy/`
 - Canonical script folder: `toy/scripts/`
 
@@ -25,6 +26,11 @@ Start here:
 Active artifact roots:
 
 - `toy_data/simpsons_mnist_rgb/summary.json`
+- `toy_outputs/simpsons5_cdro_400k_warmup20_rho32_n032_cw0_20260414/`
+- `toy_outputs/simpsons5_cdro_400k_warmup20_rho64_n032_cw0_20260414/`
+
+Historical artifact roots:
+
 - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_default_n64_rho_stress_20260407/summary/`
 - `toy_outputs/simpsons_mnist_rgb_three_method_1pct_ablation_targeted_followup_ckptreuse_20260406/summary/`
 

@@ -4,6 +4,8 @@ This package is the canonical toy-side implementation in this repo.
 
 The current active workflow is Simpsons-MNIST RGB with `method_version=cdro`.
 
+Current default lane: CDRO-EDM on the Simpsons-MNIST RGB 5% split, seed 0, batch size 256, hidden dim 64, official EMA, warmup fraction 0.2, `inner_steps=1`, `outer_attack_weight=0.3`, `outer_clean_weight=0.0`, `cdro_n_steps_path=32`, stochastic stratified quantile ladder, `cdro_step_size=0.02`, and `cdro_total_budget_rho=32.0`. Keep rho explicit when testing the pending rho=64 branch.
+
 Recent capability note:
 
 - The toy stack now also supports RF-family experiments alongside EDM-family ones.
@@ -13,8 +15,8 @@ Recent capability note:
 
 Important caveat:
 
-- The generic `toy/run_toy.py` CLI still supports many historical methods.
-- The active Simpsons choice is enforced by the Simpsons-specific wrappers and collectors, not by treating every generic default as canonical.
+- The generic `toy/run_toy.py` CLI still supports historical comparison surfaces, but old v1/v1.1/v1.2 CDRO-style knobs have been removed from `ToyConfig` and the active CLI.
+- The active Simpsons choice is now also reflected in `toy/config.py`; the Simpsons-specific wrappers and collectors remain the source of truth for shared-grid orchestration details.
 
 ## Active Path
 
@@ -45,7 +47,8 @@ Use these first when the task is about the current working setup:
 - `cdro`: current active Simpsons method.
 - `wdro` and `wild`: retained comparison baselines for shared-grid evaluation.
 - `training_objective=rf`: rectified-flow family support under the same toy stack.
-- `clean`, `v1`, `v1.1`, `v1.2`, `v2`, `v2.1`: historical or ablation variants kept for reproducibility.
+- `clean`: retained baseline continuation path.
+- Older v1/v1.1/v1.2 config knobs have been removed from the active config and CLI; old v1.x scripts/docs are historical.
 
 Do not infer the active repo direction from the presence of those historical methods alone.
 

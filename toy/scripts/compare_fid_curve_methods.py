@@ -5,8 +5,6 @@ This script compares:
 - baseline-only
 - clean continuation
 - wild
-- v1.1
-- v1.2
 
 under a fixed baseline checkpoint initialization.
 
@@ -76,10 +74,6 @@ def _normalize_method(name: str) -> str:
         return "clean"
     if key in ("wild",):
         return "wild"
-    if key in ("11", "v11", "v1.1", "1.1"):
-        return "1.1"
-    if key in ("12", "v12", "v1.2", "1.2"):
-        return "1.2"
     raise ValueError(f"Unsupported method alias: {name}")
 
 
@@ -87,7 +81,7 @@ def _parse_methods(text: str) -> List[str]:
     methods = [_normalize_method(tok) for tok in text.split(",") if tok.strip()]
     if not methods:
         raise ValueError("Empty --methods.")
-    order = ["baseline", "clean", "wild", "1.1", "1.2"]
+    order = ["baseline", "clean", "wild"]
     seen = set()
     out: List[str] = []
     for m in methods:
@@ -186,8 +180,6 @@ def _method_label(method: str) -> str:
         "baseline": "Baseline-only",
         "clean": "Clean-cont.",
         "wild": "WILD",
-        "1.1": "v1.1",
-        "1.2": "v1.2",
     }[method]
 
 
@@ -231,52 +223,6 @@ def _method_cli_args(method: str, args: argparse.Namespace) -> List[str]:
         if args.wild_clamp_samples:
             extra.append("--wild-clamp-samples")
         return extra
-    if method == "1.1":
-        return [
-            "--method-version",
-            "1.1",
-            "--inner-steps",
-            str(args.v11_inner_steps),
-            "--v11-step-size",
-            str(args.v11_step_size),
-            "--v11-transport-gamma",
-            str(args.v11_transport_gamma),
-            "--v11-total-budget-rho",
-            str(args.v11_total_budget_rho),
-            "--v11-projection-mode",
-            str(args.v11_projection_mode),
-        ]
-    if method == "1.2":
-        return [
-            "--method-version",
-            "1.2",
-            "--inner-steps",
-            str(args.v12_adv_steps),
-            "--v12-step-size",
-            str(args.v12_step_size),
-            "--v12-lambda-init",
-            str(args.v12_lambda_init),
-            "--v12-lambda-lr",
-            str(args.v12_lambda_lr),
-            "--v12-rho-target",
-            str(args.v12_rho_target),
-            "--v12-robust-mix",
-            str(args.v12_robust_mix),
-            "--v12-start-step",
-            str(args.v12_start_step),
-            "--v12-ramp-steps",
-            str(args.v12_ramp_steps),
-            "--v12-max-delta",
-            str(args.v12_max_delta),
-            "--v12-sigma-floor",
-            str(args.v12_sigma_floor),
-            "--v12-sigma-cut",
-            str(args.v12_sigma_cut),
-            "--v12-gate-power",
-            str(args.v12_gate_power),
-            "--v12-delta-space",
-            str(args.v12_delta_space),
-        ]
     raise ValueError(f"Unsupported method: {method}")
 
 
@@ -348,10 +294,6 @@ def _load_row(metrics_path: Path, method: str, step: int, exp_name: str) -> RunR
     if method == "wild":
         transport_name = "wild_sample_transport_cost"
         transport_payload = objective.get("wild_sample_transport_cost", objective.get("wild_inner_transport_cost", {}))
-        transport_final = _safe_float(transport_payload.get("final") if isinstance(transport_payload, dict) else None)
-    elif method == "1.1":
-        transport_name = "v11_path_transport_cost"
-        transport_payload = objective.get("v11_path_transport_cost", objective.get("robust_energy", {}))
         transport_final = _safe_float(transport_payload.get("final") if isinstance(transport_payload, dict) else None)
     else:
         transport_name = ""
@@ -575,12 +517,12 @@ def _fairness_checks(rows: List[RunRow], steps: List[int]) -> Dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="FID-vs-iteration sweep for baseline/clean/wild/v1.1/v1.2.")
+    p = argparse.ArgumentParser(description="FID-vs-iteration sweep for baseline/clean/wild.")
     p.add_argument("--outdir", type=Path, default=Path("toy_outputs/fid_curve_methods"))
     p.add_argument("--prefix", type=str, default="mnist_20pct_fid_curve")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps-list", type=str, default="1000,2000,4000,8000,12000,16000,20000")
-    p.add_argument("--methods", type=str, default="baseline,wild,v1.1,v1.2")
+    p.add_argument("--methods", type=str, default="baseline,wild")
     p.add_argument("--skip-existing", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--require-cuda", action="store_true")
@@ -652,32 +594,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wild-sample-max", type=float, default=1.0)
     p.add_argument("--wild-delta-ratio-denom", type=float, default=1.0)
 
-    # v1.1 args.
-    p.add_argument("--v11-inner-steps", type=int, default=1)
-    p.add_argument("--v11-step-size", type=float, default=0.0005)
-    p.add_argument("--v11-transport-gamma", type=float, default=2.0)
-    p.add_argument("--v11-total-budget-rho", type=float, default=0.02)
-    p.add_argument(
-        "--v11-projection-mode",
-        type=str,
-        default="global_remaining",
-        choices=["global_remaining", "step_clip", "step_exact", "kappa_clip", "none"],
-    )
-
-    # v1.2 args.
-    p.add_argument("--v12-adv-steps", type=int, default=1)
-    p.add_argument("--v12-step-size", type=float, default=0.02)
-    p.add_argument("--v12-lambda-init", type=float, default=0.1)
-    p.add_argument("--v12-lambda-lr", type=float, default=0.001)
-    p.add_argument("--v12-rho-target", type=float, default=0.0001)
-    p.add_argument("--v12-robust-mix", type=float, default=0.3)
-    p.add_argument("--v12-start-step", type=int, default=0)
-    p.add_argument("--v12-ramp-steps", type=int, default=0)
-    p.add_argument("--v12-max-delta", type=float, default=0.05)
-    p.add_argument("--v12-sigma-floor", type=float, default=0.0)
-    p.add_argument("--v12-sigma-cut", type=float, default=0.5)
-    p.add_argument("--v12-gate-power", type=float, default=2.0)
-    p.add_argument("--v12-delta-space", type=str, default="image", choices=["image", "noise"])
     return p
 
 
@@ -755,7 +671,7 @@ def main() -> None:
             dry_run=args.dry_run,
         )
 
-    chain_resume_methods = {"clean", "wild", "1.1"}
+    chain_resume_methods = {"clean", "wild"}
     for method in methods:
         prior_resume_ckpt: Path | None = None
         method_resume_dir = (resume_ckpt_root / method.replace(".", "_")).resolve()

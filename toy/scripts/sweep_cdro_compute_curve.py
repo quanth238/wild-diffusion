@@ -334,7 +334,6 @@ def match_cdro_steps_to_reference_weighted_budget(
         inner_steps=int(args.inner_steps),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
-        antithetic_rollouts=bool(getattr(args, "cdro_antithetic_rollouts", False)),
         calibration=calibration,
     )
     if baseline_weighted_units is None or robust_step_weighted_units is None:
@@ -933,7 +932,6 @@ def build_run_plan(args: argparse.Namespace, calibration: Dict[str, Any]) -> Dic
                     inner_steps=int(args.inner_steps),
                     outer_attack_weight=float(args.outer_attack_weight),
                     outer_clean_weight=float(args.outer_clean_weight),
-                    antithetic_rollouts=bool(getattr(args, "cdro_antithetic_rollouts", False)),
                     calibration=calibration,
                 )
                 baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(

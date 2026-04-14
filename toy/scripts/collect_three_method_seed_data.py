@@ -188,7 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=str, required=True)
     parser.add_argument("--prefix", type=str, required=True)
     parser.add_argument("--python-bin", type=str, default=os.path.join(ROOT_DIR, ".venv", "bin", "python"))
-    parser.add_argument("--seeds", type=str, default="0,1,2")
+    parser.add_argument("--seeds", type=str, default="0")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
         "--amp-dtype",
@@ -199,7 +199,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="GM-CDRO")
     parser.add_argument("--wandb-entity", type=str, default="lechibachh")
-    parser.add_argument("--use-ema-eval", action="store_true")
+    parser.add_argument("--use-ema-eval", action="store_true", default=True)
+    parser.add_argument("--disable-ema-eval", action="store_false", dest="use_ema_eval")
     parser.add_argument("--ema-mode", type=str, default="official", choices=["official", "fixed"])
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--ema-halflife-kimg", type=float, default=500.0)
@@ -221,9 +222,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wall-clock-sec-per-kimg", type=float, default=DEFAULT_WALL_CLOCK_SEC_PER_KIMG)
     parser.add_argument("--image-size", type=int, default=28)
     parser.add_argument("--image-channels", type=int, default=3)
-    parser.add_argument("--image-train-size", type=int, default=80)
+    parser.add_argument("--image-train-size", type=int, default=400)
     parser.add_argument("--image-val-size", type=int, default=2000)
-    parser.add_argument("--train-percent-label", type=str, default="1%")
+    parser.add_argument("--train-percent-label", type=str, default="5%")
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
@@ -237,16 +238,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rf-cdro-pair-source", type=str, default="auto", choices=["auto", "reflow", "data_noise"])
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
-    parser.add_argument("--fid-gen-batch", type=int, default=2048)
+    parser.add_argument("--fid-gen-batch", type=int, default=64)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
     parser.add_argument("--debug-terminal-step", type=int, default=20)
     parser.add_argument("--log-every", type=int, default=200)
     parser.add_argument("--n-steps-path", type=int, default=64)
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
-    parser.add_argument("--shared-weighted-cap", type=float, default=200000.0)
-    parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="standard")
-    parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="all")
+    parser.add_argument("--shared-weighted-cap", type=float, default=400000.0)
+    parser.add_argument("--grid-template", type=str, choices=_grid_template_names(), default="denser")
+    parser.add_argument("--fid-eval-template", type=str, choices=_fid_eval_template_names(), default="balanced")
     parser.add_argument(
         "--transition-sentinel-robust-count",
         type=int,
@@ -256,13 +257,13 @@ def parse_args() -> argparse.Namespace:
         "--baseline-fid-mode",
         type=str,
         choices=["in_run", "posthoc_from_checkpoints"],
-        default="in_run",
+        default="posthoc_from_checkpoints",
     )
     parser.add_argument(
         "--robust-fid-mode",
         type=str,
         choices=["in_run", "posthoc_from_checkpoints"],
-        default="in_run",
+        default="posthoc_from_checkpoints",
     )
     parser.add_argument(
         "--reeval-script",
@@ -270,15 +271,15 @@ def parse_args() -> argparse.Namespace:
         default=os.path.join(ROOT_DIR, "toy", "scripts", "reevaluate_three_method_fids_from_checkpoints.py"),
     )
     parser.add_argument("--posthoc-fid-batch-size", type=int, default=512)
-    parser.add_argument("--baseline-max-steps", type=int, default=80000)
-    parser.add_argument("--wdro-max-total-steps", type=int, default=76970)
+    parser.add_argument("--baseline-max-steps", type=int, default=160000)
+    parser.add_argument("--wdro-max-total-steps", type=int, default=160000)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--reuse-baseline-runs-csv", type=str, default="")
     parser.add_argument("--reuse-baseline-aggregate-csv", type=str, default="")
     parser.add_argument("--reuse-wdro-raw-csv", type=str, default="")
     parser.add_argument("--reuse-cdro-warmup-runs-csv", type=str, default="")
     parser.add_argument("--reuse-cdro-warmup-aggregate-csv", type=str, default="")
-    parser.add_argument("--wdro-warmup-fraction", type=float, default=0.05)
+    parser.add_argument("--wdro-warmup-fraction", type=float, default=0.2)
     parser.add_argument("--wdro-refresh-epochs", type=float, default=100.0)
     parser.add_argument("--wdro-adv-prob", type=float, default=0.3)
     parser.add_argument("--wdro-attack-steps", type=int, default=2)
@@ -286,9 +287,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-gamma", type=float, default=1.0)
     parser.add_argument("--inner-steps", type=int, default=1)
     parser.add_argument("--outer-attack-weight", type=float, default=0.3)
-    parser.add_argument("--outer-clean-weight", type=float, default=1.0)
+    parser.add_argument("--outer-clean-weight", type=float, default=0.0)
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
-    parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
+    parser.add_argument("--cdro-total-budget-rho", type=float, default=32.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
     parser.add_argument(
         "--cdro-edm-ladder-mode",
@@ -296,9 +297,8 @@ def parse_args() -> argparse.Namespace:
         default="stochastic_stratified_quantile",
         choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
     )
-    parser.add_argument("--cdro-warmup-fraction", type=float, default=0.05)
-    parser.add_argument("--cdro-antithetic-rollouts", action="store_true")
-    parser.add_argument("--cdro-n-steps-path", type=int, default=0)
+    parser.add_argument("--cdro-warmup-fraction", type=float, default=0.2)
+    parser.add_argument("--cdro-n-steps-path", type=int, default=32)
     return parser.parse_args()
 
 
@@ -1089,7 +1089,6 @@ def _cdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
         inner_steps=int(args.inner_steps),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
-        antithetic_rollouts=bool(args.cdro_antithetic_rollouts),
         calibration=calibration,
     )
     if units is None:
@@ -1884,13 +1883,6 @@ def _build_run_toy_cmd(
                 str(args.cdro_edm_ladder_mode),
                 "--cdro-warmup-fraction",
                 str(args.cdro_warmup_fraction),
-                *(
-                    [
-                        "--cdro-antithetic-rollouts",
-                    ]
-                    if bool(args.cdro_antithetic_rollouts)
-                    else []
-                ),
                 "--disable-collapse-diagnostics",
             ]
         )
@@ -2741,7 +2733,6 @@ def main() -> None:
             "wdro_expected_robust_step_weighted_units": float(wdro_robust_step_weighted_units),
             "cdro_expected_robust_step_weighted_units": float(cdro_robust_step_weighted_units),
             "cdro_effective_n_steps_path": int(_effective_cdro_n_steps_path(args)),
-            "cdro_antithetic_rollouts": bool(args.cdro_antithetic_rollouts),
             "cdro_edm_ladder_mode": str(args.cdro_edm_ladder_mode),
             "calibration": calibration,
         },

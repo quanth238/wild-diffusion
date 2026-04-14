@@ -8,7 +8,7 @@ cd "${ROOT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 DEVICE="${DEVICE:-cuda}"
 SEEDS="${SEEDS:-0}"
-PERCENTS="${PERCENTS:-5 10 20 50 100}"
+PERCENTS="${PERCENTS:-5}"
 
 DATA_ROOT="${DATA_ROOT:-${ROOT_DIR}/toy_data/simpsons_mnist_rgb}"
 DATASET_PATH="${DATASET_PATH:-${DATA_ROOT}/imagefolder/train}"
@@ -16,8 +16,8 @@ DATASET_VAL_PATH="${DATASET_VAL_PATH:-${DATA_ROOT}/imagefolder/test}"
 FID_REF_PATH="${FID_REF_PATH:-${DATA_ROOT}/fid_refs/simpsons_mnist_rgb_test_28x28.npz}"
 CALIBRATION_PATH="${CALIBRATION_PATH:-${ROOT_DIR}/toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json}"
 
-OUTDIR="${OUTDIR:-${ROOT_DIR}/toy_outputs/simpsons_mnist_rgb_three_method_locked_default_percent_sweep_20260408}"
-PREFIX_ROOT="${PREFIX_ROOT:-simpsons_mnist_rgb_three_method_locked_default_percent_sweep_20260408}"
+OUTDIR="${OUTDIR:-${ROOT_DIR}/toy_outputs/simpsons5_cdro_400k_warmup20_rho32_n032_cw0_default}"
+PREFIX_ROOT="${PREFIX_ROOT:-simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw030_cw000_default}"
 
 IMAGE_SIZE="${IMAGE_SIZE:-28}"
 IMAGE_CHANNELS="${IMAGE_CHANNELS:-3}"
@@ -34,7 +34,7 @@ DEBUG_EVAL_BATCH="${DEBUG_EVAL_BATCH:-64}"
 DEBUG_TERMINAL_STEP="${DEBUG_TERMINAL_STEP:-20}"
 LOG_EVERY="${LOG_EVERY:-200}"
 N_STEPS_PATH="${N_STEPS_PATH:-64}"
-USE_EMA_EVAL="${USE_EMA_EVAL:-0}"
+USE_EMA_EVAL="${USE_EMA_EVAL:-1}"
 EMA_MODE="${EMA_MODE:-official}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
 EMA_HALFLIFE_KIMG="${EMA_HALFLIFE_KIMG:-500}"
@@ -45,18 +45,20 @@ GRID_TEMPLATE="${GRID_TEMPLATE:-denser}"
 FID_EVAL_TEMPLATE="${FID_EVAL_TEMPLATE:-balanced}"
 BASELINE_FID_MODE="${BASELINE_FID_MODE:-posthoc_from_checkpoints}"
 ROBUST_FID_MODE="${ROBUST_FID_MODE:-posthoc_from_checkpoints}"
-SHARED_WEIGHTED_CAP="${SHARED_WEIGHTED_CAP:-200000}"
+SHARED_WEIGHTED_CAP="${SHARED_WEIGHTED_CAP:-400000}"
+BASELINE_MAX_STEPS="${BASELINE_MAX_STEPS:-160000}"
+WDRO_MAX_TOTAL_STEPS="${WDRO_MAX_TOTAL_STEPS:-160000}"
 
 INNER_STEPS="${INNER_STEPS:-1}"
 OUTER_ATTACK_WEIGHT="${OUTER_ATTACK_WEIGHT:-0.3}"
-OUTER_CLEAN_WEIGHT="${OUTER_CLEAN_WEIGHT:-1.0}"
-WDRO_WARMUP_FRACTION="${WDRO_WARMUP_FRACTION:-0.05}"
+OUTER_CLEAN_WEIGHT="${OUTER_CLEAN_WEIGHT:-0.0}"
+WDRO_WARMUP_FRACTION="${WDRO_WARMUP_FRACTION:-0.2}"
 CDRO_STEP_SIZE="${CDRO_STEP_SIZE:-0.02}"
-CDRO_TOTAL_BUDGET_RHO="${CDRO_TOTAL_BUDGET_RHO:-4.0}"
+CDRO_TOTAL_BUDGET_RHO="${CDRO_TOTAL_BUDGET_RHO:-32.0}"
 CDRO_TIME_HORIZON="${CDRO_TIME_HORIZON:-1.0}"
-CDRO_WARMUP_FRACTION="${CDRO_WARMUP_FRACTION:-0.05}"
-CDRO_N_STEPS_PATH="${CDRO_N_STEPS_PATH:-64}"
-CDRO_ANTITHETIC_ROLLOUTS="${CDRO_ANTITHETIC_ROLLOUTS:-0}"
+CDRO_EDM_LADDER_MODE="${CDRO_EDM_LADDER_MODE:-stochastic_stratified_quantile}"
+CDRO_WARMUP_FRACTION="${CDRO_WARMUP_FRACTION:-0.2}"
+CDRO_N_STEPS_PATH="${CDRO_N_STEPS_PATH:-32}"
 
 mkdir -p "${OUTDIR}"
 
@@ -119,10 +121,6 @@ for pct in ${PERCENTS}; do
       fi
     fi
   fi
-  if [[ "${CDRO_ANTITHETIC_ROLLOUTS}" == "1" ]]; then
-    extra_args+=(--cdro-antithetic-rollouts)
-  fi
-
   echo "[locked-default-sweep] pct=${pct}% train_size=${train_size} outdir=${run_outdir}"
 
   "${PYTHON_BIN}" "${ROOT_DIR}/toy/scripts/collect_three_method_seed_data.py" \
@@ -155,6 +153,8 @@ for pct in ${PERCENTS}; do
     --baseline-fid-mode "${BASELINE_FID_MODE}" \
     --robust-fid-mode "${ROBUST_FID_MODE}" \
     --shared-weighted-cap "${SHARED_WEIGHTED_CAP}" \
+    --baseline-max-steps "${BASELINE_MAX_STEPS}" \
+    --wdro-max-total-steps "${WDRO_MAX_TOTAL_STEPS}" \
     --inner-steps "${INNER_STEPS}" \
     --outer-attack-weight "${OUTER_ATTACK_WEIGHT}" \
     --outer-clean-weight "${OUTER_CLEAN_WEIGHT}" \
@@ -162,6 +162,7 @@ for pct in ${PERCENTS}; do
     --cdro-step-size "${CDRO_STEP_SIZE}" \
     --cdro-total-budget-rho "${CDRO_TOTAL_BUDGET_RHO}" \
     --cdro-time-horizon "${CDRO_TIME_HORIZON}" \
+    --cdro-edm-ladder-mode "${CDRO_EDM_LADDER_MODE}" \
     --cdro-warmup-fraction "${CDRO_WARMUP_FRACTION}" \
     --cdro-n-steps-path "${CDRO_N_STEPS_PATH}" \
     "${extra_args[@]}"

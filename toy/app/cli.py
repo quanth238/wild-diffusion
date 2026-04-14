@@ -95,26 +95,6 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--control-radius-kappa must be >= 0, got {cfg.control_radius_kappa}")
     if cfg.v21_rho < 0 or cfg.v21_rho > 1:
         raise ValueError(f"--v21-rho must be in [0, 1], got {cfg.v21_rho}")
-    if cfg.v1_energy_budget_rho < 0:
-        raise ValueError(f"--v1-energy-budget-rho must be >= 0, got {cfg.v1_energy_budget_rho}")
-    if cfg.v1_lambda_init < 0:
-        raise ValueError(f"--v1-lambda-init must be >= 0, got {cfg.v1_lambda_init}")
-    if cfg.v1_lambda_lr < 0:
-        raise ValueError(f"--v1-lambda-lr must be >= 0, got {cfg.v1_lambda_lr}")
-    if cfg.v1_lambda_max <= 0:
-        raise ValueError(f"--v1-lambda-max must be > 0, got {cfg.v1_lambda_max}")
-    if cfg.v11_step_size <= 0:
-        raise ValueError(f"--v11-step-size must be > 0, got {cfg.v11_step_size}")
-    if cfg.v11_transport_gamma < 0:
-        raise ValueError(f"--v11-transport-gamma must be >= 0, got {cfg.v11_transport_gamma}")
-    if cfg.v11_total_budget_rho < 0:
-        raise ValueError(f"--v11-total-budget-rho must be >= 0, got {cfg.v11_total_budget_rho}")
-    if cfg.v11_projection_mode not in ("global_remaining", "step_clip", "step_exact", "kappa_clip", "none"):
-        raise ValueError(
-            "--v11-projection-mode must be one of "
-            "('global_remaining', 'step_clip', 'step_exact', 'kappa_clip', 'none'), got "
-            f"{cfg.v11_projection_mode}"
-        )
     if cfg.cdro_step_size <= 0:
         raise ValueError(f"--cdro-step-size must be > 0, got {cfg.cdro_step_size}")
     if cfg.cdro_total_budget_rho < 0:
@@ -132,37 +112,6 @@ def _validate_config(cfg: ToyConfig) -> None:
         )
     if not (0.0 <= cfg.cdro_warmup_fraction <= 1.0):
         raise ValueError(f"--cdro-warmup-fraction must be in [0, 1], got {cfg.cdro_warmup_fraction}")
-    if cfg.v12_step_size <= 0:
-        raise ValueError(f"--v12-step-size must be > 0, got {cfg.v12_step_size}")
-    if cfg.v12_lambda_init < 0:
-        raise ValueError(f"--v12-lambda-init must be >= 0, got {cfg.v12_lambda_init}")
-    if cfg.v12_lambda_lr < 0:
-        raise ValueError(f"--v12-lambda-lr must be >= 0, got {cfg.v12_lambda_lr}")
-    if cfg.v12_rho_target < 0:
-        raise ValueError(f"--v12-rho-target must be >= 0, got {cfg.v12_rho_target}")
-    if cfg.v12_robust_mix < 0 or cfg.v12_robust_mix > 1:
-        raise ValueError(f"--v12-robust-mix must be in [0, 1], got {cfg.v12_robust_mix}")
-    if cfg.v12_start_step < 0:
-        raise ValueError(f"--v12-start-step must be >= 0, got {cfg.v12_start_step}")
-    if cfg.v12_ramp_steps < 0:
-        raise ValueError(f"--v12-ramp-steps must be >= 0, got {cfg.v12_ramp_steps}")
-    if cfg.v12_max_delta <= 0:
-        raise ValueError(f"--v12-max-delta must be > 0, got {cfg.v12_max_delta}")
-    if cfg.v12_sigma_floor < 0:
-        raise ValueError(f"--v12-sigma-floor must be >= 0, got {cfg.v12_sigma_floor}")
-    if cfg.v12_sigma_cut <= 0:
-        raise ValueError(f"--v12-sigma-cut must be > 0, got {cfg.v12_sigma_cut}")
-    if cfg.v12_sigma_floor >= cfg.v12_sigma_cut and cfg.v12_sigma_floor > 0:
-        raise ValueError(
-            f"--v12-sigma-floor must be < --v12-sigma-cut when positive, got "
-            f"{cfg.v12_sigma_floor} >= {cfg.v12_sigma_cut}"
-        )
-    if cfg.v12_gate_power <= 0:
-        raise ValueError(f"--v12-gate-power must be > 0, got {cfg.v12_gate_power}")
-    if str(cfg.v12_delta_space).lower() not in ("image", "noise"):
-        raise ValueError(
-            f"--v12-delta-space must be one of ('image', 'noise'), got {cfg.v12_delta_space}"
-        )
     if cfg.outer_attack_weight < 0 or cfg.outer_clean_weight < 0:
         raise ValueError(
             "outer loss weights must be non-negative, got "
@@ -396,21 +345,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p-std", type=float, default=ToyConfig.p_std)
 
     parser.add_argument("--lambda-energy", type=float, default=ToyConfig.lambda_energy)
-    parser.add_argument("--v1-dual-lambda-enabled", action="store_true", default=ToyConfig.v1_dual_lambda_enabled)
-    parser.add_argument("--disable-v1-dual-lambda", action="store_true")
-    parser.add_argument("--v1-energy-budget-rho", type=float, default=ToyConfig.v1_energy_budget_rho)
-    parser.add_argument("--v1-lambda-init", type=float, default=ToyConfig.v1_lambda_init)
-    parser.add_argument("--v1-lambda-lr", type=float, default=ToyConfig.v1_lambda_lr)
-    parser.add_argument("--v1-lambda-max", type=float, default=ToyConfig.v1_lambda_max)
-    parser.add_argument("--v11-step-size", type=float, default=ToyConfig.v11_step_size)
-    parser.add_argument("--v11-transport-gamma", type=float, default=ToyConfig.v11_transport_gamma)
-    parser.add_argument("--v11-total-budget-rho", type=float, default=ToyConfig.v11_total_budget_rho)
-    parser.add_argument(
-        "--v11-projection-mode",
-        type=str,
-        default=ToyConfig.v11_projection_mode,
-        choices=["global_remaining", "step_clip", "step_exact", "kappa_clip", "none"],
-    )
     parser.add_argument("--cdro-step-size", type=float, default=ToyConfig.cdro_step_size)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=ToyConfig.cdro_total_budget_rho)
     parser.add_argument("--cdro-time-horizon", type=float, default=ToyConfig.cdro_time_horizon)
@@ -421,24 +355,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
     )
     parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
-    parser.add_argument(
-        "--cdro-antithetic-rollouts",
-        action="store_true",
-        default=ToyConfig.cdro_antithetic_rollouts,
-    )
-    parser.add_argument("--disable-cdro-antithetic-rollouts", action="store_true")
-    parser.add_argument("--v12-step-size", type=float, default=ToyConfig.v12_step_size)
-    parser.add_argument("--v12-lambda-init", type=float, default=ToyConfig.v12_lambda_init)
-    parser.add_argument("--v12-lambda-lr", type=float, default=ToyConfig.v12_lambda_lr)
-    parser.add_argument("--v12-rho-target", type=float, default=ToyConfig.v12_rho_target)
-    parser.add_argument("--v12-robust-mix", type=float, default=ToyConfig.v12_robust_mix)
-    parser.add_argument("--v12-start-step", type=int, default=ToyConfig.v12_start_step)
-    parser.add_argument("--v12-ramp-steps", type=int, default=ToyConfig.v12_ramp_steps)
-    parser.add_argument("--v12-max-delta", type=float, default=ToyConfig.v12_max_delta)
-    parser.add_argument("--v12-sigma-floor", type=float, default=ToyConfig.v12_sigma_floor)
-    parser.add_argument("--v12-sigma-cut", type=float, default=ToyConfig.v12_sigma_cut)
-    parser.add_argument("--v12-gate-power", type=float, default=ToyConfig.v12_gate_power)
-    parser.add_argument("--v12-delta-space", type=str, default=ToyConfig.v12_delta_space, choices=["image", "noise"])
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--v21-rho", type=float, default=ToyConfig.v21_rho)
     parser.add_argument("--use-time-dependent-kappa", action="store_true", default=ToyConfig.use_time_dependent_kappa)
@@ -532,13 +448,11 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     force_det_plot = bool(args_dict.pop("plot_deterministic_backward"))
     disable_ema_eval = bool(args_dict.pop("disable_ema_eval"))
     disable_ema_rampup = bool(args_dict.pop("disable_ema_rampup"))
-    disable_cdro_antithetic_rollouts = bool(args_dict.pop("disable_cdro_antithetic_rollouts"))
     disable_limited_data = bool(args_dict.pop("disable_limited_data"))
     disable_mnist_percent_split = bool(args_dict.pop("disable_mnist_percent_split"))
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
-    disable_v1_dual_lambda = bool(args_dict.pop("disable_v1_dual_lambda"))
     disable_wild_fixed_noise_inner = bool(args_dict.pop("disable_wild_fixed_noise_inner"))
     collapse_v_l2_tol_legacy = args_dict.pop("collapse_v_l2_tol")
     args_dict["wandb_enabled"] = bool(args_dict.pop("wandb"))
@@ -570,8 +484,6 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_ema_eval = False
     if disable_ema_rampup:
         cfg.ema_rampup_ratio = None
-    if disable_cdro_antithetic_rollouts:
-        cfg.cdro_antithetic_rollouts = False
     if disable_limited_data:
         cfg.limited_data_enabled = False
     if disable_mnist_percent_split:
@@ -582,8 +494,6 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_time_dependent_kappa = False
     if disable_kappa_preserve_l2_budget:
         cfg.kappa_preserve_l2_budget = False
-    if disable_v1_dual_lambda:
-        cfg.v1_dual_lambda_enabled = False
     if disable_wild_fixed_noise_inner:
         cfg.wild_fixed_noise_inner = False
     if collapse_v_l2_tol_legacy is not None:

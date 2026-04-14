@@ -669,11 +669,6 @@ def _method_rollout_kwargs(cfg, method) -> Dict:
     """Method-specific rollout kwargs to keep train/eval rollout behavior aligned."""
 
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
-    if method_name in ("v1.1", "1.1"):
-        return {
-            "total_budget": float(cfg.v11_total_budget_rho),
-            "projection_mode": str(cfg.v11_projection_mode).lower(),
-        }
     if method_name == "cdro":
         return {
             "total_budget": float(cfg.cdro_total_budget_rho),
@@ -694,7 +689,7 @@ def _rollout_for_eval(
     rollout_kwargs: Dict,
     attack_net,
 ):
-    """Method-aware eval rollout. v1.1/v1.2 may override with denoiser-dependent attack."""
+    """Method-aware eval rollout with optional method-specific override."""
 
     rollout_eval_fn = getattr(method, "rollout_eval", None)
     if callable(rollout_eval_fn):
@@ -895,12 +890,11 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
     attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(attack_num_steps) > 0
     clean_enabled = float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
-    rollout_multiplier = 2.0 if bool(getattr(cfg, "cdro_antithetic_rollouts", False)) else 1.0
     if not attack_enabled:
-        return float(path_steps if clean_enabled else 0.0) * rollout_multiplier
-    attack_construction_units = float(path_steps * max(int(attack_num_steps), 0)) * rollout_multiplier
-    attack_eval_units = float(path_steps * 2) * rollout_multiplier
-    clean_eval_units = float(path_steps if clean_enabled else 0) * rollout_multiplier
+        return float(path_steps if clean_enabled else 0.0)
+    attack_construction_units = float(path_steps * max(int(attack_num_steps), 0))
+    attack_eval_units = float(path_steps * 2)
+    clean_eval_units = float(path_steps if clean_enabled else 0)
     return attack_construction_units + attack_eval_units + clean_eval_units
 
 
@@ -977,7 +971,6 @@ def _resolve_phase_steps(
                         inner_steps=int(cdro_attack_num_steps),
                         outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
                         outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
-                        antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
                         calibration=weighted_calibration,
                     )
                     baseline_step_weighted_units = baseline_weighted_compute_units_for_steps(
@@ -2215,18 +2208,12 @@ def run_experiment(cfg) -> dict:
             "attack_num_steps": None if getattr(cfg, "attack_num_steps", None) is None else int(cfg.attack_num_steps),
             "cdro_attack_num_steps_resolved": int(cdro_attack_num_steps),
             "cdro_attack_num_steps_source": str(cdro_attack_num_steps_source),
-            "v1_dual_lambda_enabled": bool(cfg.v1_dual_lambda_enabled),
-            "v1_energy_budget_rho": float(cfg.v1_energy_budget_rho),
-            "v1_lambda_init": float(cfg.v1_lambda_init),
-            "v1_lambda_lr": float(cfg.v1_lambda_lr),
-            "v1_lambda_max": float(cfg.v1_lambda_max),
             "lambda_energy_fixed": float(cfg.lambda_energy),
             "cdro_step_size": float(getattr(cfg, "cdro_step_size", 0.0)),
             "cdro_total_budget_rho": float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
             "cdro_time_horizon": float(getattr(cfg, "cdro_time_horizon", 0.0)),
             "cdro_edm_ladder_mode": str(getattr(cfg, "cdro_edm_ladder_mode", "deterministic_midpoint_quantile")),
             "cdro_warmup_fraction": float(getattr(cfg, "cdro_warmup_fraction", 0.0)),
-            "cdro_antithetic_rollouts": bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
             "method_version": cfg.method_version,
             "method_description": getattr(method, "DESCRIPTION", ""),
             "phase_step_split_mode": str(phase_steps["split_mode"]),

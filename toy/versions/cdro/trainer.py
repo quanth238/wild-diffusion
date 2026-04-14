@@ -327,23 +327,6 @@ def _rollout_delta_diagnostics(roll, radius_by_step: torch.Tensor):
     return path_delta_mean, terminal_delta_mean, delta_norm_mean, delta_norm_max, delta_ratio_mean, delta_ratio_max
 
 
-def _build_rollout_noise_schedules(
-    *,
-    x0: torch.Tensor,
-    sigma_levels: torch.Tensor,
-    antithetic_rollouts: bool,
-) -> list[Optional[torch.Tensor]]:
-    """Return one shared-noise schedule, optionally paired with its antithetic copy."""
-
-    if not bool(antithetic_rollouts):
-        return [None]
-    n_steps = int(sigma_levels.numel() - 1)
-    if n_steps <= 0:
-        return [None]
-    base_schedule = torch.randn((n_steps,) + tuple(x0.shape), device=x0.device, dtype=x0.dtype)
-    return [base_schedule, -base_schedule]
-
-
 def _path_clean_only_loss_backward(
     *,
     cfg,
@@ -687,12 +670,8 @@ def train_trajectory_robust_cdro(
         phi_lr_scale = 1.0 if lambda_ctrl > 0.0 else 0.0
         control_updates_enabled = lambda_ctrl > 0.0
         attack_enabled = bool(control_updates_enabled and attack_num_steps > 0)
-        rollout_schedules = _build_rollout_noise_schedules(
-            x0=x0,
-            sigma_levels=current_sigma_levels,
-            antithetic_rollouts=bool(getattr(cfg, "cdro_antithetic_rollouts", False)),
-        )
-        rollout_multiplier = float(len(rollout_schedules))
+        rollout_schedules = [None]
+        rollout_multiplier = 1.0
         attack_construction_units = 0.0
         rollouts = []
 

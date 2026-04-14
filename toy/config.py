@@ -5,21 +5,21 @@ from typing import Optional
 @dataclass
 class ToyConfig:
     outdir: str = "toy_outputs"
-    exp_name: str = "v11_active"
+    exp_name: str = "simpsons_mnist_rgb_cdro"
     seed: int = 0
     device: str = "auto"  # auto|cpu|cuda
     allow_tf32: bool = True
     cudnn_benchmark: bool = True
     amp_dtype: str = "auto"  # auto|off|bfloat16|float16
-    method_version: str = "v1.1"  # one of supported versions in toy/versions/registry.py
-    dataset_kind: str = "toy_gmm"  # extension point: add image dataset backends later.
+    method_version: str = "cdro"  # one of supported versions in toy/versions/registry.py
+    dataset_kind: str = "image_folder"
     model_kind: str = "auto"  # auto|toy_mlp|...
     diagnostics_kind: str = "auto"  # auto|toy_gmm|...
-    dataset_path: str = ""
-    dataset_val_path: str = ""
-    image_size: int = 32
+    dataset_path: str = "toy_data/simpsons_mnist_rgb/imagefolder/train"
+    dataset_val_path: str = "toy_data/simpsons_mnist_rgb/imagefolder/test"
+    image_size: int = 28
     image_channels: int = 3
-    image_train_size: int = 2000
+    image_train_size: int = 400
     image_val_size: int = 2000
     image_split_seed: int = 0
     # MNIST limited-data controls (for fair low-data protocols):
@@ -34,19 +34,19 @@ class ToyConfig:
 
     # Training.
     steps: int = 3000
-    batch_size: int = 512
+    batch_size: int = 256
     log_every: int = 200
     eval_samples: int = 6000
     debug_eval_batch: int = 256
     debug_terminal_step: int = 20  # terminal step used for the 4-row forward/backward debug plot.
     plot_stochastic_backward: bool = False
     baseline_only: bool = False
-    use_ema_eval: bool = False
+    use_ema_eval: bool = True
     ema_mode: str = "official"  # official|fixed
     ema_decay: float = 0.999  # only used when ema_mode='fixed'
     ema_halflife_kimg: float = 500.0
     ema_rampup_ratio: Optional[float] = 0.05
-    fid_ref_path: str = ""
+    fid_ref_path: str = "toy_data/simpsons_mnist_rgb/fid_refs/simpsons_mnist_rgb_test_28x28.npz"
     fid_ref_policy: str = "auto"
     weighted_compute_calibration_path: str = ""
     weighted_inputgrad_alpha: float = 0.0
@@ -70,7 +70,7 @@ class ToyConfig:
     wandb_mode: str = "online"
 
     # Model.
-    hidden_dim: int = 128
+    hidden_dim: int = 64
     lr_theta: float = 1e-3
     lr_phi: float = 5e-4
     inner_steps: int = 1
@@ -97,7 +97,7 @@ class ToyConfig:
     val_size: int = 10000
 
     # Diffusion ladder.
-    n_steps_path: int = 64
+    n_steps_path: int = 32
     sigma_min: float = 0.002
     sigma_max: float = 2.0  # Keep terminal noise moderate for better x0-recovery diagnostics.
     sigma_data: float = -1.0  # <=0: auto-estimate from toy data scale.
@@ -109,47 +109,15 @@ class ToyConfig:
     # Constrained robust objective (v2): hard per-step control radius.
     # Deprecated in v2 (kept for backward CLI compatibility only).
     lambda_energy: float = 0.2
-    # v1 dual-lambda options (energy-only robust surrogate):
-    # min_{theta, lambda>=0} rho*lambda + sup_u [L_attack(theta,u) - lambda*C_energy(u)].
-    v1_dual_lambda_enabled: bool = True
-    v1_energy_budget_rho: float = 0.02
-    v1_lambda_init: float = 1.0
-    v1_lambda_lr: float = 5e-4
-    v1_lambda_max: float = 100.0
-    # v1.1 path-heuristic style options (gamma-penalized + explicit budget projection).
-    v11_step_size: float = 5e-4
-    v11_transport_gamma: float = 2.0
-    v11_total_budget_rho: float = 0.02
-    # projection mode for rollout controls:
-    # - global_remaining: shared global budget with remaining-cost projection.
-    # - step_clip: clip each step to rho/T.
-    # - step_exact: force each step to exact rho/T norm.
-    # - kappa_clip: fallback to v2-style local radius kappa_k * Delta_sigma_k.
-    # - none: no projection.
-    v11_projection_mode: str = "global_remaining"
     # CDRO Route-A options (beta-space greedy attack with sigma-time local caps).
     cdro_step_size: float = 0.02
-    cdro_total_budget_rho: float = 4.0
+    cdro_total_budget_rho: float = 32.0
     cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
     cdro_edm_ladder_mode: str = "stochastic_stratified_quantile"  # deterministic_midpoint_quantile|stochastic_stratified_quantile
     # Reference WDRO warmup step fraction. CDRO converts this into a target
     # weighted-compute warmup share, then solves for the baseline warmup steps
     # needed to match that share under CDRO's more expensive robust steps.
-    cdro_warmup_fraction: float = 0.05
-    cdro_antithetic_rollouts: bool = False
-    # v1.2 CDRO-EDM-inspired options (path-heuristic + adaptive dual lambda + sigma gating).
-    v12_step_size: float = 0.02
-    v12_lambda_init: float = 0.1
-    v12_lambda_lr: float = 1e-3
-    v12_rho_target: float = 1e-4
-    v12_robust_mix: float = 0.3
-    v12_start_step: int = 0
-    v12_ramp_steps: int = 0
-    v12_max_delta: float = 0.05
-    v12_sigma_floor: float = 0.0
-    v12_sigma_cut: float = 0.5
-    v12_gate_power: float = 2.0
-    v12_delta_space: str = "image"  # image|noise
+    cdro_warmup_fraction: float = 0.2
     control_radius_kappa: float = 0.15
     # v2.1 non-Markovian reference update parameter in [0,1].
     v21_rho: float = 0.8
@@ -159,7 +127,7 @@ class ToyConfig:
     kappa_high_multiplier: float = 1.0
     kappa_preserve_l2_budget: bool = True
     outer_attack_weight: float = 0.3
-    outer_clean_weight: float = 1.0
+    outer_clean_weight: float = 0.0
     warmup_clean_steps: int = 900
     warmup_ramp_steps: int = 600
     warmup_attack_weight_start: float = 0.0

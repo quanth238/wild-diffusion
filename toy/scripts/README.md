@@ -14,6 +14,8 @@ These are the scripts that match the current working decision in this repo:
 - `reevaluate_three_method_fids_from_checkpoints.py`: re-run FID from saved checkpoints when needed.
 - `materialize_toy_pngs.py`: assemble checked-in PNG summaries from collected outputs.
 
+Current CDRO-EDM default lane: Simpsons-MNIST RGB 5%, seed 0, batch size 256, hidden dim 64, official EMA, warmup fraction 0.2, `inner_steps=1`, `outer_attack_weight=0.3`, `outer_clean_weight=0.0`, `cdro_n_steps_path=32`, stochastic stratified quantile ladder, `cdro_step_size=0.02`, and `cdro_total_budget_rho=32.0`. Override rho explicitly for rho=64 follow-up runs.
+
 Current comparison naming convention:
 
 - `Baseline EDM`
