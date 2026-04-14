@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--compare-csv", type=str, default=DEFAULT_WDRO_COMPARE_CSV)
     parser.add_argument("--summary-json", type=str, default=DEFAULT_WDRO_SUMMARY_JSON)
     parser.add_argument("--calibration-json", type=str, default=DEFAULT_CALIBRATION_JSON)
-    parser.add_argument("--target-mode", type=str, choices=["wdro_best", "midpoint", "baseline_best"], default="baseline_best")
+    parser.add_argument("--target-mode", type=str, choices=["wdro_best", "wdro_final", "midpoint", "baseline_best"], default="baseline_best")
     parser.add_argument("--target-wcu", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--batch-gpu", type=int, default=512)

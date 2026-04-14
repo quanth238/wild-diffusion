@@ -78,10 +78,17 @@ def resolve_budget_target(compare_csv: str, target_mode: str) -> Dict[str, float
     rows = load_compare_rows(compare_csv)
     baseline_best = best_row_for_method(rows, "baseline")
     wdro_best = best_row_for_method(rows, "wild_diffusion")
+    wdro_rows = [row for row in rows if str(row.get("method", "")).strip() == "wild_diffusion"]
+    wdro_final = max(
+        [row for row in wdro_rows if _safe_float(row.get("weighted_compute_units")) is not None],
+        key=lambda row: float(row["step"]),
+    )
     baseline_best_wcu = float(baseline_best["weighted_compute_units"])
     wdro_best_wcu = float(wdro_best["weighted_compute_units"])
     if target_mode == "wdro_best":
         target_wcu = wdro_best_wcu
+    elif target_mode == "wdro_final":
+        target_wcu = float(wdro_final["weighted_compute_units"])
     elif target_mode == "midpoint":
         target_wcu = 0.5 * (baseline_best_wcu + wdro_best_wcu)
     elif target_mode == "baseline_best":
@@ -92,12 +99,16 @@ def resolve_budget_target(compare_csv: str, target_mode: str) -> Dict[str, float
         "target_wcu": float(target_wcu),
         "baseline_best_wcu": float(baseline_best_wcu),
         "wdro_best_wcu": float(wdro_best_wcu),
+        "wdro_final_wcu": float(wdro_final["weighted_compute_units"]),
         "baseline_best_fid": float(baseline_best["fid"]),
         "wdro_best_fid": float(wdro_best["fid"]),
+        "wdro_final_fid": float(wdro_final["fid"]),
         "baseline_best_step": float(baseline_best["step"]),
         "wdro_best_step": float(wdro_best["step"]),
+        "wdro_final_step": float(wdro_final["step"]),
         "baseline_best_wall_clock_sec": float(baseline_best["train_wall_clock_sec"]),
         "wdro_best_wall_clock_sec": float(wdro_best["train_wall_clock_sec"]),
+        "wdro_final_wall_clock_sec": float(wdro_final["train_wall_clock_sec"]),
     }
 
 
