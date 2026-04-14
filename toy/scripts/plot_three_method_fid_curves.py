@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outdir", type=str, required=True)
     parser.add_argument("--prefix", type=str, required=True)
     parser.add_argument("--train-percent-label", type=str, default="1%")
+    parser.add_argument("--dataset-label", type=str, default="Simpsons-MNIST RGB")
     return parser.parse_args()
 
 
@@ -332,6 +333,7 @@ def make_plot(
     plot_label: str,
     title_suffix: str,
     train_percent_label: str,
+    dataset_label: str,
 ) -> None:
     plt.figure(figsize=(8, 5))
     ax = plt.gca()
@@ -354,7 +356,7 @@ def make_plot(
     _draw_phase_boundaries(ax=ax, rows=rows, x_key=x_key, series_keys=series_keys)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.set_title(f"Simpsons-MNIST RGB {train_percent_label}: {plot_label} vs {title_suffix}")
+    ax.set_title(f"{dataset_label} {train_percent_label}: {plot_label} vs {title_suffix}")
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
@@ -370,6 +372,7 @@ def make_dual_plot(
     y_label: str,
     plot_label: str,
     train_percent_label: str,
+    dataset_label: str,
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     plot_specs = (
@@ -408,7 +411,7 @@ def make_dual_plot(
             ncol=max(1, min(len(handles), 3)),
             frameon=False,
         )
-    fig.suptitle(f"Simpsons-MNIST RGB {train_percent_label}: {plot_label} Comparison", y=0.995)
+    fig.suptitle(f"{dataset_label} {train_percent_label}: {plot_label} Comparison", y=0.995)
     fig.tight_layout(rect=[0, 0, 1, 0.86])
     fig.savefig(path, dpi=160)
     plt.close(fig)
@@ -461,6 +464,7 @@ def main() -> None:
         plot_label="FID",
         title_suffix="Train Wall-Clock",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_plot(
         path=plot_weighted,
@@ -472,6 +476,7 @@ def main() -> None:
         plot_label="FID",
         title_suffix="Weighted Compute",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_plot(
         path=plot_legacy,
@@ -483,6 +488,7 @@ def main() -> None:
         plot_label="FID",
         title_suffix="Legacy Batch-Equivalent Compute",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_dual_plot(
         path=plot_dual,
@@ -491,6 +497,7 @@ def main() -> None:
         y_label="FID",
         plot_label="FID",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_plot(
         path=plot_loss_wall_clock,
@@ -502,6 +509,7 @@ def main() -> None:
         plot_label="Loss (mean last)",
         title_suffix="Train Wall-Clock",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_plot(
         path=plot_loss_weighted,
@@ -513,6 +521,7 @@ def main() -> None:
         plot_label="Loss (mean last)",
         title_suffix="Weighted Compute",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     make_dual_plot(
         path=plot_loss_dual,
@@ -521,6 +530,7 @@ def main() -> None:
         y_label="Loss (mean last)",
         plot_label="Loss (mean last)",
         train_percent_label=str(args.train_percent_label),
+        dataset_label=str(args.dataset_label),
     )
     summary = {
         "rows": rows,
