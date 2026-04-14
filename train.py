@@ -38,6 +38,10 @@ def parse_int_list(s):
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
 @click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm',       type=click.Choice(['wdroedm', 'advedm']), default='wdroedm', show_default=True)
+@click.option('--adv-steps',     help='Adversarial inner steps for advedm', metavar='INT',          type=click.IntRange(min=1), default=2, show_default=True)
+@click.option('--adv-step-size', help='Adversarial inner step size for advedm', metavar='FLOAT',    type=click.FloatRange(min=0, min_open=True), default=0.1, show_default=True)
+@click.option('--adv-eps',       help='Optional adversarial clamp radius for advedm', metavar='FLOAT', type=click.FloatRange(min=0), default=None)
+@click.option('--adv-mix',       help='Adversarial branch mix weight for advedm', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.5, show_default=True)
 @click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
 @click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
 @click.option('--wdro-k',        help='WDRO inner ascent steps (K)', metavar='INT',                    type=click.IntRange(min=1), default=2, show_default=True)
@@ -140,6 +144,12 @@ def main(**kwargs):
     if opts.precond == 'advedm':
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
         c.loss_kwargs.class_name = 'training.loss.EDMLossAdv'
+        c.loss_kwargs.update(
+            adv_steps=opts.adv_steps,
+            adv_step_size=opts.adv_step_size,
+            adv_eps=opts.adv_eps,
+            adv_mix=opts.adv_mix,
+        )
     else:
         assert opts.precond == 'wdroedm'
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
@@ -242,6 +252,8 @@ def main(**kwargs):
     dist.print0(f'Class-conditional:       {c.dataset_kwargs.use_labels}')
     dist.print0(f'Network architecture:    {opts.arch}')
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
+    if opts.precond == 'advedm':
+        dist.print0(f'Adv steps/step/eps/mix:{c.loss_kwargs.adv_steps}/{c.loss_kwargs.adv_step_size}/{c.loss_kwargs.adv_eps}/{c.loss_kwargs.adv_mix}')
     dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
     dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
     dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
