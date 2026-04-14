@@ -86,6 +86,7 @@ def _is_stochastic_cdro_eval(cfg: ToyConfig, method_name: str) -> bool:
 
 
 def _build_eval_sigma_levels(cfg: ToyConfig, *, device: torch.device, method_name: str) -> torch.Tensor:
+    canonical_method = _canonical_method_name(method_name)
     if str(cfg.training_objective).strip().lower() == "rf":
         return build_rf_time_quantile_levels(
             float(cfg.sigma_max),
@@ -93,7 +94,7 @@ def _build_eval_sigma_levels(cfg: ToyConfig, *, device: torch.device, method_nam
             device=device,
             distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
-    if _canonical_method_name(method_name) == "cdro":
+    if canonical_method == "cdro":
         return build_sigma_levels_from_warmup_quantiles(
             float(cfg.sigma_min),
             float(cfg.sigma_max),

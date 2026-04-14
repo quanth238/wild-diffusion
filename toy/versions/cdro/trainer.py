@@ -12,6 +12,7 @@ from ...shared.trainer_common import generate_reflow_pairs
 from ...shared.sigma import (
     build_rf_stage_time_quantile_levels,
     resolve_rf_stage_t_distribution,
+    sample_rf_stage_time_stratified_levels,
     sample_log_sigma_stratified_quantile_ladder,
     sample_target_indices,
     sample_target_indices_log_normal,
@@ -119,6 +120,48 @@ def _build_rf_cdro_stage_grid_info(
         stage_name=stage_name,
         reflow_distribution=distribution,
         quantile_rule=str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
+    ).to(device=device, dtype=dtype)
+    transition_deltas = build_transition_deltas_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        time_horizon=time_horizon,
+    ).to(device=device, dtype=dtype)
+    radius_by_step = build_constraint_radii_for_objective(
+        cfg=cfg,
+        sigma_levels=sigma_levels,
+        total_budget=float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
+        time_horizon=time_horizon,
+    ).to(device=device, dtype=dtype)
+    return {
+        "stage_name": str(stage_name),
+        "distribution": str(distribution),
+        "sigma_levels": sigma_levels,
+        "transition_deltas": transition_deltas,
+        "radius_by_step": radius_by_step,
+    }
+
+
+def _sample_rf_cdro_stage_grid_info(
+    cfg,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    time_horizon: float,
+    stage_name: str,
+) -> dict:
+    """Sample one stratified RF rollout grid aligned to the clean stage law."""
+
+    distribution = resolve_rf_stage_t_distribution(
+        stage_name,
+        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+    )
+    sigma_levels = sample_rf_stage_time_stratified_levels(
+        float(getattr(cfg, "sigma_max", 1.0)),
+        int(getattr(cfg, "n_steps_path", 1)),
+        device=device,
+        stage_name=stage_name,
+        reflow_distribution=distribution,
+        dtype=dtype,
     ).to(device=device, dtype=dtype)
     transition_deltas = build_transition_deltas_for_objective(
         cfg=cfg,
@@ -470,6 +513,7 @@ def train_trajectory_robust_cdro(
     history["attack_num_steps_source"] = str(attack_num_steps_source)
     history["control_u_radius"] = float((total_budget / time_horizon) ** 0.5 if time_horizon > 0.0 else 0.0)
     history["cdro_edm_ladder_mode_resolved"] = str(cdro_edm_ladder_mode)
+    history["rf_cdro_rollout_grid_mode_resolved"] = "stochastic_stratified" if _is_rf_objective(cfg) else ""
     rf_pair_teacher = None
     rf_stage1_steps = 0
     rf_reflow_steps = 0
@@ -510,7 +554,8 @@ def train_trajectory_robust_cdro(
         rf_eval_stage = "rf_reflow" if int(rf_reflow_steps) > 0 else "rf_stage1"
         transition_deltas = rf_stage_grids[rf_eval_stage]["transition_deltas"]
         radius_by_step = rf_stage_grids[rf_eval_stage]["radius_by_step"]
-        history["transition_deltas"] = [float(v.item()) for v in transition_deltas.detach().cpu()]
+        history["transition_deltas"] = []
+        history["transition_deltas_reference"] = _snapshot_tensor_values(transition_deltas)
         history["rf_stage1_steps"] = int(rf_stage1_steps)
         history["rf_reflow_steps"] = int(rf_reflow_steps)
         history.setdefault("rf_stage", [])
@@ -518,7 +563,7 @@ def train_trajectory_robust_cdro(
         history["rf_stage1_t_distribution_resolved"] = str(rf_stage_grids["rf_stage1"]["distribution"])
         history["rf_reflow_t_distribution_resolved"] = str(rf_stage_grids["rf_reflow"]["distribution"])
         history["rf_eval_t_distribution_resolved"] = str(rf_stage_grids[rf_eval_stage]["distribution"])
-        history["rf_cdro_quantile_rule_resolved"] = str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint"))
+        history["rf_cdro_quantile_rule_resolved"] = ""
         history["rf_stage_transition_deltas"] = {
             stage_name: [float(v.item()) for v in stage_info["transition_deltas"].detach().cpu()]
             for stage_name, stage_info in rf_stage_grids.items()
@@ -585,12 +630,23 @@ def train_trajectory_robust_cdro(
                     sample_terminal_batch_fn=None,
                 )
                 current_rf_stage = "rf_reflow"
-            stage_grid = rf_stage_grids[current_rf_stage]
+            stage_grid = _sample_rf_cdro_stage_grid_info(
+                cfg,
+                device=sigma_levels.device,
+                dtype=sigma_levels.dtype,
+                time_horizon=time_horizon,
+                stage_name=current_rf_stage,
+            )
             current_sigma_levels = stage_grid["sigma_levels"]
             current_transition_deltas = stage_grid["transition_deltas"]
             current_radius_by_step = stage_grid["radius_by_step"]
             history["rf_stage"].append(current_rf_stage)
             history["rf_t_distribution"].append(str(stage_grid["distribution"]))
+            if "stochastic_ladder_first_sigma_levels" not in history:
+                history["stochastic_ladder_first_sigma_levels"] = _snapshot_tensor_values(current_sigma_levels)
+                history["stochastic_ladder_first_transition_deltas"] = _snapshot_tensor_values(current_transition_deltas)
+            history["stochastic_ladder_last_sigma_levels"] = _snapshot_tensor_values(current_sigma_levels)
+            history["stochastic_ladder_last_transition_deltas"] = _snapshot_tensor_values(current_transition_deltas)
         elif use_stochastic_edm_ladders:
             current_sigma_levels = _sample_cdro_edm_step_ladder(cfg, sigma_levels)
             current_transition_deltas = build_transition_deltas_for_objective(

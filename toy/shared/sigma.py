@@ -74,6 +74,52 @@ def build_rf_time_quantile_levels(
     return t_levels * sigma_max_value
 
 
+def sample_rf_time_stratified_levels(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    distribution: str = "u_shaped",
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Sample one stratified RF time ladder from the stage time law.
+
+    The positive levels are sampled from open quantile cells
+    `((k-1)/N, k/N)`, so the resulting grid matches the baseline RF
+    random-time law in stratified Monte Carlo form rather than the
+    endpoint-inclusive deterministic quantile grid.
+    """
+
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    sigma_max_value = float(sigma_max)
+    if sigma_max_value <= 0.0:
+        raise ValueError(f"sigma_max must be > 0 for RF time levels, got {sigma_max}")
+    out_dtype = torch.float32 if dtype is None else dtype
+    jitter = torch.empty(int(n_steps), dtype=torch.float64, device=device).uniform_(1e-12, 1.0 - 1e-12)
+    strata = torch.arange(0, int(n_steps), dtype=torch.float64, device=device)
+    probs = (strata + jitter) / float(n_steps)
+    mode = str(distribution).strip().lower()
+    if mode == "u_shaped":
+        t_positive = torch.sin(0.5 * math.pi * probs).square()
+    elif mode == "uniform":
+        t_positive = probs
+    else:
+        raise ValueError(
+            f"Unsupported RF time distribution '{distribution}'. Expected one of: u_shaped, uniform."
+        )
+    if t_positive.numel() > 1 and not torch.all(t_positive[1:] > t_positive[:-1]):
+        raise ValueError("Stratified RF time ladder must be strictly increasing.")
+    sigma_levels = torch.cat([torch.zeros(1, dtype=torch.float64, device=device), t_positive * sigma_max_value]).to(
+        device=device,
+        dtype=out_dtype,
+    )
+    positive_out = sigma_levels[1:]
+    if positive_out.numel() > 1 and not torch.all(positive_out[1:] > positive_out[:-1]):
+        raise ValueError("Stratified RF time ladder must remain strictly increasing after dtype conversion.")
+    return sigma_levels
+
+
 def resolve_rf_stage_t_distribution(
     stage_name: str,
     *,
@@ -118,6 +164,30 @@ def build_rf_stage_time_quantile_levels(
         device,
         distribution=distribution,
         quantile_rule=quantile_rule,
+    )
+
+
+def sample_rf_stage_time_stratified_levels(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    stage_name: str,
+    reflow_distribution: str = "u_shaped",
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Sample a stratified RF time ladder aligned to the clean stage law."""
+
+    distribution = resolve_rf_stage_t_distribution(
+        stage_name,
+        reflow_distribution=reflow_distribution,
+    )
+    return sample_rf_time_stratified_levels(
+        sigma_max,
+        n_steps,
+        device,
+        distribution=distribution,
+        dtype=dtype,
     )
 
 

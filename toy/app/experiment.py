@@ -2255,6 +2255,11 @@ def run_experiment(cfg) -> dict:
             "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
             "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
             "rf_cdro_quantile_rule": str(getattr(cfg, "rf_cdro_quantile_rule", "right_endpoint")),
+            "rf_cdro_rollout_grid_mode": (
+                "stochastic_stratified"
+                if _is_cdro_rf_port(cfg, method_name)
+                else "deterministic_quantile"
+            ),
             "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
             "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
             "rf_edm_init": rf_edm_init_report,
@@ -2425,6 +2430,9 @@ def run_experiment(cfg) -> dict:
             ),
             "robust_rf_eval_t_distribution_resolved": str(
                 history_robust.get("rf_eval_t_distribution_resolved", "")
+            ),
+            "robust_rf_cdro_rollout_grid_mode_resolved": str(
+                history_robust.get("rf_cdro_rollout_grid_mode_resolved", "")
             ),
             "robust_rf_cdro_quantile_rule_resolved": str(
                 history_robust.get("rf_cdro_quantile_rule_resolved", "")

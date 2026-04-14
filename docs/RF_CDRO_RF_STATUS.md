@@ -54,10 +54,16 @@ CDRO-RF rollout grids are stage-matched to the clean RF timestep law:
 - robust RF stage-1 matches clean RF stage-1
 - robust RF reflow matches clean RF reflow
 
-The rollout grid is built from RF quantiles, with:
+The robust rollout now uses a stratified Monte Carlo discretization of the
+stage-matched RF time law:
 
-- default: `rf_cdro_quantile_rule=right_endpoint`
-- optional ablation: `rf_cdro_quantile_rule=midpoint`
+- stage-1 rollout nodes are stratified samples from uniform `t`
+- reflow rollout nodes are stratified samples from the configured reflow law
+- conditional on the sampled nodes, the RF reference path remains the straight
+  path `x_ref(t) = x_L + t d`
+
+The older deterministic RF quantile grid remains available only as a legacy
+reference/ablation path through `rf_cdro_quantile_rule`.
 
 ## What Is Still Deferred
 
