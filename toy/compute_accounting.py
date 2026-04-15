@@ -100,6 +100,83 @@ def weighted_compute_units(
     )
 
 
+def weighted_compute_units_from_count_record(
+    *,
+    count_record: Dict[str, Any],
+    calibration: Dict[str, Any],
+    override_n_fwd: Optional[float] = None,
+) -> Optional[float]:
+    """Compute weighted units from a recorded count dict.
+
+    The record is expected to carry `n_fwd`, `n_fwd_inputgrad`, and
+    `n_fwd_parambackward` totals like the payloads under
+    `metrics.flow_debug.compute_accounting.weighted_counts.*`.
+    """
+
+    if not isinstance(count_record, dict):
+        return None
+    n_fwd = _safe_float(count_record.get("n_fwd"))
+    n_fwd_inputgrad = _safe_float(count_record.get("n_fwd_inputgrad"))
+    n_fwd_parambackward = _safe_float(count_record.get("n_fwd_parambackward"))
+    if n_fwd is None or n_fwd_inputgrad is None or n_fwd_parambackward is None:
+        return None
+    return weighted_compute_units(
+        n_fwd=float(override_n_fwd) if override_n_fwd is not None else float(n_fwd),
+        n_fwd_inputgrad=float(n_fwd_inputgrad),
+        n_fwd_parambackward=float(n_fwd_parambackward),
+        calibration=calibration,
+    )
+
+
+def cdro_adjusted_weighted_compute_from_compute_accounting(
+    *,
+    compute_accounting: Dict[str, Any],
+    calibration: Dict[str, Any],
+) -> Optional[Dict[str, float]]:
+    """Recompute CDRO weighted units excluding the logging-only forward reevaluation.
+
+    The toy CDRO trainer records one extra attacked-path forward sweep used for
+    `inner_obj` logging / NaN guarding. For comparison plots and budget matching,
+    we exclude that monitoring-only pass from CDRO weighted compute while keeping
+    the attack-construction input-grad and outer param-backward counts intact.
+    """
+
+    if not isinstance(compute_accounting, dict):
+        return None
+    effective_calibration = compute_accounting.get("weighted_compute_calibration")
+    if not isinstance(effective_calibration, dict) or not effective_calibration.get("available", False):
+        effective_calibration = calibration
+    if not isinstance(effective_calibration, dict) or not effective_calibration.get("available", False):
+        return None
+    weighted_counts = compute_accounting.get("weighted_counts")
+    if not isinstance(weighted_counts, dict):
+        return None
+    baseline_counts = weighted_counts.get("baseline")
+    robust_counts = weighted_counts.get("robust")
+    if not isinstance(baseline_counts, dict) or not isinstance(robust_counts, dict):
+        return None
+    baseline_weighted = weighted_compute_units_from_count_record(
+        count_record=baseline_counts,
+        calibration=effective_calibration,
+    )
+    robust_weighted = weighted_compute_units_from_count_record(
+        count_record=robust_counts,
+        calibration=effective_calibration,
+        override_n_fwd=0.0,
+    )
+    robust_logging_only_forward_count = _safe_float(robust_counts.get("n_fwd"))
+    if baseline_weighted is None or robust_weighted is None:
+        return None
+    return {
+        "baseline_weighted_compute_units": float(baseline_weighted),
+        "robust_weighted_compute_units": float(robust_weighted),
+        "weighted_compute_units": float(baseline_weighted + robust_weighted),
+        "robust_logging_only_forward_count_excluded": (
+            0.0 if robust_logging_only_forward_count is None else float(robust_logging_only_forward_count)
+        ),
+    }
+
+
 def estimate_wall_clock_sec_from_batch_equiv(
     *,
     batch_equiv_denoiser_evals: float,
@@ -199,7 +276,11 @@ def cdro_robust_step_weighted_compute_units(
     outer_clean_weight: float,
     calibration: Dict[str, Any],
 ) -> Optional[float]:
-    """Weighted compute for one CDRO robust optimizer step under the current objective."""
+    """Weighted compute for one CDRO robust optimizer step.
+
+    This excludes the toy trainer's extra attacked-path `inner_obj` reevaluation
+    pass because that sweep is monitoring-only and does not change the update.
+    """
 
     path_steps = max(int(n_steps_path), 0)
     if path_steps <= 0:
@@ -213,7 +294,7 @@ def cdro_robust_step_weighted_compute_units(
     clean_enabled = bool(float(outer_clean_weight) > 0.0)
     active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
     return weighted_compute_units(
-        n_fwd=float(path_steps) if attack_enabled else 0.0,
+        n_fwd=0.0,
         n_fwd_inputgrad=float(path_steps * max(int(inner_steps), 0)) if attack_enabled else 0.0,
         n_fwd_parambackward=float(path_steps * active_outer_branches),
         calibration=calibration,

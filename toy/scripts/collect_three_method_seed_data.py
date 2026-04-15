@@ -16,6 +16,7 @@ if ROOT_DIR not in sys.path:
 
 from toy.compute_accounting import (  # noqa: E402
     baseline_weighted_compute_units_for_steps,
+    cdro_adjusted_weighted_compute_from_compute_accounting,
     cdro_robust_step_weighted_compute_units,
     estimate_wall_clock_sec_from_batch_equiv,
     load_weighted_compute_calibration,
@@ -1473,6 +1474,20 @@ def _extract_cdro_row(
     baseline_weighted_compute = compute_accounting.get("baseline_weighted_compute_units")
     robust_weighted_compute = compute_accounting.get("robust_weighted_compute_units")
     total_weighted_compute = compute_accounting.get("weighted_compute_units", runtime.get("weighted_compute_units"))
+    adjusted_cdro_weighted = cdro_adjusted_weighted_compute_from_compute_accounting(
+        compute_accounting=compute_accounting,
+        calibration=calibration,
+    )
+    weighted_compute_source = "metrics_payload"
+    robust_logging_only_forward_count_excluded = None
+    if adjusted_cdro_weighted is not None:
+        baseline_weighted_compute = adjusted_cdro_weighted["baseline_weighted_compute_units"]
+        robust_weighted_compute = adjusted_cdro_weighted["robust_weighted_compute_units"]
+        total_weighted_compute = adjusted_cdro_weighted["weighted_compute_units"]
+        robust_logging_only_forward_count_excluded = adjusted_cdro_weighted[
+            "robust_logging_only_forward_count_excluded"
+        ]
+        weighted_compute_source = "cdro_adjusted_excluding_logging_forward"
     train_wall_clock_sec = compute_accounting.get("train_wall_clock_sec", runtime.get("train_wall_clock_sec"))
     if train_wall_clock_sec is None:
         train_wall_clock_sec = runtime.get("effective_train_total")
@@ -1502,6 +1517,12 @@ def _extract_cdro_row(
             None if baseline_weighted_compute is None else float(baseline_weighted_compute)
         ),
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
+        "weighted_compute_source": str(weighted_compute_source),
+        "robust_logging_only_forward_count_excluded": (
+            None
+            if robust_logging_only_forward_count_excluded is None
+            else float(robust_logging_only_forward_count_excluded)
+        ),
         "images_shown_m": float(total_images_shown_m_effective),
         "loss_kind": "robust_outer_loss",
         "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),

@@ -17,6 +17,7 @@ if ROOT_DIR not in sys.path:
 
 from toy.compute_accounting import (
     baseline_weighted_compute_units_for_steps,
+    cdro_adjusted_weighted_compute_from_compute_accounting,
     cdro_robust_step_weighted_compute_units,
     load_weighted_compute_calibration,
     solve_warmup_steps_for_target_compute_fraction,
@@ -663,6 +664,20 @@ def extract_cdro_row(
     baseline_weighted_compute = compute_accounting.get("baseline_weighted_compute_units")
     robust_weighted_compute = compute_accounting.get("robust_weighted_compute_units")
     total_weighted_compute = compute_accounting.get("weighted_compute_units", runtime.get("weighted_compute_units"))
+    adjusted_cdro_weighted = cdro_adjusted_weighted_compute_from_compute_accounting(
+        compute_accounting=compute_accounting,
+        calibration=calibration,
+    )
+    weighted_compute_source = "metrics_payload"
+    robust_logging_only_forward_count_excluded = None
+    if adjusted_cdro_weighted is not None:
+        baseline_weighted_compute = adjusted_cdro_weighted["baseline_weighted_compute_units"]
+        robust_weighted_compute = adjusted_cdro_weighted["robust_weighted_compute_units"]
+        total_weighted_compute = adjusted_cdro_weighted["weighted_compute_units"]
+        robust_logging_only_forward_count_excluded = adjusted_cdro_weighted[
+            "robust_logging_only_forward_count_excluded"
+        ]
+        weighted_compute_source = "cdro_adjusted_excluding_logging_forward"
     if total_weighted_compute is None and calibration.get("available", False):
         path_steps = int(config.get("n_steps_path", 24))
         attack_weight = float(flow.get("outer_attack_weight", config.get("outer_attack_weight", 0.0)))
@@ -676,7 +691,7 @@ def extract_cdro_row(
             calibration=calibration,
         )
         robust_weighted_compute = weighted_compute_units(
-            n_fwd=float(path_steps * robust_phase_steps) if attack_enabled else 0.0,
+            n_fwd=0.0,
             n_fwd_inputgrad=float(path_steps * inner_steps * robust_phase_steps) if attack_enabled else 0.0,
             n_fwd_parambackward=float(path_steps * robust_phase_steps * int((attack_weight > 0.0) + (clean_weight > 0.0))),
             calibration=calibration,
@@ -718,6 +733,12 @@ def extract_cdro_row(
             None if baseline_weighted_compute is None else float(baseline_weighted_compute)
         ),
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
+        "weighted_compute_source": str(weighted_compute_source),
+        "robust_logging_only_forward_count_excluded": (
+            None
+            if robust_logging_only_forward_count_excluded is None
+            else float(robust_logging_only_forward_count_excluded)
+        ),
         "images_shown_m": float(total_images_shown_m),
         "fid": float(fid_value),
         "baseline_fid_same_run": (
