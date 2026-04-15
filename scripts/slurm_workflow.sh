@@ -40,7 +40,7 @@ PY
 # Create outputs dir if not exists
 mkdir -p toy_outputs
 
-export CUDA_VISIBLE_DEVICES=0
+# Let Slurm keep the correct GPU mapping for both full-GPU and MIG allocations.
 export FID_DETECTOR_PATH=/mnt/data/quanth/models/inception-2015-12-05.pkl
 export BASELINE_CKPT_DIR=toy_outputs/_baseline_cache_shared
 mkdir -p "${BASELINE_CKPT_DIR}"

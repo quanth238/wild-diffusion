@@ -4,9 +4,8 @@ import csv
 import json
 import math
 import sys
-from bisect import bisect_left
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -17,9 +16,9 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     DEFAULT_CALIBRATION_JSON,
     DEFAULT_PYTORCH_FID_REF,
     DEFAULT_WDRO_SUMMARY_JSON,
-    advedm_robust_step_compute_be,
-    advedm_robust_step_weighted_compute_units,
     calibration_from_path,
+    cdro_robust_step_compute_be,
+    cdro_robust_step_weighted_compute_units,
     load_warmup_summary,
 )
 
@@ -27,9 +26,9 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a posthoc FID manifest for a CIFAR-10 CDRO-style image run using "
-            "the same weighted-compute and wall-clock accounting scheme as the existing "
-            "Baseline-vs-WDRO sweep."
+            "Build a posthoc FID manifest for a real CIFAR-10 CDRO run using "
+            "the same weighted-compute and wall-clock accounting scheme as the "
+            "existing Baseline-vs-WDRO sweep."
         )
     )
     parser.add_argument("--cdro-run-dir", type=str, required=True)
@@ -40,62 +39,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-name", type=str, default="cifar10_cdro_budget_manifest_summary.json")
     parser.add_argument("--kimg", type=str, default="")
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--adv-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--train-percent-label", type=str, default="20%")
     parser.add_argument("--ref-path", type=str, default=DEFAULT_PYTORCH_FID_REF)
     return parser.parse_args()
 
 
-def _safe_mean_field(payload: Dict, key: str) -> float:
-    value = payload[key]
+def _safe_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return float(parsed)
+
+
+def _safe_mean_field(payload: Dict, key: str):
+    value = payload.get(key)
     if isinstance(value, dict):
         value = value.get("mean")
-    return float(value)
+    return _safe_float(value)
 
 
-def load_stats_trace(path: Path) -> List[Tuple[float, float]]:
-    trace: List[Tuple[float, float]] = []
+def load_stats_trace(path: Path) -> List[Dict[str, float]]:
+    trace: List[Dict[str, float]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             payload = json.loads(line)
+            kimg = _safe_mean_field(payload, "Progress/kimg")
+            total_sec = _safe_mean_field(payload, "Timing/total_sec")
+            if kimg is None or total_sec is None:
+                continue
             trace.append(
-                (
-                    _safe_mean_field(payload, "Progress/kimg"),
-                    _safe_mean_field(payload, "Timing/total_sec"),
-                )
+                {
+                    "kimg": float(kimg),
+                    "total_sec": float(total_sec),
+                    "loss_loss": _safe_mean_field(payload, "Loss/loss"),
+                    "cdro_outer_loss": _safe_mean_field(payload, "CDRO/outer_loss"),
+                    "cdro_outer_loss_attack": _safe_mean_field(payload, "CDRO/outer_loss_attack"),
+                    "cdro_outer_loss_clean": _safe_mean_field(payload, "CDRO/outer_loss_clean"),
+                    "cdro_delta_ratio_mean": _safe_mean_field(payload, "CDRO/delta_ratio_mean"),
+                }
             )
     if not trace:
         raise RuntimeError(f"No stats rows found in {path}")
-    trace.sort(key=lambda item: item[0])
+    trace.sort(key=lambda item: item["kimg"])
     return trace
-
-
-def interpolate_total_sec(trace: Sequence[Tuple[float, float]], target_kimg: float) -> float:
-    xs = [item[0] for item in trace]
-    ys = [item[1] for item in trace]
-    if target_kimg <= xs[0]:
-        if xs[0] == target_kimg:
-            return float(ys[0])
-        raise RuntimeError(
-            f"Target kimg {target_kimg} is before the first recorded stats point {xs[0]:.4f}."
-        )
-    if target_kimg >= xs[-1]:
-        if xs[-1] == target_kimg:
-            return float(ys[-1])
-        raise RuntimeError(
-            f"Target kimg {target_kimg} is after the last recorded stats point {xs[-1]:.4f}."
-        )
-    idx = bisect_left(xs, target_kimg)
-    if idx < len(xs) and xs[idx] == target_kimg:
-        return float(ys[idx])
-    x0, y0 = xs[idx - 1], ys[idx - 1]
-    x1, y1 = xs[idx], ys[idx]
-    frac = (float(target_kimg) - float(x0)) / max(float(x1) - float(x0), 1e-12)
-    return float(y0 + frac * (y1 - y0))
 
 
 def parse_kimg_list(text: str) -> List[int]:
@@ -117,7 +112,19 @@ def discover_snapshot_kimg(run_dir: Path) -> List[int]:
     return sorted(set(out))
 
 
-def _series_fields(*, method_version_used: str) -> Dict[str, str]:
+def match_trace_row_for_snapshot(trace: List[Dict[str, float]], snapshot_kimg: int) -> Dict[str, float]:
+    exact = [row for row in trace if int(math.floor(float(row["kimg"]))) == int(snapshot_kimg)]
+    if exact:
+        return exact[-1]
+    nearest = min(trace, key=lambda row: abs(float(row["kimg"]) - float(snapshot_kimg)))
+    if abs(float(nearest["kimg"]) - float(snapshot_kimg)) > 2.0:
+        raise RuntimeError(
+            f"Could not align snapshot kimg={snapshot_kimg} with stats trace; nearest row is {nearest['kimg']:.3f}."
+        )
+    return nearest
+
+
+def _series_fields() -> Dict[str, str]:
     return {
         "method": "cdro",
         "robust_method": "cdro",
@@ -127,17 +134,17 @@ def _series_fields(*, method_version_used: str) -> Dict[str, str]:
         "backbone_label": "EDM",
         "series_key": "cdro_edm",
         "series_label": "CDRO EDM",
-        "method_version_used": method_version_used,
+        "method_version_used": "cdroedm",
     }
 
 
-def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[str, object]]:
+def build_rows(args: argparse.Namespace):
     cdro_run_dir = Path(args.cdro_run_dir).resolve()
     budget_plan_path = cdro_run_dir / "cdro_budget_plan.json"
     if not budget_plan_path.is_file():
         raise FileNotFoundError(f"Missing launch metadata: {budget_plan_path}")
     budget_plan = json.loads(budget_plan_path.read_text(encoding="utf-8"))
-
+    cdro_config = dict(budget_plan.get("cdro_config", {}))
     calibration = calibration_from_path(args.calibration_json)
     warmup_summary = load_warmup_summary(args.summary_json)
     trace = load_stats_trace(cdro_run_dir / "stats.jsonl")
@@ -148,11 +155,20 @@ def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[
     if not snapshot_kimg:
         raise RuntimeError(f"No robust-phase snapshots found in {cdro_run_dir}")
 
-    robust_step_wcu = advedm_robust_step_weighted_compute_units(
+    robust_step_wcu = cdro_robust_step_weighted_compute_units(
         calibration=calibration,
-        adv_steps=args.adv_steps,
+        n_steps_path=int(cdro_config["cdro_n_steps_path"]),
+        attack_num_steps=int(cdro_config["attack_num_steps"]),
+        outer_attack_weight=float(cdro_config["outer_attack_weight"]),
+        outer_clean_weight=float(cdro_config["outer_clean_weight"]),
     )
-    robust_step_compute_be = advedm_robust_step_compute_be(adv_steps=args.adv_steps)
+    robust_step_compute_be = cdro_robust_step_compute_be(
+        n_steps_path=int(cdro_config["cdro_n_steps_path"]),
+        attack_num_steps=int(cdro_config["attack_num_steps"]),
+        outer_attack_weight=float(cdro_config["outer_attack_weight"]),
+        outer_clean_weight=float(cdro_config["outer_clean_weight"]),
+    )
+
     warmup_wcu = float(warmup_summary["warmup_weighted_compute_units"])
     warmup_sec = float(warmup_summary["warmup_train_wall_clock_sec"])
     warmup_compute_be = float(warmup_summary["warmup_compute_be"])
@@ -168,19 +184,23 @@ def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[
         snapshot = cdro_run_dir / f"network-snapshot-{int(kimg):06d}.pkl"
         if not snapshot.is_file():
             raise FileNotFoundError(f"Missing snapshot: {snapshot}")
-        robust_steps = max((float(kimg) - float(warmup_kimg)) * 1000.0 / float(args.batch_size), 0.0)
+        trace_row = match_trace_row_for_snapshot(trace, int(kimg))
+        actual_progress_kimg = float(trace_row["kimg"])
+        robust_steps = max(int(round((actual_progress_kimg - float(warmup_kimg)) * 1000.0 / float(args.batch_size))), 0)
         robust_wcu = float(robust_steps) * float(robust_step_wcu)
         robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
-        robust_sec = interpolate_total_sec(trace, float(kimg))
-        total_sec = warmup_sec + robust_sec
+        total_sec = float(warmup_sec + trace_row["total_sec"])
         eval_tag = f"cdro_kimg{int(kimg):06d}"
+        loss_final = trace_row["cdro_outer_loss"]
+        if loss_final is None:
+            loss_final = trace_row["loss_loss"]
         rows.append(
             {
-                **_series_fields(method_version_used="advedm"),
+                **_series_fields(),
                 "seed": int(args.seed),
                 "step": int(kimg),
                 "snapshot_kimg": int(kimg),
-                "images_shown_m": float(kimg) / 1000.0,
+                "images_shown_m": float(actual_progress_kimg) / 1000.0,
                 "row_origin": "trajectory_robust_phase",
                 "run_dir": str(cdro_run_dir),
                 "network_pkl": str(snapshot),
@@ -190,7 +210,7 @@ def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[
                 "train_gpu_hours": float(total_sec) / 3600.0,
                 "train_wall_clock_source": "normalized_baseline_warmup_plus_observed_cdro_stats_jsonl",
                 "baseline_train_wall_clock_sec_effective": float(warmup_sec),
-                "robust_train_wall_clock_sec_effective": float(robust_sec),
+                "robust_train_wall_clock_sec_effective": float(trace_row["total_sec"]),
                 "baseline_train_wall_clock_source": "normalized_baseline_stats_jsonl",
                 "weighted_compute_units": float(warmup_wcu + robust_wcu),
                 "baseline_weighted_compute_units": float(warmup_wcu),
@@ -198,7 +218,7 @@ def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[
                 "compute_budget_be": float(warmup_compute_be + robust_compute_be),
                 "baseline_compute_be": float(warmup_compute_be),
                 "robust_compute_be": float(robust_compute_be),
-                "weighted_compute_source": "cifar_calibration_advedm_cdro",
+                "weighted_compute_source": "cifar_calibration_cdro_path_primitive_counts",
                 "warmup_steps_fixed": float(warmup_compute_be),
                 "robust_steps_observed": float(robust_steps),
                 "train_wall_clock_complete": True,
@@ -214,19 +234,19 @@ def build_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[
                 "ref_path": str(Path(args.ref_path).resolve()),
                 "train_percent_label": str(args.train_percent_label),
                 "eval_dir": str(eval_root / eval_tag),
-                "loss_final": "",
-                "loss_mean_last": "",
+                "loss_final": "" if loss_final is None else float(loss_final),
+                "loss_mean_last": "" if trace_row["loss_loss"] is None else float(trace_row["loss_loss"]),
                 "fixed_warmup_steps": float(warmup_compute_be),
             }
         )
 
     summary = {
-        "manifest_version": "cifar_cdro_fid_manifest_v1",
+        "manifest_version": "cifar_cdro_fid_manifest_v2",
         "cdro_run_dir": str(cdro_run_dir),
         "calibration_json": str(Path(args.calibration_json).resolve()),
         "summary_json": str(Path(args.summary_json).resolve()),
         "warmup_summary": warmup_summary,
-        "adv_steps": int(args.adv_steps),
+        "cdro_config": cdro_config,
         "robust_step_weighted_compute_units": float(robust_step_wcu),
         "robust_step_compute_be": float(robust_step_compute_be),
         "snapshot_kimg": [int(value) for value in snapshot_kimg],

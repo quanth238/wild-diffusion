@@ -31,7 +31,11 @@ else
   exit 1
 fi
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  echo "[info] Using scheduler/device override CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+else
+  echo "[info] CUDA_VISIBLE_DEVICES is unset; relying on the runtime default device mapping."
+fi
 export FID_DETECTOR_PATH="${FID_DETECTOR_PATH:-/mnt/data/quanth/models/inception-2015-12-05.pkl}"
 
 python3 - <<'PY'

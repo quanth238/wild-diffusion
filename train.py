@@ -5,8 +5,7 @@ import click
 import torch
 import dnnlib
 from torch_utils import distributed as dist
-# from training import training_loop
-from training import training_wdro_loop
+from training import training_loop, training_wdro_loop
 from wandb_utils import finish_run, init_wandb_run, log_artifact
 
 import warnings
@@ -37,11 +36,21 @@ def parse_int_list(s):
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
-@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|advedm',       type=click.Choice(['wdroedm', 'advedm']), default='wdroedm', show_default=True)
+@click.option('--precond',       help='Preconditioning & loss function', metavar='wdroedm|cdroedm|advedm',       type=click.Choice(['wdroedm', 'cdroedm', 'advedm']), default='wdroedm', show_default=True)
 @click.option('--adv-steps',     help='Adversarial inner steps for advedm', metavar='INT',          type=click.IntRange(min=1), default=2, show_default=True)
 @click.option('--adv-step-size', help='Adversarial inner step size for advedm', metavar='FLOAT',    type=click.FloatRange(min=0, min_open=True), default=0.1, show_default=True)
 @click.option('--adv-eps',       help='Optional adversarial clamp radius for advedm', metavar='FLOAT', type=click.FloatRange(min=0), default=None)
 @click.option('--adv-mix',       help='Adversarial branch mix weight for advedm', metavar='FLOAT',  type=click.FloatRange(min=0, max=1), default=0.5, show_default=True)
+@click.option('--cdro-n-steps-path', help='CDRO path steps N', metavar='INT', type=click.IntRange(min=1), default=32, show_default=True)
+@click.option('--cdro-step-size', help='CDRO inner ascent step size', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.02, show_default=True)
+@click.option('--cdro-total-budget-rho', help='CDRO path budget rho', metavar='FLOAT', type=click.FloatRange(min=0), default=32.0, show_default=True)
+@click.option('--cdro-time-horizon', help='CDRO continuation horizon T', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=1.0, show_default=True)
+@click.option('--cdro-sigma-min', help='Minimum sigma for the CDRO path ladder', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
+@click.option('--cdro-sigma-max', help='Maximum sigma for the CDRO path ladder', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
+@click.option('--cdro-edm-ladder-mode', help='CDRO EDM ladder mode', metavar='MODE', type=click.Choice(['deterministic_midpoint_quantile', 'stochastic_stratified_quantile']), default='stochastic_stratified_quantile', show_default=True)
+@click.option('--attack-num-steps', help='CDRO inner attack steps', metavar='INT', type=click.IntRange(min=0, max=2), default=1, show_default=True)
+@click.option('--outer-attack-weight', help='CDRO attacked-path outer weight', metavar='FLOAT', type=click.FloatRange(min=0), default=0.3, show_default=True)
+@click.option('--outer-clean-weight', help='CDRO clean-path outer weight', metavar='FLOAT', type=click.FloatRange(min=0), default=0.0, show_default=True)
 @click.option('--wdro-warmup-ratio', help='WDRO warmup ratio (Sw/S)', metavar='FLOAT',                type=click.FloatRange(min=0, max=1), default=0.4, show_default=True)
 @click.option('--wdro-m-epochs', help='WDRO refresh interval in epochs (m)', metavar='INT',            type=click.IntRange(min=1), default=100, show_default=True)
 @click.option('--wdro-k',        help='WDRO inner ascent steps (K)', metavar='INT',                    type=click.IntRange(min=1), default=2, show_default=True)
@@ -150,6 +159,21 @@ def main(**kwargs):
             adv_eps=opts.adv_eps,
             adv_mix=opts.adv_mix,
         )
+    elif opts.precond == 'cdroedm':
+        c.network_kwargs.class_name = 'training.networks.EDMPrecond'
+        c.loss_kwargs.class_name = 'training.loss.EDMLossCDRO'
+        c.loss_kwargs.update(
+            cdro_n_steps_path=opts.cdro_n_steps_path,
+            cdro_step_size=opts.cdro_step_size,
+            cdro_total_budget_rho=opts.cdro_total_budget_rho,
+            cdro_time_horizon=opts.cdro_time_horizon,
+            cdro_sigma_min=opts.cdro_sigma_min,
+            cdro_sigma_max=opts.cdro_sigma_max,
+            cdro_edm_ladder_mode=opts.cdro_edm_ladder_mode,
+            attack_num_steps=opts.attack_num_steps,
+            outer_attack_weight=opts.outer_attack_weight,
+            outer_clean_weight=opts.outer_clean_weight,
+        )
     else:
         assert opts.precond == 'wdroedm'
         c.network_kwargs.class_name = 'training.networks.EDMPrecond'
@@ -254,6 +278,19 @@ def main(**kwargs):
     dist.print0(f'Preconditioning & loss:  {opts.precond}')
     if opts.precond == 'advedm':
         dist.print0(f'Adv steps/step/eps/mix:{c.loss_kwargs.adv_steps}/{c.loss_kwargs.adv_step_size}/{c.loss_kwargs.adv_eps}/{c.loss_kwargs.adv_mix}')
+    if opts.precond == 'cdroedm':
+        dist.print0(
+            'CDRO cfg:               '
+            f"N={c.loss_kwargs.cdro_n_steps_path} "
+            f"rho={c.loss_kwargs.cdro_total_budget_rho} "
+            f"step={c.loss_kwargs.cdro_step_size} "
+            f"T={c.loss_kwargs.cdro_time_horizon} "
+            f"sigma=[{c.loss_kwargs.cdro_sigma_min}, {c.loss_kwargs.cdro_sigma_max}] "
+            f"ladder={c.loss_kwargs.cdro_edm_ladder_mode} "
+            f"attack_steps={c.loss_kwargs.attack_num_steps} "
+            f"outer_attack={c.loss_kwargs.outer_attack_weight} "
+            f"outer_clean={c.loss_kwargs.outer_clean_weight}"
+        )
     dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
     dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
     dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
@@ -297,8 +334,10 @@ def main(**kwargs):
                 config=c,
             )
         c.wandb_run = wandb_run
-        # training_loop.training_loop(**c)
-        training_wdro_loop.training_loop(**c)
+        if opts.precond == 'wdroedm':
+            training_wdro_loop.training_loop(**c)
+        else:
+            training_loop.training_loop(**c)
         if dist.get_rank() == 0:
             log_artifact(
                 wandb_run,

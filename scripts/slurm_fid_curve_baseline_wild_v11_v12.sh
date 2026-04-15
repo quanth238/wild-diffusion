@@ -24,7 +24,7 @@ fi
 source /home/quanth/working_space/scripts/conda.sh
 cd /home/quanth/working_space/Wild-Diffusion
 
-export CUDA_VISIBLE_DEVICES=0
+# Let Slurm keep the correct GPU mapping for both full-GPU and MIG allocations.
 export FID_DETECTOR_PATH=/mnt/data/quanth/models/inception-2015-12-05.pkl
 
 python3 - <<'PY'
@@ -175,4 +175,3 @@ echo "[cmd] ${CMD[*]}"
 "${CMD[@]}"
 
 echo "[*] Job finished."
-

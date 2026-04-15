@@ -11,7 +11,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from toy.compute_accounting import load_weighted_compute_calibration, weighted_compute_units  # noqa: E402
+from toy.compute_accounting import (  # noqa: E402
+    cdro_robust_step_weighted_compute_units as toy_cdro_robust_step_weighted_compute_units,
+    load_weighted_compute_calibration,
+)
 
 
 DEFAULT_BASELINE_RUN_DIR = (
@@ -112,12 +115,19 @@ def resolve_budget_target(compare_csv: str, target_mode: str) -> Dict[str, float
     }
 
 
-def advedm_robust_step_weighted_compute_units(*, calibration: Dict, adv_steps: int) -> float:
-    adv_steps_value = max(int(adv_steps), 0)
-    value = weighted_compute_units(
-        n_fwd=0.0,
-        n_fwd_inputgrad=float(adv_steps_value),
-        n_fwd_parambackward=2.0,
+def cdro_robust_step_weighted_compute_units(
+    *,
+    calibration: Dict,
+    n_steps_path: int,
+    attack_num_steps: int,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+) -> float:
+    value = toy_cdro_robust_step_weighted_compute_units(
+        n_steps_path=int(n_steps_path),
+        inner_steps=int(attack_num_steps),
+        outer_attack_weight=float(outer_attack_weight),
+        outer_clean_weight=float(outer_clean_weight),
         calibration=calibration,
     )
     if value is None:
@@ -125,8 +135,18 @@ def advedm_robust_step_weighted_compute_units(*, calibration: Dict, adv_steps: i
     return float(value)
 
 
-def advedm_robust_step_compute_be(*, adv_steps: int) -> float:
-    return float(max(int(adv_steps), 0) + 2.0)
+def cdro_robust_step_compute_be(
+    *,
+    n_steps_path: int,
+    attack_num_steps: int,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+) -> float:
+    path_steps = max(int(n_steps_path), 0)
+    attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(attack_num_steps) > 0)
+    clean_enabled = bool(float(outer_clean_weight) > 0.0)
+    active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
+    return float(path_steps * ((max(int(attack_num_steps), 0) if attack_enabled else 0) + active_outer_branches))
 
 
 def build_budget_plan(
@@ -139,18 +159,58 @@ def build_budget_plan(
     robust_step_wcu: float,
     robust_step_compute_be: float,
 ) -> Dict[str, float]:
-    robust_steps = max((float(target_wcu) - float(warmup_wcu)) / float(robust_step_wcu), 0.0)
-    robust_kimg = float(robust_steps) * float(batch_size) / 1000.0
-    robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
-    total_compute_be = float(warmup_compute_be) + float(robust_compute_be)
-    total_kimg = float(warmup_kimg) + float(robust_kimg)
+    target_wcu_value = max(float(target_wcu), float(warmup_wcu))
+    required_robust_steps = max((target_wcu_value - float(warmup_wcu)) / float(robust_step_wcu), 0.0)
+    floor_steps = max(int(math.floor(required_robust_steps + 1e-12)), 0)
+    ceil_steps = max(int(math.ceil(required_robust_steps - 1e-12)), 0)
+    candidates = sorted(set([floor_steps, ceil_steps]))
+    robust_steps_int = min(
+        candidates,
+        key=lambda steps: (
+            abs(float(warmup_wcu) + float(steps) * float(robust_step_wcu) - float(target_wcu_value)),
+            steps,
+        ),
+    )
+    warmup_nimg = int(round(float(warmup_kimg) * 1000.0))
+    actual_total_nimg = warmup_nimg + int(robust_steps_int) * int(batch_size)
+    actual_total_kimg_float = float(actual_total_nimg) / 1000.0
+    if robust_steps_int <= 0:
+        total_kimg_int = int(round(float(warmup_kimg)))
+    else:
+        prev_nimg = warmup_nimg + int(robust_steps_int - 1) * int(batch_size)
+        lower_total_kimg_int = int(prev_nimg // 1000) + 1
+        upper_total_kimg_int = int(actual_total_nimg // 1000)
+        if lower_total_kimg_int > upper_total_kimg_int:
+            raise RuntimeError(
+                "Could not map the desired CDRO robust-step count to an exact train.py total_kimg stop. "
+                f"prev_nimg={prev_nimg} actual_total_nimg={actual_total_nimg}"
+            )
+        total_kimg_int = int(upper_total_kimg_int)
+    actual_robust_kimg = max(float(actual_total_nimg - warmup_nimg) / 1000.0, 0.0)
+    actual_robust_wcu = float(robust_steps_int) * float(robust_step_wcu)
+    actual_robust_compute_be = float(robust_steps_int) * float(robust_step_compute_be)
     return {
-        "robust_steps_float": float(robust_steps),
-        "robust_kimg_float": float(robust_kimg),
-        "total_kimg_float": float(total_kimg),
-        "robust_compute_be": float(robust_compute_be),
-        "total_compute_be": float(total_compute_be),
+        "required_robust_steps_float": float(required_robust_steps),
+        "robust_steps_int": int(robust_steps_int),
+        "warmup_nimg": int(warmup_nimg),
+        "actual_total_nimg": int(actual_total_nimg),
+        "actual_total_kimg_float": float(actual_total_kimg_float),
+        "total_kimg_int": int(total_kimg_int),
+        "actual_robust_kimg": float(actual_robust_kimg),
+        "actual_robust_wcu": float(actual_robust_wcu),
+        "actual_total_wcu": float(warmup_wcu + actual_robust_wcu),
+        "actual_robust_compute_be": float(actual_robust_compute_be),
+        "actual_total_compute_be": float(warmup_compute_be + actual_robust_compute_be),
     }
+
+
+def estimate_total_wall_clock_sec(
+    *,
+    warmup_wall_clock_sec: float,
+    robust_steps_int: int,
+    robust_step_wall_clock_sec: float,
+) -> float:
+    return float(warmup_wall_clock_sec) + float(int(robust_steps_int)) * float(robust_step_wall_clock_sec)
 
 
 def calibration_from_path(calibration_json: str) -> Dict:
