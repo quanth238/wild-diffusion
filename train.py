@@ -196,22 +196,23 @@ def main(**kwargs):
     c.update(batch_size=opts.batch, batch_gpu=opts.batch_gpu)
     c.update(loss_scaling=opts.ls, cudnn_benchmark=opts.bench)
     c.update(kimg_per_tick=opts.tick, snapshot_ticks=opts.snap, state_dump_ticks=opts.dump)
-    c.update(
-        wdro_warmup_ratio=opts.wdro_warmup_ratio,
-        wdro_m_epochs=opts.wdro_m_epochs,
-        wdro_k=opts.wdro_k,
-        wdro_step_size=opts.wdro_step_size,
-        wdro_gamma=opts.wdro_gamma,
-        wdro_p_adv=opts.wdro_p_adv,
-        debug_eval_enable=opts.debug_eval,
-        debug_eval_init=opts.debug_eval_init,
-        debug_eval_num_images=opts.debug_eval_num,
-        debug_eval_steps=opts.debug_eval_steps,
-        debug_eval_batch_size=opts.debug_eval_batch,
-        debug_eval_num_visual=opts.debug_eval_visual,
-        debug_eval_ref_path=(opts.debug_eval_ref if opts.debug_eval_ref else None),
-        debug_adv_num_visual=opts.debug_adv_visual,
-    )
+    if opts.precond == 'wdroedm':
+        c.update(
+            wdro_warmup_ratio=opts.wdro_warmup_ratio,
+            wdro_m_epochs=opts.wdro_m_epochs,
+            wdro_k=opts.wdro_k,
+            wdro_step_size=opts.wdro_step_size,
+            wdro_gamma=opts.wdro_gamma,
+            wdro_p_adv=opts.wdro_p_adv,
+            debug_eval_enable=opts.debug_eval,
+            debug_eval_init=opts.debug_eval_init,
+            debug_eval_num_images=opts.debug_eval_num,
+            debug_eval_steps=opts.debug_eval_steps,
+            debug_eval_batch_size=opts.debug_eval_batch,
+            debug_eval_num_visual=opts.debug_eval_visual,
+            debug_eval_ref_path=(opts.debug_eval_ref if opts.debug_eval_ref else None),
+            debug_adv_num_visual=opts.debug_adv_visual,
+        )
     c.wandb_kwargs = dnnlib.EasyDict(
         enabled=bool(opts.wandb),
         project=opts.wandb_project,
@@ -291,14 +292,15 @@ def main(**kwargs):
             f"outer_attack={c.loss_kwargs.outer_attack_weight} "
             f"outer_clean={c.loss_kwargs.outer_clean_weight}"
         )
-    dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
-    dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
-    dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
-    dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
-    if c.debug_eval_enable:
-        dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
-        dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
-        dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
+    if opts.precond == 'wdroedm':
+        dist.print0(f'WDRO warmup ratio:       {c.wdro_warmup_ratio}')
+        dist.print0(f'WDRO interval m (epoch): {c.wdro_m_epochs}')
+        dist.print0(f'WDRO K/step/gamma/padv:  {c.wdro_k}/{c.wdro_step_size}/{c.wdro_gamma}/{c.wdro_p_adv}')
+        dist.print0(f'Debug eval enabled:      {c.debug_eval_enable}')
+        if c.debug_eval_enable:
+            dist.print0(f'Debug eval cfg:          init={c.debug_eval_init} num={c.debug_eval_num_images} steps={c.debug_eval_steps} batch={c.debug_eval_batch_size} visual={c.debug_eval_num_visual}')
+            dist.print0(f'Debug eval ref:          {c.debug_eval_ref_path}')
+            dist.print0(f'Debug adv visuals:       {c.debug_adv_num_visual}')
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')

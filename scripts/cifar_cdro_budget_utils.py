@@ -11,10 +11,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from toy.compute_accounting import (  # noqa: E402
-    cdro_robust_step_weighted_compute_units as toy_cdro_robust_step_weighted_compute_units,
-    load_weighted_compute_calibration,
-)
+from toy.compute_accounting import load_weighted_compute_calibration, weighted_compute_units  # noqa: E402
 
 
 DEFAULT_BASELINE_RUN_DIR = (
@@ -123,11 +120,16 @@ def cdro_robust_step_weighted_compute_units(
     outer_attack_weight: float,
     outer_clean_weight: float,
 ) -> float:
-    value = toy_cdro_robust_step_weighted_compute_units(
-        n_steps_path=int(n_steps_path),
-        inner_steps=int(attack_num_steps),
-        outer_attack_weight=float(outer_attack_weight),
-        outer_clean_weight=float(outer_clean_weight),
+    path_steps = max(int(n_steps_path), 0)
+    attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(attack_num_steps) > 0)
+    clean_enabled = bool(float(outer_clean_weight) > 0.0)
+    active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
+    # The image-port CDRO rollout constructs the nominal noisy state analytically and only
+    # spends denoiser work on the input-gradient attack construction plus the outer backward pass.
+    value = weighted_compute_units(
+        n_fwd=0.0,
+        n_fwd_inputgrad=float(path_steps * max(int(attack_num_steps), 0)) if attack_enabled else 0.0,
+        n_fwd_parambackward=float(path_steps * active_outer_branches),
         calibration=calibration,
     )
     if value is None:
