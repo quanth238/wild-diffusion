@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-wcu", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--batch-gpu", type=int, default=64)
+    parser.add_argument("--batch-gpu", type=int, default=1024)
     parser.add_argument("--arch", type=str, choices=["ddpmpp", "ncsnpp", "adm"], default="ddpmpp")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cifar-train-percent", type=int, default=20)
