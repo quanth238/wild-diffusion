@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import matplotlib.pyplot as plt
 
@@ -17,8 +16,8 @@ STYLE = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot a zoomed dual loss comparison for CIFAR baseline vs WDRO "
-            "using the coarse manifest and training stats traces."
+            "Plot a zoomed dual FID comparison for CIFAR baseline vs WDRO "
+            "using the coarse manifest."
         )
     )
     parser.add_argument("--manifest-csv", type=str, required=True)
@@ -47,49 +46,34 @@ def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def load_loss_trace(stats_path: Path) -> List[Tuple[float, float]]:
-    trace: List[Tuple[float, float]] = []
-    with stats_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            trace.append(
-                (
-                    float(payload["Progress/kimg"]["mean"]),
-                    float(payload["Loss/loss"]["mean"]),
-                )
-            )
-    if not trace:
-        raise RuntimeError(f"No stats rows found in {stats_path}")
-    trace.sort(key=lambda item: item[0])
-    return trace
-
-
-def nearest_loss(trace: List[Tuple[float, float]], target_kimg: float) -> Tuple[float, float]:
-    return min(trace, key=lambda item: abs(item[0] - float(target_kimg)))
+def _safe_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_rows(manifest_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
-    trace_cache: Dict[Path, List[Tuple[float, float]]] = {}
     out: List[Dict[str, object]] = []
     for row in manifest_rows:
-        if row.get("robust_method") not in STYLE:
+        robust_method = str(row.get("robust_method", "")).strip()
+        if robust_method not in STYLE:
             continue
-        run_dir = Path(str(row["run_dir"])).resolve()
-        stats_path = run_dir / "stats.jsonl"
-        if stats_path not in trace_cache:
-            trace_cache[stats_path] = load_loss_trace(stats_path)
-        matched_kimg, loss_value = nearest_loss(trace_cache[stats_path], float(row["step"]))
+        fid_value = _safe_float(row.get("fid"))
+        wall_clock = _safe_float(row.get("train_wall_clock_sec"))
+        weighted_compute = _safe_float(row.get("weighted_compute_units"))
+        if fid_value is None or wall_clock is None or weighted_compute is None:
+            continue
         out.append(
             {
-                "robust_method": row["robust_method"],
-                "series_label": STYLE[row["robust_method"]]["label"],
+                "robust_method": robust_method,
+                "series_label": STYLE[robust_method]["label"],
                 "step": int(float(row["step"])),
-                "matched_stats_kimg": float(matched_kimg),
-                "loss_mean": float(loss_value),
-                "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
-                "weighted_compute_units": float(row["weighted_compute_units"]),
+                "fid": float(fid_value),
+                "train_wall_clock_sec": float(wall_clock),
+                "weighted_compute_units": float(weighted_compute),
                 "baseline_train_wall_clock_sec_effective": (
                     ""
                     if not row.get("baseline_train_wall_clock_sec_effective")
@@ -107,7 +91,14 @@ def build_rows(manifest_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
     return out
 
 
-def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: str, train_percent_label: str, baseline_zoom_start_kimg: float) -> None:
+def plot_zoom(
+    rows: List[Dict[str, object]],
+    *,
+    out_png: Path,
+    dataset_label: str,
+    train_percent_label: str,
+    baseline_zoom_start_kimg: float,
+) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     baseline_zoom_rows = [
@@ -115,14 +106,17 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
     ]
     wdro_rows = [row for row in rows if row["robust_method"] == "wild_diffusion"]
     zoom_rows = baseline_zoom_rows + wdro_rows
-    y_vals = [float(row["loss_mean"]) for row in zoom_rows]
+    if not zoom_rows:
+        raise RuntimeError("No rows available for zoomed FID plot.")
+
+    y_vals = [float(row["fid"]) for row in zoom_rows]
     y_min = min(y_vals)
     y_max = max(y_vals)
-    pad = max((y_max - y_min) * 0.08, 0.001)
+    y_pad = max((y_max - y_min) * 0.08, 0.05)
 
     plot_specs = [
-        ("train_wall_clock_sec", "Train Wall-Clock (sec)", "Loss vs Train Wall-Clock (Zoom)"),
-        ("weighted_compute_units", "Weighted Compute Units", "Loss vs Weighted Compute (Zoom)"),
+        ("train_wall_clock_sec", "Train Wall-Clock (sec)", "FID vs Train Wall-Clock (Zoom)"),
+        ("weighted_compute_units", "Weighted Compute Units", "FID vs Weighted Compute (Zoom)"),
     ]
     for ax, (x_key, x_label, title) in zip(axes, plot_specs):
         x_vals = [float(row[x_key]) for row in zoom_rows]
@@ -132,9 +126,11 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
         for robust_method, style in STYLE.items():
             method_rows = [row for row in zoom_rows if row["robust_method"] == robust_method]
             method_rows.sort(key=lambda row: float(row[x_key]))
+            if not method_rows:
+                continue
             ax.plot(
                 [float(row[x_key]) for row in method_rows],
-                [float(row["loss_mean"]) for row in method_rows],
+                [float(row["fid"]) for row in method_rows],
                 marker="o",
                 linewidth=2.0,
                 color=style["color"],
@@ -149,15 +145,15 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
             if boundary not in ("", None):
                 ax.axvline(float(boundary), color="tab:orange", alpha=0.45, label="Wild-Diffusion warmup end")
         ax.set_xlabel(x_label)
-        ax.set_ylabel("Loss/loss")
+        ax.set_ylabel("FID")
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
-        ax.set_ylim(y_min - pad, y_max + pad)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
 
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=3, frameon=False)
-    fig.suptitle(f"{dataset_label} {train_percent_label}: Loss Comparison (Zoomed)", y=1.03)
+    fig.suptitle(f"{dataset_label} {train_percent_label}: FID Comparison (Zoomed)", y=1.03)
     fig.tight_layout(rect=[0, 0, 1, 0.9])
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_png, dpi=160, bbox_inches="tight")
@@ -175,7 +171,7 @@ def main() -> None:
     if out_csv is not None:
         out_csv.parent.mkdir(parents=True, exist_ok=True)
         write_csv(out_csv, rows)
-        print(f"[loss-zoom] wrote {out_csv}")
+        print(f"[fid-zoom] wrote {out_csv}")
     plot_zoom(
         rows,
         out_png=out_png,
@@ -183,7 +179,7 @@ def main() -> None:
         train_percent_label=str(args.train_percent_label),
         baseline_zoom_start_kimg=float(args.baseline_zoom_start_kimg),
     )
-    print(f"[loss-zoom] wrote {out_png}")
+    print(f"[fid-zoom] wrote {out_png}")
 
 
 if __name__ == "__main__":
