@@ -550,10 +550,16 @@ def _compute_weighted_accounting(
     if attack_training_executed and robust_steps_total > 0:
         direct_robust_counts = read_denoiser_op_count_totals(history_robust)
         if direct_robust_counts is not None:
-            robust_n_fwd = float(direct_robust_counts["n_fwd"])
+            if method_name == "cdro":
+                # Exclude the attacked-path frozen-denoiser reevaluation used only for
+                # `inner_obj` monitoring / NaN guarding from weighted compute.
+                robust_n_fwd = 0.0
+                robust_count_source = "history_direct_cdro_adjusted"
+            else:
+                robust_n_fwd = float(direct_robust_counts["n_fwd"])
+                robust_count_source = "history_direct"
             robust_n_fwd_inputgrad = float(direct_robust_counts["n_fwd_inputgrad"])
             robust_n_fwd_parambackward = float(direct_robust_counts["n_fwd_parambackward"])
-            robust_count_source = "history_direct"
         elif method_name == "wdro":
             robust_n_fwd_inputgrad = _sum_float_series(
                 history_robust.get("batch_equiv_denoiser_evals_attack_construction", [])
@@ -570,14 +576,14 @@ def _compute_weighted_accounting(
             else:
                 attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
             if method_name == "cdro":
-                robust_n_fwd = float(path_steps * robust_steps_total) if attack_enabled else 0.0
+                robust_n_fwd = 0.0
             else:
                 robust_n_fwd = float(path_steps * robust_steps_total)
             active_outer_branches = _count_positive_weight(float(cfg.outer_attack_weight)) + _count_positive_weight(
                 float(cfg.outer_clean_weight)
             )
             robust_n_fwd_parambackward = float(path_steps * robust_steps_total * active_outer_branches)
-            robust_count_source = "history_inferred_pathwise"
+            robust_count_source = "history_inferred_cdro_adjusted" if method_name == "cdro" else "history_inferred_pathwise"
         elif method_name == "clean":
             robust_n_fwd_parambackward = float(max(int(robust_steps_total), 0))
             robust_count_source = "history_inferred_clean"
