@@ -321,6 +321,15 @@ def _canonical_amp_dtype(value: str) -> str:
     raise ValueError(f"Unsupported amp dtype: {value}")
 
 
+def _train_percent_cli_value(label: str) -> str:
+    text = str(label).strip()
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    if not text:
+        raise ValueError(f"Invalid train percent label: {label!r}")
+    return text
+
+
 def _append_rf_cli_args(cmd: List[str], args: argparse.Namespace) -> None:
     cmd.extend(
         [
@@ -1700,7 +1709,7 @@ def _build_baseline_sweep_cmd(
         "--seeds",
         seeds_text,
         "--train-percents",
-        "1",
+        _train_percent_cli_value(args.train_percent_label),
         "--steps-list",
         format_steps_list(steps),
         "--fid-eval-steps-list",
