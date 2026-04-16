@@ -229,6 +229,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--image-backbone", type=str, default="conv", choices=["conv", "songunet"])
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong", "plain"])
     parser.add_argument("--rf-stage1-fraction", type=float, default=0.5)
@@ -926,6 +927,8 @@ def _build_posthoc_reeval_cmd(
         str(args.batch_size),
         "--hidden-dim",
         str(args.hidden_dim),
+        "--image-backbone",
+        str(args.image_backbone),
         "--eval-samples",
         str(args.eval_samples),
         "--fid-samples",
@@ -1311,6 +1314,7 @@ def _normalize_baseline_runs(*, runs_csv: str, args: argparse.Namespace) -> List
                     "loss_final": float(row["baseline_loss_final"]),
                     "loss_mean_last": float(row["baseline_loss_mean_last"]),
                     "images_shown_m": float(row["images_shown_m"]),
+                    "image_backbone": str(row.get("image_backbone", getattr(args, "image_backbone", "conv"))),
                     "row_origin": "baseline_seed_run",
                     "source_csv": runs_csv,
                     "exp_name": row["exp_name"],
@@ -1342,6 +1346,9 @@ def _extract_wdro_row(
     args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
+    source_cfg = payload.get("config", {})
+    if not isinstance(source_cfg, dict):
+        source_cfg = {}
     metrics = payload["metrics"]
     flow = metrics["flow_debug"]
     runtime = flow["runtime"]
@@ -1395,6 +1402,7 @@ def _extract_wdro_row(
         ),
         "robust_weighted_compute_units": None if robust_weighted_compute is None else float(robust_weighted_compute),
         "images_shown_m": float(total_images_shown_m_effective),
+        "image_backbone": str(source_cfg.get("image_backbone", getattr(args, "image_backbone", "conv"))),
         "loss_kind": "robust_outer_loss",
         "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
         "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
@@ -1451,6 +1459,9 @@ def _extract_cdro_row(
     args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
+    source_cfg = payload.get("config", {})
+    if not isinstance(source_cfg, dict):
+        source_cfg = {}
     metrics = payload["metrics"]
     flow = metrics["flow_debug"]
     runtime = flow["runtime"]
@@ -1524,6 +1535,7 @@ def _extract_cdro_row(
             else float(robust_logging_only_forward_count_excluded)
         ),
         "images_shown_m": float(total_images_shown_m_effective),
+        "image_backbone": str(source_cfg.get("image_backbone", getattr(args, "image_backbone", "conv"))),
         "loss_kind": "robust_outer_loss",
         "loss_final": _optional_float(objective.get("robust_outer_loss", {}).get("final")),
         "loss_mean_last": _optional_float(objective.get("robust_outer_loss", {}).get("mean_last")),
@@ -1708,6 +1720,8 @@ def _build_baseline_sweep_cmd(
         str(args.batch_size),
         "--hidden-dim",
         str(args.hidden_dim),
+        "--image-backbone",
+        str(args.image_backbone),
         "--training-objective",
         str(args.training_objective),
         "--n-steps-path",
@@ -1787,6 +1801,8 @@ def _build_run_toy_cmd(
         str(n_steps_path_value),
         "--hidden-dim",
         str(args.hidden_dim),
+        "--image-backbone",
+        str(args.image_backbone),
         "--dataset-kind",
         "image_folder",
         "--model-kind",

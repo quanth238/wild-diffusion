@@ -151,6 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=50000)
     parser.add_argument("--fid-batch-size", type=int, default=DEFAULT_FID_BATCH_SIZE)
@@ -484,6 +485,7 @@ def _base_cfg_from_args(args: argparse.Namespace) -> ToyConfig:
     cfg.amp_dtype = args.amp_dtype
     cfg.dataset_kind = "image_folder"
     cfg.model_kind = "image_conv"
+    cfg.image_backbone = str(args.image_backbone)
     cfg.diagnostics_kind = "image_basic"
     cfg.dataset_path = args.dataset_path
     cfg.dataset_val_path = args.dataset_val_path
@@ -520,6 +522,7 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "eval_seed_offset_metrics",
         "fid_ref_path",
         "hidden_dim",
+        "image_backbone",
         "image_channels",
         "image_size",
         "image_split_seed",
@@ -585,6 +588,7 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str)
         str(cfg.amp_dtype),
         str(cfg.dataset_kind),
         str(cfg.model_kind),
+        str(getattr(cfg, "image_backbone", ToyConfig.image_backbone)),
         str(cfg.training_objective),
         str(cfg.dataset_path),
         str(cfg.dataset_val_path),
@@ -697,6 +701,7 @@ def _write_metrics_payload(
             "image_val_size": int(ctx.cfg.image_val_size),
             "image_split_seed": int(ctx.cfg.image_split_seed),
             "hidden_dim": int(ctx.cfg.hidden_dim),
+            "image_backbone": str(getattr(ctx.cfg, "image_backbone", ToyConfig.image_backbone)),
             "n_steps_path": int(ctx.cfg.n_steps_path),
             "sigma_min": float(ctx.cfg.sigma_min),
             "sigma_max": float(ctx.cfg.sigma_max),

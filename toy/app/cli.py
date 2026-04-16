@@ -13,6 +13,10 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--method-version must be one of {SUPPORTED_METHOD_VERSIONS}, got {cfg.method_version}"
         )
+    if str(cfg.image_backbone).lower() not in ("conv", "songunet"):
+        raise ValueError(
+            f"--image-backbone must be one of ('conv', 'songunet'), got {cfg.image_backbone}"
+        )
     if str(cfg.amp_dtype).lower() not in ("auto", "off", "bf16", "bfloat16", "fp16", "float16", "half"):
         raise ValueError(
             "--amp-dtype must be one of "
@@ -211,6 +215,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-kind", type=str, default=ToyConfig.dataset_kind)
     parser.add_argument("--model-kind", type=str, default=ToyConfig.model_kind)
+    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
     parser.add_argument("--diagnostics-kind", type=str, default=ToyConfig.diagnostics_kind)
     parser.add_argument("--dataset-path", type=str, default=ToyConfig.dataset_path)
     parser.add_argument("--dataset-val-path", type=str, default=ToyConfig.dataset_val_path)

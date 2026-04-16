@@ -15,7 +15,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 from toy.config import ToyConfig
-from toy.models import ImageEDMDenoiser, ImageRectifiedFlowModel, ImageScoreModel
+from toy.model_backends.provider import resolve_image_denoiser_spec
 from toy.shared.objective import build_training_state, compute_training_loss
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
 from toy.utils import ensure_dir, pick_device, set_seed
@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-channels", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
     parser.add_argument("--sigma-data", type=float, default=0.5)
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
@@ -63,33 +64,19 @@ def build_cfg(args: argparse.Namespace) -> ToyConfig:
         image_channels=int(args.image_channels),
         batch_size=int(args.batch_size),
         hidden_dim=int(args.hidden_dim),
+        image_backbone=str(args.image_backbone),
         sigma_min=float(args.sigma_min),
         sigma_max=float(args.sigma_max),
     )
 
 
 def build_denoiser(cfg: ToyConfig, device: torch.device) -> torch.nn.Module:
-    if cfg.training_objective == "edm":
-        denoiser_cls = ImageEDMDenoiser
-        denoiser_kwargs = dict(
-            in_channels=int(cfg.image_channels),
-            hidden_dim=int(cfg.hidden_dim),
-            sigma_data=float(cfg.sigma_data),
-        )
-    elif cfg.training_objective == "score":
-        denoiser_cls = ImageScoreModel
-        denoiser_kwargs = dict(
-            in_channels=int(cfg.image_channels),
-            hidden_dim=int(cfg.hidden_dim),
-            sigma_data=float(cfg.sigma_data),
-        )
-    else:
-        denoiser_cls = ImageRectifiedFlowModel
-        denoiser_kwargs = dict(
-            in_channels=int(cfg.image_channels),
-            hidden_dim=int(cfg.hidden_dim),
-            sigma_max=float(cfg.sigma_max),
-        )
+    _, denoiser_cls, denoiser_kwargs = resolve_image_denoiser_spec(
+        cfg,
+        in_channels=int(cfg.image_channels),
+        image_resolution=int(cfg.image_size),
+        sigma_data=float(cfg.sigma_data),
+    )
     denoiser = denoiser_cls(**denoiser_kwargs).to(device)
     return denoiser
 
@@ -240,6 +227,7 @@ def main() -> None:
         },
         "workload": {
             "model_kind": "image_conv",
+            "image_backbone": str(cfg.image_backbone),
             "training_objective": str(cfg.training_objective),
             "score_matching_weight_power": float(cfg.score_matching_weight_power),
             "batch_size": int(cfg.batch_size),

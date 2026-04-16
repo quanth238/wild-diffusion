@@ -8,6 +8,9 @@ from ..models import (
     ImageEDMDenoiser,
     ImageRectifiedFlowModel,
     ImageScoreModel,
+    ImageSongUNetDenoiser,
+    ImageSongUNetRectifiedFlowModel,
+    ImageSongUNetScoreModel,
     ToyEDMDenoiser,
     ToyRectifiedFlowModel,
     ToyScoreModel,
@@ -22,6 +25,65 @@ class ModelBundle:
     baseline: torch.nn.Module
     robust: torch.nn.Module
     control: torch.nn.Module
+
+
+def resolve_image_denoiser_spec(
+    cfg,
+    *,
+    in_channels: int,
+    image_resolution: int,
+    sigma_data: float,
+) -> tuple[str, type[torch.nn.Module], dict]:
+    """Resolve the active image denoiser constructor from config."""
+
+    objective = str(getattr(cfg, "training_objective", "edm")).lower()
+    image_backbone = str(getattr(cfg, "image_backbone", "conv")).strip().lower()
+
+    if image_backbone == "conv":
+        if objective == "edm":
+            return "image_conv", ImageEDMDenoiser, dict(
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        if objective == "score":
+            return "image_conv", ImageScoreModel, dict(
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        return "image_conv", ImageRectifiedFlowModel, dict(
+            in_channels=in_channels,
+            hidden_dim=cfg.hidden_dim,
+            sigma_max=cfg.sigma_max,
+        )
+
+    if image_backbone == "songunet":
+        if objective == "edm":
+            return "image_songunet", ImageSongUNetDenoiser, dict(
+                img_resolution=image_resolution,
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        if objective == "score":
+            return "image_songunet", ImageSongUNetScoreModel, dict(
+                img_resolution=image_resolution,
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        return "image_songunet", ImageSongUNetRectifiedFlowModel, dict(
+            img_resolution=image_resolution,
+            in_channels=in_channels,
+            hidden_dim=cfg.hidden_dim,
+            sigma_max=cfg.sigma_max,
+        )
+
+    raise ValueError(
+        f"Unsupported image_backbone='{getattr(cfg, 'image_backbone', image_backbone)}'. "
+        "Expected one of: conv, songunet."
+    )
 
 
 def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) -> ModelBundle:
@@ -55,17 +117,22 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
                 f"got data_shape={dataset.data_shape}"
             )
         channels = int(dataset.data_shape[0])
-        if objective == "edm":
-            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
-            denoiser_cls = ImageEDMDenoiser
-        elif objective == "score":
-            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_data=sigma_data)
-            denoiser_cls = ImageScoreModel
-        else:
-            denoiser_kwargs = dict(in_channels=channels, hidden_dim=cfg.hidden_dim, sigma_max=cfg.sigma_max)
-            denoiser_cls = ImageRectifiedFlowModel
+        height = int(dataset.data_shape[1])
+        width = int(dataset.data_shape[2])
+        image_backbone = str(getattr(cfg, "image_backbone", "conv")).strip().lower()
+        if image_backbone == "songunet" and height != width:
+            raise ValueError(
+                "image_backbone='songunet' expects square image samples with data_shape=(C,H,W), "
+                f"got data_shape={dataset.data_shape}"
+            )
+        backend_name, denoiser_cls, denoiser_kwargs = resolve_image_denoiser_spec(
+            cfg,
+            in_channels=channels,
+            image_resolution=height,
+            sigma_data=sigma_data,
+        )
         return ModelBundle(
-            name=f"image_conv_{objective}",
+            name=f"{backend_name}_{objective}",
             baseline=denoiser_cls(**denoiser_kwargs).to(device),
             robust=denoiser_cls(**denoiser_kwargs).to(device),
             control=ImageControlNet(in_channels=channels, hidden_dim=cfg.hidden_dim).to(device),

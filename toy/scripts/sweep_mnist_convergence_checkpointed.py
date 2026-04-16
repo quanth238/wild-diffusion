@@ -307,6 +307,7 @@ def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float,
         "val_subset_size": int(dataset.val_pool.shape[0]),
         "batch_size": int(cfg.batch_size),
         "hidden_dim": int(cfg.hidden_dim),
+        "image_backbone": str(getattr(cfg, "image_backbone", ToyConfig.image_backbone)),
         "lr_theta": float(cfg.lr_theta),
         "training_objective": str(cfg.training_objective),
         "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
@@ -874,6 +875,7 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.method_version = "v1.1"
     cfg.dataset_kind = str(args.dataset_kind)
     cfg.model_kind = "image_conv"
+    cfg.image_backbone = str(args.image_backbone)
     cfg.image_size = int(args.image_size)
     cfg.image_channels = int(args.image_channels)
     cfg.image_split_seed = int(seed + args.image_split_seed_offset)
@@ -1345,6 +1347,7 @@ def build_parser():
     parser.add_argument("--mnist-val-percent", type=float, default=100.0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong", "plain"])
     parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
@@ -1586,6 +1589,7 @@ def main() -> None:
             "fid_eval_steps_list": fid_eval_steps,
             "batch_size": int(args.batch_size),
             "image_size": int(args.image_size),
+            "image_backbone": str(args.image_backbone),
             "training_objective": str(args.training_objective),
             "sigma_min": float(args.sigma_min),
             "sigma_max": float(args.sigma_max),
