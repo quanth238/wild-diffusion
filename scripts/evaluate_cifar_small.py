@@ -37,6 +37,14 @@ def _load_jsonl(path: Path) -> List[Dict]:
     return rows
 
 
+def _extract_stat_mean(payload: Dict, *keys: str) -> Optional[float]:
+    for key in keys:
+        value = payload.get(key, {})
+        if isinstance(value, dict) and value.get("mean") is not None:
+            return float(value["mean"])
+    return None
+
+
 def _resolve_single_run_dir(run_root: Path) -> Path:
     run_dirs = sorted([p for p in run_root.iterdir() if p.is_dir()])
     if not run_dirs:
@@ -67,8 +75,8 @@ def _extract_train_tail(run_dir: Path) -> Dict[str, Optional[float]]:
     if not rows:
         return {"final_kimg": None, "final_loss": None}
     last = rows[-1]
-    final_kimg = last.get("Progress/kimg", {}).get("mean")
-    final_loss = last.get("Loss/loss", {}).get("mean")
+    final_kimg = _extract_stat_mean(last, "Progress/kimg")
+    final_loss = _extract_stat_mean(last, "Loss", "Loss/loss")
     return {
         "final_kimg": None if final_kimg is None else float(final_kimg),
         "final_loss": None if final_loss is None else float(final_loss),

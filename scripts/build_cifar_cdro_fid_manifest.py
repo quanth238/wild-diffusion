@@ -64,6 +64,14 @@ def _safe_mean_field(payload: Dict, key: str):
     return _safe_float(value)
 
 
+def _safe_mean_field_any(payload: Dict, *keys: str):
+    for key in keys:
+        value = _safe_mean_field(payload, key)
+        if value is not None:
+            return value
+    return None
+
+
 def load_stats_trace(path: Path) -> List[Dict[str, float]]:
     trace: List[Dict[str, float]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -80,7 +88,7 @@ def load_stats_trace(path: Path) -> List[Dict[str, float]]:
                 {
                     "kimg": float(kimg),
                     "total_sec": float(total_sec),
-                    "loss_loss": _safe_mean_field(payload, "Loss/loss"),
+                    "loss": _safe_mean_field_any(payload, "Loss", "Loss/loss"),
                     "cdro_outer_loss": _safe_mean_field(payload, "CDRO/outer_loss"),
                     "cdro_outer_loss_attack": _safe_mean_field(payload, "CDRO/outer_loss_attack"),
                     "cdro_outer_loss_clean": _safe_mean_field(payload, "CDRO/outer_loss_clean"),
@@ -193,7 +201,7 @@ def build_rows(args: argparse.Namespace):
         eval_tag = f"cdro_kimg{int(kimg):06d}"
         loss_final = trace_row["cdro_outer_loss"]
         if loss_final is None:
-            loss_final = trace_row["loss_loss"]
+            loss_final = trace_row["loss"]
         rows.append(
             {
                 **_series_fields(),
@@ -235,7 +243,7 @@ def build_rows(args: argparse.Namespace):
                 "train_percent_label": str(args.train_percent_label),
                 "eval_dir": str(eval_root / eval_tag),
                 "loss_final": "" if loss_final is None else float(loss_final),
-                "loss_mean_last": "" if trace_row["loss_loss"] is None else float(trace_row["loss_loss"]),
+                "loss_mean_last": "" if trace_row["loss"] is None else float(trace_row["loss"]),
                 "fixed_warmup_steps": float(warmup_compute_be),
             }
         )

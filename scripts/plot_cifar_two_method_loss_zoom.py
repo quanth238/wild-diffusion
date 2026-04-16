@@ -47,6 +47,14 @@ def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _extract_loss_mean(payload: Dict) -> float:
+    for key in ("Loss", "Loss/loss"):
+        value = payload.get(key, {})
+        if isinstance(value, dict) and value.get("mean") is not None:
+            return float(value["mean"])
+    raise KeyError("Missing loss metric: expected 'Loss' or legacy 'Loss/loss'.")
+
+
 def load_loss_trace(stats_path: Path) -> List[Tuple[float, float]]:
     trace: List[Tuple[float, float]] = []
     with stats_path.open("r", encoding="utf-8") as handle:
@@ -57,7 +65,7 @@ def load_loss_trace(stats_path: Path) -> List[Tuple[float, float]]:
             trace.append(
                 (
                     float(payload["Progress/kimg"]["mean"]),
-                    float(payload["Loss/loss"]["mean"]),
+                    _extract_loss_mean(payload),
                 )
             )
     if not trace:
@@ -149,7 +157,7 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
             if boundary not in ("", None):
                 ax.axvline(float(boundary), color="tab:orange", alpha=0.45, label="Wild-Diffusion warmup end")
         ax.set_xlabel(x_label)
-        ax.set_ylabel("Loss/loss")
+        ax.set_ylabel("Loss")
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
         ax.set_ylim(y_min - pad, y_max + pad)
         ax.set_title(title)

@@ -23,6 +23,29 @@ from wandb_utils import log_metrics, update_summary
 
 #----------------------------------------------------------------------------
 
+def _mean_loss_scalar(value):
+    return float(torch.as_tensor(value).detach().to(torch.float32).mean().item())
+
+#----------------------------------------------------------------------------
+
+def _resume_step_stats_index(path):
+    if not os.path.isfile(path):
+        return 0
+    next_iter_idx = 0
+    with open(path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            next_iter_idx = max(int(payload.get('iter_idx', -1)) + 1, next_iter_idx)
+    return next_iter_idx
+
+#----------------------------------------------------------------------------
+
 def training_loop(
     run_dir             = '.',      # Output directory.
     dataset_kwargs      = {},       # Options for training set.
@@ -121,10 +144,16 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    step_stats_jsonl = None
+    step_stats_path = os.path.join(run_dir, 'step_stats.jsonl')
+    step_stats_next_iter = _resume_step_stats_index(step_stats_path) if dist.get_rank() == 0 else 0
     while True:
 
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
+        step_start_nimg = cur_nimg
+        step_loss_accum = 0.0
+        step_loss_rounds = 0
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
@@ -139,10 +168,14 @@ def training_loop(
                         augment_pipe=augment_pipe,
                         gain=gain,
                     )
-                    training_stats.report('Loss/loss', loss_value)
+                    step_loss_accum += _mean_loss_scalar(loss_value)
+                    step_loss_rounds += 1
+                    training_stats.report('Loss', loss_value)
                 else:
                     loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
-                    training_stats.report('Loss/loss', loss)
+                    step_loss_accum += _mean_loss_scalar(loss)
+                    step_loss_rounds += 1
+                    training_stats.report('Loss', loss)
                     loss.sum().mul(gain).backward()
 
         # Update weights.
@@ -160,6 +193,32 @@ def training_loop(
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
         for p_ema, p_net in zip(ema.parameters(), net.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
+
+        # Persist one loss value per optimizer step for fine-grained curves.
+        step_loss_value = step_loss_accum / max(step_loss_rounds, 1)
+        if dist.get_world_size() > 1:
+            step_loss_tensor = torch.tensor(step_loss_value, device=device, dtype=torch.float32)
+            torch.distributed.all_reduce(step_loss_tensor)
+            step_loss_value = float((step_loss_tensor / dist.get_world_size()).item())
+        if dist.get_rank() == 0:
+            if step_stats_jsonl is None:
+                step_stats_jsonl = open(step_stats_path, 'at', encoding='utf-8')
+            step_end_nimg = step_start_nimg + batch_size
+            now = time.time()
+            step_stats_jsonl.write(json.dumps({
+                'iter_idx': int(step_stats_next_iter),
+                'timestamp': now,
+                'loss': float(step_loss_value),
+                'loss_key': 'Loss',
+                'nimg_start': int(step_start_nimg),
+                'nimg_end': int(step_end_nimg),
+                'kimg_start': float(step_start_nimg / 1e3),
+                'kimg_end': float(step_end_nimg / 1e3),
+                'total_sec': float(now - start_time),
+                'lr': float(optimizer.param_groups[0]['lr']),
+            }) + '\n')
+            step_stats_jsonl.flush()
+            step_stats_next_iter += 1
 
         # Perform maintenance tasks once per tick.
         cur_nimg += batch_size
@@ -241,6 +300,10 @@ def training_loop(
 
     # Done.
     if dist.get_rank() == 0:
+        if stats_jsonl is not None:
+            stats_jsonl.close()
+        if step_stats_jsonl is not None:
+            step_stats_jsonl.close()
         update_summary(
             wandb_run,
             {
