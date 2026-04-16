@@ -14,7 +14,9 @@ class ToyConfig:
     method_version: str = "cdro"  # one of supported versions in toy/versions/registry.py
     dataset_kind: str = "image_folder"
     model_kind: str = "auto"  # auto|toy_mlp|...
-    image_backbone: str = "conv"  # conv|songunet
+    image_backbone: str = "conv"  # conv|songunet|ddpmpp
+    baseline_train_backend: str = "toy"  # toy|mainline
+    baseline_train_batch_gpu: int = 0  # 0=auto, else per-GPU microbatch for mainline baseline training
     diagnostics_kind: str = "auto"  # auto|toy_gmm|...
     dataset_path: str = "toy_data/simpsons_mnist_rgb/imagefolder/train"
     dataset_val_path: str = "toy_data/simpsons_mnist_rgb/imagefolder/test"

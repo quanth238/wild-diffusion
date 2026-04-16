@@ -5,6 +5,9 @@ import torch
 from ..models import (
     ControlNet,
     ImageControlNet,
+    ImageDDPMPPDenoiser,
+    ImageDDPMPPRectifiedFlowModel,
+    ImageDDPMPPScoreModel,
     ImageEDMDenoiser,
     ImageRectifiedFlowModel,
     ImageScoreModel,
@@ -80,9 +83,31 @@ def resolve_image_denoiser_spec(
             sigma_max=cfg.sigma_max,
         )
 
+    if image_backbone == "ddpmpp":
+        if objective == "edm":
+            return "image_ddpmpp", ImageDDPMPPDenoiser, dict(
+                img_resolution=image_resolution,
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        if objective == "score":
+            return "image_ddpmpp", ImageDDPMPPScoreModel, dict(
+                img_resolution=image_resolution,
+                in_channels=in_channels,
+                hidden_dim=cfg.hidden_dim,
+                sigma_data=sigma_data,
+            )
+        return "image_ddpmpp", ImageDDPMPPRectifiedFlowModel, dict(
+            img_resolution=image_resolution,
+            in_channels=in_channels,
+            hidden_dim=cfg.hidden_dim,
+            sigma_max=cfg.sigma_max,
+        )
+
     raise ValueError(
         f"Unsupported image_backbone='{getattr(cfg, 'image_backbone', image_backbone)}'. "
-        "Expected one of: conv, songunet."
+        "Expected one of: conv, songunet, ddpmpp."
     )
 
 
@@ -120,9 +145,9 @@ def build_model_bundle(cfg, dataset, sigma_data: float, device: torch.device) ->
         height = int(dataset.data_shape[1])
         width = int(dataset.data_shape[2])
         image_backbone = str(getattr(cfg, "image_backbone", "conv")).strip().lower()
-        if image_backbone == "songunet" and height != width:
+        if image_backbone in ("songunet", "ddpmpp") and height != width:
             raise ValueError(
-                "image_backbone='songunet' expects square image samples with data_shape=(C,H,W), "
+                f"image_backbone='{image_backbone}' expects square image samples with data_shape=(C,H,W), "
                 f"got data_shape={dataset.data_shape}"
             )
         backend_name, denoiser_cls, denoiser_kwargs = resolve_image_denoiser_spec(

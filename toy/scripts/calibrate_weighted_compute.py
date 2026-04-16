@@ -37,7 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-channels", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
+    parser.add_argument(
+        "--image-backbone",
+        type=str,
+        default=ToyConfig.image_backbone,
+        choices=["conv", "songunet", "ddpmpp"],
+    )
     parser.add_argument("--sigma-data", type=float, default=0.5)
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)

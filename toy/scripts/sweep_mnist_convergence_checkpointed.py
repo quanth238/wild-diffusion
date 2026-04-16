@@ -20,6 +20,7 @@ import json
 import math
 import os
 import pickle
+import subprocess
 import statistics
 import sys
 import time
@@ -37,6 +38,17 @@ if __package__ is None or __package__ == "":
     from toy.config import ToyConfig
     from toy.data_backends.provider import build_dataset_bundle
     from toy.export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from toy.mainline_baseline import (
+        SUPPORTED_BASELINE_TRAIN_BACKENDS,
+        build_mainline_baseline_segment_cmd,
+        load_mainline_ema_into_toy_model,
+        load_mainline_snapshot_ema_state_dict,
+        load_mainline_stats_loss_history,
+        resolve_baseline_train_backend,
+        resolve_baseline_train_batch_gpu,
+        snapshot_path_for_kimg,
+        steps_to_kimg_exact,
+    )
     from toy.model_backends.provider import build_model_bundle
     from toy.models import set_requires_grad
     from toy.process_title import apply_process_title, build_process_title
@@ -56,6 +68,17 @@ else:
     from ..config import ToyConfig
     from ..data_backends.provider import build_dataset_bundle
     from ..export_mnist_fid_ref import build_mnist_fid_reference, default_mnist_fid_policy_name
+    from ..mainline_baseline import (
+        SUPPORTED_BASELINE_TRAIN_BACKENDS,
+        build_mainline_baseline_segment_cmd,
+        load_mainline_ema_into_toy_model,
+        load_mainline_snapshot_ema_state_dict,
+        load_mainline_stats_loss_history,
+        resolve_baseline_train_backend,
+        resolve_baseline_train_batch_gpu,
+        snapshot_path_for_kimg,
+        steps_to_kimg_exact,
+    )
     from ..model_backends.provider import build_model_bundle
     from ..models import set_requires_grad
     from ..process_title import apply_process_title, build_process_title
@@ -295,7 +318,7 @@ def _optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.d
 
 def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float, seed: int) -> Dict[str, Any]:
     return {
-        "signature_version": 1,
+        "signature_version": 2,
         "dataset_kind": str(cfg.dataset_kind),
         "dataset_path": str(getattr(cfg, "dataset_path", "")),
         "dataset_val_path": str(getattr(cfg, "dataset_val_path", "")),
@@ -306,8 +329,10 @@ def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float,
         "train_subset_size": int(dataset.train_pool.shape[0]) if dataset.train_pool is not None else None,
         "val_subset_size": int(dataset.val_pool.shape[0]),
         "batch_size": int(cfg.batch_size),
+        "baseline_train_batch_gpu": resolve_baseline_train_batch_gpu(cfg),
         "hidden_dim": int(cfg.hidden_dim),
         "image_backbone": str(getattr(cfg, "image_backbone", ToyConfig.image_backbone)),
+        "baseline_train_backend": resolve_baseline_train_backend(cfg),
         "lr_theta": float(cfg.lr_theta),
         "training_objective": str(cfg.training_objective),
         "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
@@ -881,8 +906,10 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.image_split_seed = int(seed + args.image_split_seed_offset)
     cfg.steps = int(max(_parse_int_list(args.steps_list, allow_zero=True)))
     cfg.batch_size = int(args.batch_size)
+    cfg.baseline_train_batch_gpu = int(args.baseline_train_batch_gpu)
     cfg.hidden_dim = int(args.hidden_dim)
     cfg.training_objective = str(args.training_objective)
+    cfg.baseline_train_backend = str(args.baseline_train_backend)
     cfg.rf_baseline_mode = str(args.rf_baseline_mode)
     cfg.rf_stage1_fraction = float(args.rf_stage1_fraction)
     cfg.rf_reflow_t_distribution = str(args.rf_reflow_t_distribution)
@@ -940,6 +967,229 @@ def _objective_display_name(training_objective: str) -> str:
     if objective == "score":
         return "Score VE"
     return "EDM"
+
+
+def _run_combo_mainline(
+    *,
+    args,
+    cfg: ToyConfig,
+    train_percent: float,
+    seed: int,
+    checkpoint_steps: List[int],
+    fid_eval_steps: List[int],
+    detector_net,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+    weighted_calibration: Dict[str, Any],
+    dataset,
+    sigma_levels: torch.Tensor,
+    baseline: torch.nn.Module,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    combo_name: str,
+    combo_dir: Path,
+    summary_path: Path,
+    run_state_path: Path,
+) -> List[RunRow]:
+    """Train checkpoints via the repo's main EDM loop, but keep toy-side eval/output."""
+
+    checkpoint_set = set(int(step) for step in checkpoint_steps)
+    fid_eval_set = set(int(step) for step in fid_eval_steps)
+    mainline_run_dir = combo_dir / "mainline_train"
+    ensure_dir(str(mainline_run_dir))
+
+    rows: List[RunRow] = []
+    resume_steps = 0
+    combo_train_elapsed_offset_sec = 0.0
+    if not bool(getattr(args, "disable_resume", False)) and summary_path.is_file():
+        try:
+            summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary_payload = {}
+        existing_rows = {
+            int(row.get("step")): _run_row_from_dict(
+                row,
+                weighted_calibration=weighted_calibration,
+                train_accelerator_count=int(args.train_accelerator_count),
+            )
+            for row in summary_payload.get("rows", [])
+            if isinstance(row, dict) and row.get("step") is not None
+        }
+        for step in sorted(int(v) for v in checkpoint_steps):
+            row = existing_rows.get(int(step))
+            if row is None:
+                break
+            if not str(row.checkpoint_path).strip() or not Path(row.checkpoint_path).is_file():
+                break
+            rows.append(row)
+            resume_steps = int(step)
+            combo_train_elapsed_offset_sec = max(combo_train_elapsed_offset_sec, float(row.train_elapsed_sec))
+        if resume_steps > 0:
+            print(f"[resume-mainline] {summary_path} step={resume_steps} rows={len(rows)}", flush=True)
+        if resume_steps >= int(cfg.steps):
+            _write_combo_rows_summary(
+                summary_path,
+                combo_name=combo_name,
+                train_percent=train_percent,
+                seed=seed,
+                rows=rows,
+                run_state_path=run_state_path,
+                completed=True,
+            )
+            return rows
+
+    combo_train_t0 = time.perf_counter()
+    eval_seed = int(cfg.seed + args.eval_seed_offset_metrics)
+
+    def _emit_checkpoint_row_mainline(*, step: int, loss_history: List[float]) -> None:
+        ckpt_path = combo_dir / "checkpoints" / f"baseline_step{step:05d}.pt"
+        history_snapshot = {
+            "loss": [float(v) for v in loss_history],
+            "proxy_weighted_denoise_loss": [float(v) for v in loss_history],
+            "sigma_counts": [],
+        }
+        train_elapsed = combo_train_elapsed_offset_sec + float(time.perf_counter() - combo_train_t0)
+        _save_checkpoint(
+            ckpt_path,
+            model=baseline,
+            raw_model=None,
+            optimizer=None,
+            ema_model=None,
+            rng_state=None,
+            step=step,
+            train_percent=train_percent,
+            seed=seed,
+            history=history_snapshot,
+            train_wall_clock_sec=float(train_elapsed),
+        )
+        train_gpu_hours = float(train_elapsed) * float(max(int(args.train_accelerator_count), 0)) / 3600.0
+        weighted_units = weighted_compute_units(
+            n_fwd=0.0,
+            n_fwd_inputgrad=0.0,
+            n_fwd_parambackward=float(step),
+            calibration=weighted_calibration,
+        )
+        fid_eval_selected = bool(step in fid_eval_set)
+        fid_value: Optional[float] = None
+        fid_elapsed: Optional[float] = None
+        fid_evaluated = False
+        fid_missing_reason = ""
+        fid_source = "not_evaluated"
+        if fid_eval_selected:
+            if detector_net is None or mu_ref is None or sigma_ref is None:
+                raise RuntimeError("FID evaluation requested but detector/ref stats were not initialized.")
+            baseline_was_training = baseline.training
+            baseline.eval()
+            t_fid = time.perf_counter()
+            fid_value = _run_with_scoped_seed(
+                eval_seed,
+                lambda: _compute_fid_for_model(
+                    denoiser=baseline,
+                    sigma_levels=sigma_levels,
+                    dataset=dataset,
+                    detector_net=detector_net,
+                    mu_ref=mu_ref,
+                    sigma_ref=sigma_ref,
+                    num_images=int(args.fid_samples),
+                    gen_batch=int(args.gen_batch),
+                    device=device,
+                    amp_dtype=amp_dtype,
+                ),
+            )
+            fid_elapsed = float(time.perf_counter() - t_fid)
+            fid_evaluated = math.isfinite(_safe_float(fid_value))
+            fid_missing_reason = "" if fid_evaluated else "selected_but_missing_or_failed"
+            fid_source = "in_run_metrics" if fid_evaluated else "missing_in_run_metrics"
+            if baseline_was_training:
+                baseline.train()
+        else:
+            fid_missing_reason = "not_selected_by_schedule"
+
+        tail = loss_history[-min(200, len(loss_history)) :] if loss_history else []
+        baseline_loss_final = float(loss_history[-1]) if loss_history else float("nan")
+        baseline_loss_mean_last = float(sum(float(v) for v in tail) / len(tail)) if tail else float("nan")
+        row = RunRow(
+            train_percent=float(train_percent),
+            seed=int(seed),
+            step=int(step),
+            images_shown_m=float(step * cfg.batch_size) / 1_000_000.0,
+            exp_name=combo_name,
+            exp_dir=str(combo_dir),
+            checkpoint_path=str(ckpt_path),
+            train_subset_size=int(dataset.metadata.get("train_subset_size_resolved") or 0),
+            val_subset_size=int(dataset.metadata.get("val_subset_size_resolved") or 0),
+            baseline_fid=None if fid_value is None else float(fid_value),
+            baseline_loss_final=float(baseline_loss_final),
+            baseline_loss_mean_last=float(baseline_loss_mean_last),
+            train_elapsed_sec=float(train_elapsed),
+            train_wall_clock_sec=float(train_elapsed),
+            train_gpu_hours=float(train_gpu_hours),
+            weighted_compute_units=float(weighted_units) if weighted_units is not None else float("nan"),
+            batch_equiv_denoiser_evals=float(step),
+            fid_elapsed_sec=None if fid_elapsed is None else float(fid_elapsed),
+            fid_eval_selected=bool(fid_eval_selected),
+            fid_evaluated=bool(fid_evaluated),
+            fid_missing_reason=str(fid_missing_reason),
+            fid_source=str(fid_source),
+        )
+        rows.append(row)
+        print(
+            "[row]"
+            f" pct={train_percent:g} seed={seed} step={step}"
+            f" mimg={_fmt(row.images_shown_m, 3)}"
+            f" fid={_fmt(_safe_float(row.baseline_fid), 3)}"
+            f" loss={_fmt(row.baseline_loss_final, 5)}"
+            f" train_elapsed={_fmt(row.train_elapsed_sec, 1)}s"
+            f" weighted={_fmt(row.weighted_compute_units, 1)}"
+            f" fid_selected={str(row.fid_eval_selected).lower()}"
+            f" fid_elapsed={_fmt(_safe_float(row.fid_elapsed_sec), 1)}s",
+            flush=True,
+        )
+        _write_combo_rows_summary(
+            summary_path,
+            combo_name=combo_name,
+            train_percent=train_percent,
+            seed=seed,
+            rows=rows,
+            run_state_path=run_state_path,
+            completed=False,
+        )
+
+    if resume_steps == 0 and 0 in checkpoint_set and not any(int(row.step) == 0 for row in rows):
+        baseline.eval()
+        _emit_checkpoint_row_mainline(step=0, loss_history=[])
+
+    for step in [int(v) for v in checkpoint_steps if int(v) > int(resume_steps)]:
+        cmd = build_mainline_baseline_segment_cmd(
+            python_bin=sys.executable,
+            run_dir=str(mainline_run_dir),
+            cfg=cfg,
+            target_steps=int(step),
+            resume_steps=int(resume_steps),
+        )
+        subprocess.run(cmd, check=True, cwd=str(_repo_root()))
+
+        target_kimg = steps_to_kimg_exact(int(step), int(cfg.batch_size), label="checkpoint_step")
+        snapshot_path = snapshot_path_for_kimg(str(mainline_run_dir), target_kimg)
+        if not os.path.isfile(snapshot_path):
+            raise RuntimeError(f"Expected mainline snapshot missing: {snapshot_path}")
+        ema_state = load_mainline_snapshot_ema_state_dict(snapshot_path)
+        load_mainline_ema_into_toy_model(baseline, ema_state)
+        baseline.eval()
+        loss_history = load_mainline_stats_loss_history(str(mainline_run_dir))
+        _emit_checkpoint_row_mainline(step=int(step), loss_history=loss_history)
+        resume_steps = int(step)
+
+    _write_combo_rows_summary(
+        summary_path,
+        combo_name=combo_name,
+        train_percent=train_percent,
+        seed=seed,
+        rows=rows,
+        run_state_path=run_state_path,
+        completed=True,
+    )
+    return rows
 
 
 def _run_combo(
@@ -1008,6 +1258,28 @@ def _run_combo(
         sigma_levels = build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
     model_bundle = build_model_bundle(cfg, dataset, sigma_data=cfg.sigma_data, device=device)
     baseline = model_bundle.baseline
+    if resolve_baseline_train_backend(cfg) == "mainline":
+        return _run_combo_mainline(
+            args=args,
+            cfg=cfg,
+            train_percent=train_percent,
+            seed=seed,
+            checkpoint_steps=checkpoint_steps,
+            fid_eval_steps=fid_eval_steps,
+            detector_net=detector_net,
+            mu_ref=mu_ref,
+            sigma_ref=sigma_ref,
+            weighted_calibration=weighted_calibration,
+            dataset=dataset,
+            sigma_levels=sigma_levels,
+            baseline=baseline,
+            device=device,
+            amp_dtype=amp_dtype,
+            combo_name=combo_name,
+            combo_dir=combo_dir,
+            summary_path=summary_path,
+            run_state_path=run_state_path,
+        )
 
     optimizer = torch.optim.Adam(baseline.parameters(), lr=cfg.lr_theta)
     grad_scaler = None
@@ -1346,8 +1618,20 @@ def build_parser():
     parser.add_argument("--image-channels", type=int, default=1)
     parser.add_argument("--mnist-val-percent", type=float, default=100.0)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--baseline-train-batch-gpu", type=int, default=ToyConfig.baseline_train_batch_gpu)
     parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
+    parser.add_argument(
+        "--image-backbone",
+        type=str,
+        default=ToyConfig.image_backbone,
+        choices=["conv", "songunet", "ddpmpp"],
+    )
+    parser.add_argument(
+        "--baseline-train-backend",
+        type=str,
+        default=ToyConfig.baseline_train_backend,
+        choices=list(SUPPORTED_BASELINE_TRAIN_BACKENDS),
+    )
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong", "plain"])
     parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)

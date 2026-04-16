@@ -3,6 +3,8 @@ import math
 import os
 import random
 import hashlib
+import subprocess
+import sys
 import uuid
 import time
 from dataclasses import replace
@@ -52,6 +54,16 @@ from ..metrics import (
     compute_x0_recovery_vs_terminal_step,
     evaluate_nearest_reference_distance,
     summarize_attack_gap_windows,
+)
+from ..mainline_baseline import (
+    build_mainline_baseline_segment_cmd,
+    load_mainline_ema_into_toy_model,
+    load_mainline_snapshot_ema_state_dict,
+    load_mainline_stats_loss_history,
+    resolve_baseline_train_backend,
+    resolve_baseline_train_batch_gpu,
+    snapshot_path_for_kimg,
+    steps_to_kimg_exact,
 )
 from ..shared.reverse import generated_data_path_index_from_denoiser, sample_rectified_flow_paths_from_source
 from ..trainer import reverse_paths_from_terminal, sample_reverse_paths, train_baseline
@@ -741,6 +753,47 @@ def _empty_baseline_history() -> Dict:
     return history
 
 
+def _train_baseline_via_mainline_backend(
+    *,
+    baseline_model,
+    cfg,
+    exp_dir: str,
+) -> tuple[Dict[str, Any], torch.nn.Module]:
+    """Train the image EDM baseline via the repo's main training loop, then reuse toy eval."""
+
+    if int(getattr(cfg, "steps", 0)) <= 0:
+        history = _empty_baseline_history()
+        baseline_model.eval()
+        return history, baseline_model
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    run_dir = os.path.join(exp_dir, "_mainline_baseline")
+    ensure_dir(run_dir)
+    cmd = build_mainline_baseline_segment_cmd(
+        python_bin=sys.executable,
+        run_dir=run_dir,
+        cfg=cfg,
+        target_steps=int(cfg.steps),
+        resume_steps=0,
+    )
+    subprocess.run(cmd, check=True, cwd=repo_root)
+
+    target_kimg = steps_to_kimg_exact(int(cfg.steps), int(cfg.batch_size), label="baseline_steps")
+    snapshot_path = snapshot_path_for_kimg(run_dir, target_kimg)
+    if not os.path.isfile(snapshot_path):
+        raise RuntimeError(f"Mainline baseline snapshot missing after training: {snapshot_path}")
+
+    ema_state_dict = load_mainline_snapshot_ema_state_dict(snapshot_path)
+    load_mainline_ema_into_toy_model(baseline_model, ema_state_dict)
+    baseline_model.eval()
+
+    loss_history = load_mainline_stats_loss_history(run_dir)
+    history = _empty_baseline_history()
+    history["loss"] = [float(v) for v in loss_history]
+    history["proxy_weighted_denoise_loss"] = [float(v) for v in loss_history]
+    return history, baseline_model
+
+
 def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_levels: torch.Tensor) -> Dict:
     """Build a strict signature for fair baseline checkpoint reuse."""
 
@@ -764,6 +817,8 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
         "val_subset_size_resolved": dataset.metadata.get("val_subset_size_resolved"),
         "train_subset_fraction_resolved": dataset.metadata.get("train_subset_fraction_resolved"),
         "model_backend": str(model_bundle.name),
+        "baseline_train_backend": resolve_baseline_train_backend(cfg),
+        "baseline_train_batch_gpu": resolve_baseline_train_batch_gpu(cfg),
         "hidden_dim": int(cfg.hidden_dim),
         "training_objective": str(cfg.training_objective),
         "sigma_data": float(cfg.sigma_data),
@@ -924,6 +979,20 @@ def _resolve_phase_steps(
     wdro_warmup_weighted_compute_fraction = None
     wdro_robust_step_weighted_units = None
     cdro_robust_step_weighted_units = None
+
+    if bool(getattr(cfg, "baseline_only", False)):
+        return {
+            "total_steps": int(total_steps),
+            "baseline_steps": int(total_steps),
+            "robust_steps": 0,
+            "split_mode": "baseline_only_full_budget",
+            "wdro_warmup_compute_fraction": None,
+            "wdro_warmup_weighted_compute_fraction": None,
+            "wdro_robust_step_batch_equiv": None,
+            "wdro_robust_step_weighted_compute_units": None,
+            "cdro_robust_step_batch_equiv": None,
+            "cdro_robust_step_weighted_compute_units": None,
+        }
 
     if str(method_name).lower() == "wdro":
         split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
@@ -1574,6 +1643,8 @@ def run_experiment(cfg) -> dict:
         )
     if cfg.sigma_data <= 0:
         cfg.sigma_data = dataset.estimate_sigma_data()
+    cfg_baseline.sigma_data = float(cfg.sigma_data)
+    cfg_robust.sigma_data = float(cfg.sigma_data)
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
@@ -1721,16 +1792,23 @@ def run_experiment(cfg) -> dict:
     if not baseline_restored_from_robust_resume and not baseline_ckpt_loaded:
         t_phase = time.perf_counter()
         if baseline_steps_for_phase > 0:
-            history_baseline, baseline_eval = train_baseline(
-                baseline,
-                centers,
-                baseline_sigma_levels,
-                cfg_baseline,
-                train_pool=dataset.train_pool,
-                sample_train_batch_fn=dataset.sample_train_batch,
-                sample_population_batch_fn=dataset.sample_population_batch,
-                sample_terminal_batch_fn=dataset.sample_terminal_batch,
-            )
+            if resolve_baseline_train_backend(cfg_baseline) == "mainline":
+                history_baseline, baseline_eval = _train_baseline_via_mainline_backend(
+                    baseline_model=baseline,
+                    cfg=cfg_baseline,
+                    exp_dir=exp_dir,
+                )
+            else:
+                history_baseline, baseline_eval = train_baseline(
+                    baseline,
+                    centers,
+                    baseline_sigma_levels,
+                    cfg_baseline,
+                    train_pool=dataset.train_pool,
+                    sample_train_batch_fn=dataset.sample_train_batch,
+                    sample_population_batch_fn=dataset.sample_population_batch,
+                    sample_terminal_batch_fn=dataset.sample_terminal_batch,
+                )
             runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
             if baseline_ckpt_enabled:
                 t_phase = time.perf_counter()
@@ -2206,6 +2284,8 @@ def run_experiment(cfg) -> dict:
         "flow_debug": {
             "flow_mode": flow_mode,
             "baseline_only": bool(cfg.baseline_only),
+            "baseline_train_backend": resolve_baseline_train_backend(cfg),
+            "baseline_train_batch_gpu": resolve_baseline_train_batch_gpu(cfg),
             "baseline_gate_enabled": bool(cfg.baseline_gate_enabled),
             "baseline_gate_error_on_fail": bool(cfg.baseline_gate_error_on_fail),
             "outer_attack_weight": float(cfg.outer_attack_weight),

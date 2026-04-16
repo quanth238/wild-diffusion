@@ -228,8 +228,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-percent-label", type=str, default="5%")
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--baseline-train-batch-gpu", type=int, default=0)
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--image-backbone", type=str, default="conv", choices=["conv", "songunet"])
+    parser.add_argument("--image-backbone", type=str, default="conv", choices=["conv", "songunet", "ddpmpp"])
+    parser.add_argument("--baseline-train-backend", type=str, default="toy", choices=["toy", "mainline"])
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong", "plain"])
     parser.add_argument("--rf-stage1-fraction", type=float, default=0.5)
@@ -925,6 +927,8 @@ def _build_posthoc_reeval_cmd(
         str(args.image_split_seed),
         "--batch-size",
         str(args.batch_size),
+        "--baseline-train-batch-gpu",
+        str(args.baseline_train_batch_gpu),
         "--hidden-dim",
         str(args.hidden_dim),
         "--image-backbone",
@@ -1722,6 +1726,8 @@ def _build_baseline_sweep_cmd(
         str(args.hidden_dim),
         "--image-backbone",
         str(args.image_backbone),
+        "--baseline-train-backend",
+        str(args.baseline_train_backend),
         "--training-objective",
         str(args.training_objective),
         "--n-steps-path",
@@ -1787,6 +1793,8 @@ def _build_run_toy_cmd(
         str(int(total_steps)),
         "--batch-size",
         str(args.batch_size),
+        "--baseline-train-batch-gpu",
+        str(args.baseline_train_batch_gpu),
         "--log-every",
         str(args.log_every),
         "--eval-samples",
@@ -1803,6 +1811,8 @@ def _build_run_toy_cmd(
         str(args.hidden_dim),
         "--image-backbone",
         str(args.image_backbone),
+        "--baseline-train-backend",
+        str(args.baseline_train_backend),
         "--dataset-kind",
         "image_folder",
         "--model-kind",

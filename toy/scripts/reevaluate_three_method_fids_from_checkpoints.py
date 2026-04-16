@@ -151,7 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
+    parser.add_argument(
+        "--image-backbone",
+        type=str,
+        default=ToyConfig.image_backbone,
+        choices=["conv", "songunet", "ddpmpp"],
+    )
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=50000)
     parser.add_argument("--fid-batch-size", type=int, default=DEFAULT_FID_BATCH_SIZE)

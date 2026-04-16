@@ -3,6 +3,11 @@ import math
 from typing import Optional, Sequence
 
 from ..config import ToyConfig
+from ..mainline_baseline import (
+    SUPPORTED_BASELINE_TRAIN_BACKENDS,
+    resolve_baseline_train_batch_gpu,
+    validate_mainline_baseline_request,
+)
 from ..versions.registry import SUPPORTED_METHOD_VERSIONS
 
 
@@ -13,10 +18,20 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--method-version must be one of {SUPPORTED_METHOD_VERSIONS}, got {cfg.method_version}"
         )
-    if str(cfg.image_backbone).lower() not in ("conv", "songunet"):
+    if str(cfg.image_backbone).lower() not in ("conv", "songunet", "ddpmpp"):
         raise ValueError(
-            f"--image-backbone must be one of ('conv', 'songunet'), got {cfg.image_backbone}"
+            f"--image-backbone must be one of ('conv', 'songunet', 'ddpmpp'), got {cfg.image_backbone}"
         )
+    if str(cfg.image_backbone).lower() == "ddpmpp" and int(cfg.hidden_dim) != 128:
+        raise ValueError(
+            f"--hidden-dim must be 128 when --image-backbone=ddpmpp, got {cfg.hidden_dim}"
+        )
+    if str(cfg.baseline_train_backend).lower() not in SUPPORTED_BASELINE_TRAIN_BACKENDS:
+        raise ValueError(
+            f"--baseline-train-backend must be one of {SUPPORTED_BASELINE_TRAIN_BACKENDS}, "
+            f"got {cfg.baseline_train_backend}"
+        )
+    validate_mainline_baseline_request(cfg)
     if str(cfg.amp_dtype).lower() not in ("auto", "off", "bf16", "bfloat16", "fp16", "float16", "half"):
         raise ValueError(
             "--amp-dtype must be one of "
@@ -27,6 +42,17 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(f"--steps must be >= 0, got {cfg.steps}")
     if cfg.batch_size <= 0:
         raise ValueError(f"--batch-size must be > 0, got {cfg.batch_size}")
+    if int(getattr(cfg, "baseline_train_batch_gpu", 0)) < 0:
+        raise ValueError(
+            "--baseline-train-batch-gpu must be >= 0, "
+            f"got {cfg.baseline_train_batch_gpu}"
+        )
+    batch_gpu = resolve_baseline_train_batch_gpu(cfg)
+    if batch_gpu is not None and batch_gpu > int(cfg.batch_size):
+        raise ValueError(
+            "--baseline-train-batch-gpu must be <= --batch-size, "
+            f"got batch_gpu={batch_gpu}, batch_size={cfg.batch_size}"
+        )
     if cfg.baseline_ckpt_path and not isinstance(cfg.baseline_ckpt_path, str):
         raise ValueError("--baseline-ckpt-path must be a string path.")
     if cfg.robust_resume_ckpt_path and not isinstance(cfg.robust_resume_ckpt_path, str):
@@ -215,7 +241,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--dataset-kind", type=str, default=ToyConfig.dataset_kind)
     parser.add_argument("--model-kind", type=str, default=ToyConfig.model_kind)
-    parser.add_argument("--image-backbone", type=str, default=ToyConfig.image_backbone, choices=["conv", "songunet"])
+    parser.add_argument(
+        "--image-backbone",
+        type=str,
+        default=ToyConfig.image_backbone,
+        choices=["conv", "songunet", "ddpmpp"],
+    )
+    parser.add_argument(
+        "--baseline-train-backend",
+        type=str,
+        default=ToyConfig.baseline_train_backend,
+        choices=list(SUPPORTED_BASELINE_TRAIN_BACKENDS),
+    )
     parser.add_argument("--diagnostics-kind", type=str, default=ToyConfig.diagnostics_kind)
     parser.add_argument("--dataset-path", type=str, default=ToyConfig.dataset_path)
     parser.add_argument("--dataset-val-path", type=str, default=ToyConfig.dataset_val_path)
@@ -242,6 +279,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--steps", type=int, default=ToyConfig.steps)
     parser.add_argument("--batch-size", type=int, default=ToyConfig.batch_size)
+    parser.add_argument("--baseline-train-batch-gpu", type=int, default=ToyConfig.baseline_train_batch_gpu)
     parser.add_argument("--log-every", type=int, default=ToyConfig.log_every)
     parser.add_argument("--eval-samples", type=int, default=ToyConfig.eval_samples)
     parser.add_argument("--debug-eval-batch", type=int, default=ToyConfig.debug_eval_batch)
