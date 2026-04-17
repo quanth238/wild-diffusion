@@ -2715,6 +2715,14 @@ def main() -> None:
                     checkpoint_entry["fid_evaluated"] = bool(_optional_bool(row.get("fid_evaluated")))
                     checkpoint_entry["fid_missing_reason"] = str(row.get("fid_missing_reason", ""))
                     checkpoint_entry["fid_source"] = str(row.get("fid_source", ""))
+                    checkpoint_entry["edm_clean_probe"] = _optional_float(row.get("edm_clean_probe"))
+                    checkpoint_entry["edm_clean_probe_evaluated"] = bool(
+                        _optional_bool(row.get("edm_clean_probe_evaluated"))
+                    )
+                    checkpoint_entry["edm_clean_probe_missing_reason"] = str(
+                        row.get("edm_clean_probe_missing_reason", "")
+                    )
+                    checkpoint_entry["edm_clean_probe_source"] = str(row.get("edm_clean_probe_source", ""))
                     if row.get("reeval_metrics_path"):
                         checkpoint_entry["reeval_metrics_path"] = str(row.get("reeval_metrics_path"))
                     if row.get("reeval_log_path"):
