@@ -160,7 +160,12 @@ def build_rows(args: argparse.Namespace):
     requested_kimg = parse_kimg_list(args.kimg)
     snapshot_kimg = requested_kimg if requested_kimg else discover_snapshot_kimg(cdro_run_dir)
     warmup_kimg = int(round(float(warmup_summary["warmup_kimg"])))
-    snapshot_kimg = [value for value in snapshot_kimg if int(value) > warmup_kimg]
+    if requested_kimg:
+        snapshot_kimg = [
+            value for value in snapshot_kimg if int(value) > warmup_kimg or int(value) == warmup_kimg
+        ]
+    else:
+        snapshot_kimg = [value for value in snapshot_kimg if int(value) > warmup_kimg]
     if not snapshot_kimg:
         raise RuntimeError(f"No robust-phase snapshots found in {cdro_run_dir}")
 
@@ -193,12 +198,34 @@ def build_rows(args: argparse.Namespace):
         snapshot = cdro_run_dir / f"network-snapshot-{int(kimg):06d}.pkl"
         if not snapshot.is_file():
             raise FileNotFoundError(f"Missing snapshot: {snapshot}")
-        trace_row = match_trace_row_for_snapshot(trace, int(kimg))
-        actual_progress_kimg = float(trace_row["kimg"])
-        robust_steps = max(int(round((actual_progress_kimg - float(warmup_kimg)) * 1000.0 / float(args.batch_size))), 0)
-        robust_wcu = float(robust_steps) * float(robust_step_wcu)
-        robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
-        total_sec = float(warmup_sec + trace_row["total_sec"])
+        if int(kimg) == warmup_kimg:
+            trace_row = {
+                "kimg": float(warmup_kimg),
+                "total_sec": 0.0,
+                "loss": None,
+                "cdro_edm_clean_probe": None,
+                "cdro_outer_loss": None,
+                "cdro_outer_loss_attack": None,
+                "cdro_outer_loss_clean": None,
+                "cdro_delta_ratio_mean": None,
+            }
+            actual_progress_kimg = float(warmup_kimg)
+            robust_steps = 0
+            robust_wcu = 0.0
+            robust_compute_be = 0.0
+            total_sec = float(warmup_sec)
+            row_origin = "baseline_warmup_boundary"
+        else:
+            trace_row = match_trace_row_for_snapshot(trace, int(kimg))
+            actual_progress_kimg = float(trace_row["kimg"])
+            robust_steps = max(
+                int(round((actual_progress_kimg - float(warmup_kimg)) * 1000.0 / float(args.batch_size))),
+                0,
+            )
+            robust_wcu = float(robust_steps) * float(robust_step_wcu)
+            robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
+            total_sec = float(warmup_sec + trace_row["total_sec"])
+            row_origin = "trajectory_robust_phase"
         eval_tag = f"cdro_kimg{int(kimg):06d}"
         loss_final = trace_row["cdro_outer_loss"]
         if loss_final is None:
@@ -210,7 +237,7 @@ def build_rows(args: argparse.Namespace):
                 "step": int(kimg),
                 "snapshot_kimg": int(kimg),
                 "images_shown_m": float(actual_progress_kimg) / 1000.0,
-                "row_origin": "trajectory_robust_phase",
+                "row_origin": row_origin,
                 "run_dir": str(cdro_run_dir),
                 "network_pkl": str(snapshot),
                 "metrics_path": str(cdro_run_dir / "stats.jsonl"),
