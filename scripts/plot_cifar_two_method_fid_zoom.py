@@ -10,14 +10,16 @@ import matplotlib.pyplot as plt
 STYLE = {
     "baseline": {"label": "Baseline EDM", "color": "tab:blue"},
     "wild_diffusion": {"label": "Wild-Diffusion EDM", "color": "tab:orange"},
+    "cdro": {"label": "CDRO EDM", "color": "tab:green"},
 }
+STYLE_ORDER = ["baseline", "wild_diffusion", "cdro"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Plot a zoomed dual FID comparison for CIFAR baseline vs WDRO "
-            "using the coarse manifest."
+            "Plot a zoomed FID comparison for CIFAR baseline and robust "
+            "variants using a merged comparison CSV."
         )
     )
     parser.add_argument("--manifest-csv", type=str, required=True)
@@ -102,10 +104,12 @@ def plot_zoom(
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
     baseline_zoom_rows = [
-        row for row in rows if row["robust_method"] == "baseline" and float(row["step"]) >= float(baseline_zoom_start_kimg)
+        row
+        for row in rows
+        if row["robust_method"] == "baseline" and float(row["step"]) >= float(baseline_zoom_start_kimg)
     ]
-    wdro_rows = [row for row in rows if row["robust_method"] == "wild_diffusion"]
-    zoom_rows = baseline_zoom_rows + wdro_rows
+    robust_rows = [row for row in rows if row["robust_method"] != "baseline"]
+    zoom_rows = baseline_zoom_rows + robust_rows
     if not zoom_rows:
         raise RuntimeError("No rows available for zoomed FID plot.")
 
@@ -123,7 +127,8 @@ def plot_zoom(
         x_min = min(x_vals)
         x_max = max(x_vals)
         x_pad = max((x_max - x_min) * 0.05, 1.0)
-        for robust_method, style in STYLE.items():
+        for robust_method in STYLE_ORDER:
+            style = STYLE[robust_method]
             method_rows = [row for row in zoom_rows if row["robust_method"] == robust_method]
             method_rows.sort(key=lambda row: float(row[x_key]))
             if not method_rows:
@@ -136,14 +141,14 @@ def plot_zoom(
                 color=style["color"],
                 label=style["label"],
             )
-        if wdro_rows:
+        if robust_rows:
             boundary = (
-                wdro_rows[0]["baseline_train_wall_clock_sec_effective"]
+                robust_rows[0]["baseline_train_wall_clock_sec_effective"]
                 if x_key == "train_wall_clock_sec"
-                else wdro_rows[0]["baseline_weighted_compute_units"]
+                else robust_rows[0]["baseline_weighted_compute_units"]
             )
             if boundary not in ("", None):
-                ax.axvline(float(boundary), color="tab:orange", alpha=0.45, label="Wild-Diffusion warmup end")
+                ax.axvline(float(boundary), color="tab:orange", alpha=0.45, label="Robust warmup end")
         ax.set_xlabel(x_label)
         ax.set_ylabel("FID")
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
@@ -152,7 +157,7 @@ def plot_zoom(
         ax.grid(True, alpha=0.3)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=3, frameon=False)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=4, frameon=False)
     fig.suptitle(f"{dataset_label} {train_percent_label}: FID Comparison (Zoomed)", y=1.03)
     fig.tight_layout(rect=[0, 0, 1, 0.9])
     out_png.parent.mkdir(parents=True, exist_ok=True)
