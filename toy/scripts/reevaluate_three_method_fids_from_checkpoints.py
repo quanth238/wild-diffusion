@@ -83,6 +83,7 @@ def _is_stochastic_cdro_eval(cfg: ToyConfig, method_name: str) -> bool:
     return (
         _canonical_method_name(method_name) == "cdro"
         and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf"
+        and bool(getattr(cfg, "cdro_eval_stochastic_ladders", False))
         and str(
             getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
         ).strip().lower()
@@ -91,22 +92,12 @@ def _is_stochastic_cdro_eval(cfg: ToyConfig, method_name: str) -> bool:
 
 
 def _build_eval_sigma_levels(cfg: ToyConfig, *, device: torch.device, method_name: str) -> torch.Tensor:
-    canonical_method = _canonical_method_name(method_name)
     if str(cfg.training_objective).strip().lower() == "rf":
         return build_rf_time_quantile_levels(
             float(cfg.sigma_max),
             int(cfg.n_steps_path),
             device=device,
             distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-        )
-    if canonical_method == "cdro":
-        return build_sigma_levels_from_warmup_quantiles(
-            float(cfg.sigma_min),
-            float(cfg.sigma_max),
-            int(cfg.n_steps_path),
-            device=device,
-            p_mean=float(getattr(cfg, "p_mean", -1.2)),
-            p_std=float(getattr(cfg, "p_std", 1.2)),
         )
     return build_sigma_levels(float(cfg.sigma_min), float(cfg.sigma_max), int(cfg.n_steps_path), device=device)
 
@@ -175,6 +166,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edm-clean-probe-batches", type=int, default=DEFAULT_EDM_CLEAN_PROBE_BATCHES)
     parser.add_argument("--edm-clean-probe-batch-size", type=int, default=256)
     parser.add_argument("--n-steps-path-default", type=int, default=32)
+    parser.add_argument("--cdro-eval-stochastic-ladders", action="store_true")
+    parser.add_argument("--respect-row-n-steps-path", action="store_true")
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
     parser.add_argument("--metrics-eval-seed-offset", type=int, default=ToyConfig.eval_seed_offset_metrics)
@@ -515,6 +508,7 @@ def _base_cfg_from_args(args: argparse.Namespace) -> ToyConfig:
     cfg.eval_samples = int(args.eval_samples)
     cfg.fid_samples = int(args.fid_samples)
     cfg.n_steps_path = int(args.n_steps_path_default)
+    cfg.cdro_eval_stochastic_ladders = bool(args.cdro_eval_stochastic_ladders)
     cfg.sigma_min = float(args.sigma_min)
     cfg.sigma_max = float(args.sigma_max)
     cfg.training_objective = "edm"
@@ -532,6 +526,7 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "auto_log_normal_params",
         "batch_size",
         "cdro_edm_ladder_mode",
+        "cdro_eval_stochastic_ladders",
         "cudnn_benchmark",
         "dataset_kind",
         "dataset_path",
@@ -578,9 +573,11 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
         source_cfg = payload.get("config", {})
         if isinstance(source_cfg, dict):
             _apply_cfg_overrides(cfg, source_cfg)
+    if not bool(args.respect_row_n_steps_path):
+        cfg.n_steps_path = int(args.n_steps_path_default)
     if row.get("training_objective"):
         cfg.training_objective = str(row.get("training_objective"))
-    if row.get("n_steps_path"):
+    if bool(args.respect_row_n_steps_path) and row.get("n_steps_path"):
         cfg.n_steps_path = _safe_int(row.get("n_steps_path"), cfg.n_steps_path)
     if row.get("sigma_min"):
         sigma_min = _safe_float(row.get("sigma_min"))
@@ -625,6 +622,7 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str)
         float(getattr(cfg, "sigma_data", -1.0)),
         bool(getattr(cfg, "use_log_normal_sigma_sampling", True)),
         str(getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)),
+        bool(getattr(cfg, "cdro_eval_stochastic_ladders", False)),
         str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         bool(getattr(cfg, "allow_tf32", True)),
         bool(getattr(cfg, "cudnn_benchmark", True)),
@@ -730,6 +728,48 @@ def _maybe_extract_cached_reeval(metrics_path: str, row: Dict[str, str]) -> Opti
         return _extract_cached_reeval(metrics_path, row)
     except Exception:
         return None
+
+
+def _cached_reeval_matches_request(
+    metrics_path: str,
+    *,
+    args: argparse.Namespace,
+    row: Dict[str, str],
+    cfg: ToyConfig,
+) -> bool:
+    if not os.path.isfile(metrics_path):
+        return False
+    try:
+        payload = _load_json(metrics_path)
+    except Exception:
+        return False
+
+    config = payload.get("config", {})
+    metrics = payload.get("metrics", {})
+    sample_quality = metrics.get("sample_quality_debug", {})
+    flow_debug = metrics.get("flow_debug", {})
+    if not isinstance(config, dict) or not isinstance(sample_quality, dict) or not isinstance(flow_debug, dict):
+        return False
+
+    expected_stochastic_cdro_eval = _is_stochastic_cdro_eval(cfg, str(row.get("method", "")))
+    expected_probe_enabled = not bool(args.disable_edm_clean_probe)
+    expected_n_steps_path = int(cfg.n_steps_path)
+    expected_fid_samples = int(args.fid_samples)
+    expected_fid_batch_size = max(int(args.fid_batch_size), 1)
+    expected_probe_split = str(args.edm_clean_probe_split)
+    expected_probe_batches = int(max(args.edm_clean_probe_batches, 0))
+    expected_probe_batch_size = int(max(args.edm_clean_probe_batch_size, 0))
+
+    return (
+        _safe_int(config.get("n_steps_path"), -1) == expected_n_steps_path
+        and _safe_bool(config.get("edm_clean_probe_enabled"), default=False) == expected_probe_enabled
+        and str(config.get("edm_clean_probe_split", "")) == expected_probe_split
+        and _safe_int(config.get("edm_clean_probe_batches"), -1) == expected_probe_batches
+        and _safe_int(config.get("edm_clean_probe_batch_size"), -1) == expected_probe_batch_size
+        and _safe_int(sample_quality.get("fid_samples"), -1) == expected_fid_samples
+        and _safe_int(sample_quality.get("fid_batch_size"), -1) == expected_fid_batch_size
+        and _safe_bool(flow_debug.get("stochastic_cdro_eval"), default=False) == expected_stochastic_cdro_eval
+    )
 
 
 def _summarize_probe_values(values: List[float]) -> Dict[str, object]:
@@ -1210,7 +1250,15 @@ def main() -> None:
             exp_name = _exp_name_from_row(args.prefix, row, row_index)
             metrics_path = os.path.join(eval_runs_dir, exp_name, "metrics.json")
             log_path = os.path.join(logs_dir, f"{exp_name}.log")
+            request_cfg = _config_from_row(args, row)
             existing_cached = _maybe_extract_cached_reeval(metrics_path, row)
+            if existing_cached is not None and not _cached_reeval_matches_request(
+                metrics_path,
+                args=args,
+                row=row,
+                cfg=request_cfg,
+            ):
+                existing_cached = None
             probe_needed = bool(
                 not args.disable_edm_clean_probe
                 and (
@@ -1227,8 +1275,6 @@ def main() -> None:
                 existing_fid_value = None
                 if existing_cached is not None:
                     existing_fid_value = _safe_float(existing_cached.get("fid"))
-                if existing_fid_value is None:
-                    existing_fid_value = _safe_float(row.get("fid"))
                 cached_metrics = _evaluate_checkpoint_metrics(
                     args=args,
                     row=row,

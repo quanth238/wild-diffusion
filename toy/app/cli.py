@@ -403,6 +403,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ToyConfig.cdro_per_example_sigma_ladders,
     )
     parser.add_argument("--disable-cdro-per-example-sigma-ladders", action="store_true")
+    parser.add_argument(
+        "--cdro-eval-stochastic-ladders",
+        action="store_true",
+        default=ToyConfig.cdro_eval_stochastic_ladders,
+    )
     parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--v21-rho", type=float, default=ToyConfig.v21_rho)

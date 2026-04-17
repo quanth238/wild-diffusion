@@ -145,6 +145,7 @@ def _use_stochastic_cdro_eval_ladders(cfg, method_name: str) -> bool:
     return (
         str(method_name).strip().lower() == "cdro"
         and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf"
+        and bool(getattr(cfg, "cdro_eval_stochastic_ladders", False))
         and str(
             getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)
         ).strip().lower()
