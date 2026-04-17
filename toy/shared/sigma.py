@@ -107,6 +107,55 @@ def sample_rf_time_stratified_levels(
     return sigma_levels
 
 
+def sample_rf_time_stratified_levels_batch(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    batch_size: int,
+    distribution: str = "u_shaped",
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Sample one independent stratified RF time ladder per batch element."""
+
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    sigma_max_value = float(sigma_max)
+    if sigma_max_value <= 0.0:
+        raise ValueError(f"sigma_max must be > 0 for RF time levels, got {sigma_max}")
+    out_dtype = torch.float32 if dtype is None else dtype
+    jitter = torch.empty((int(batch_size), int(n_steps)), dtype=torch.float64, device=device).uniform_(
+        1e-12,
+        1.0 - 1e-12,
+    )
+    strata = torch.arange(0, int(n_steps), dtype=torch.float64, device=device).view(1, int(n_steps))
+    probs = (strata + jitter) / float(n_steps)
+    mode = str(distribution).strip().lower()
+    if mode == "u_shaped":
+        t_positive = torch.sin(0.5 * math.pi * probs).square()
+    elif mode == "uniform":
+        t_positive = probs
+    else:
+        raise ValueError(
+            f"Unsupported RF time distribution '{distribution}'. Expected one of: u_shaped, uniform."
+        )
+    if t_positive.shape[1] > 1 and not torch.all(t_positive[:, 1:] > t_positive[:, :-1]):
+        raise ValueError("Per-example stratified RF time ladders must be strictly increasing.")
+    sigma_levels = torch.cat(
+        [
+            torch.zeros((int(batch_size), 1), dtype=torch.float64, device=device),
+            t_positive * sigma_max_value,
+        ],
+        dim=1,
+    ).to(device=device, dtype=out_dtype)
+    positive_out = sigma_levels[:, 1:]
+    if positive_out.shape[1] > 1 and not torch.all(positive_out[:, 1:] > positive_out[:, :-1]):
+        raise ValueError("Per-example stratified RF time ladders must remain strictly increasing after dtype conversion.")
+    return sigma_levels
+
+
 def resolve_rf_stage_t_distribution(
     stage_name: str,
     *,
@@ -171,6 +220,32 @@ def sample_rf_stage_time_stratified_levels(
         sigma_max,
         n_steps,
         device,
+        distribution=distribution,
+        dtype=dtype,
+    )
+
+
+def sample_rf_stage_time_stratified_levels_batch(
+    sigma_max: float,
+    n_steps: int,
+    device: torch.device,
+    *,
+    batch_size: int,
+    stage_name: str,
+    reflow_distribution: str = "u_shaped",
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Sample one stratified RF time ladder per batch element aligned to the clean stage law."""
+
+    distribution = resolve_rf_stage_t_distribution(
+        stage_name,
+        reflow_distribution=reflow_distribution,
+    )
+    return sample_rf_time_stratified_levels_batch(
+        sigma_max,
+        n_steps,
+        device,
+        batch_size=batch_size,
         distribution=distribution,
         dtype=dtype,
     )

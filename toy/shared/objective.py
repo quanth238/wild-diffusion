@@ -33,9 +33,11 @@ def rf_time_levels_from_sigma_levels(
 ) -> torch.Tensor:
     """Build normalized RF time levels from the existing sigma ladder."""
 
-    if sigma_levels.numel() < 2:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
-    sigma_max_value = max(float(sigma_levels[-1].item()), 1e-8)
+    if sigma_levels.ndim not in (1, 2):
+        raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
+    if sigma_levels.shape[-1] < 2:
+        raise ValueError(f"sigma_levels must contain at least 2 values, got shape={tuple(sigma_levels.shape)}")
+    sigma_max_value = max(float(sigma_levels[..., -1].max().item()), 1e-8)
     return (sigma_levels / sigma_max_value).clamp(0.0, 1.0)
 
 

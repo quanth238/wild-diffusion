@@ -14,6 +14,7 @@ from ...shared.sigma import (
     resolve_rf_stage_t_distribution,
     sample_log_sigma_stratified_quantile_ladder,
     sample_log_sigma_stratified_quantile_ladder_batch,
+    sample_rf_stage_time_stratified_levels_batch,
     sample_rf_stage_time_stratified_levels,
     sample_target_indices,
     sample_target_indices_log_normal,
@@ -187,6 +188,7 @@ def _sample_rf_cdro_stage_grid_info(
     dtype: torch.dtype,
     time_horizon: float,
     stage_name: str,
+    batch_size: int,
 ) -> dict:
     """Sample one stratified RF rollout grid aligned to the clean stage law."""
 
@@ -194,14 +196,25 @@ def _sample_rf_cdro_stage_grid_info(
         stage_name,
         reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
     )
-    sigma_levels = sample_rf_stage_time_stratified_levels(
-        float(getattr(cfg, "sigma_max", 1.0)),
-        int(getattr(cfg, "n_steps_path", 1)),
-        device=device,
-        stage_name=stage_name,
-        reflow_distribution=distribution,
-        dtype=dtype,
-    ).to(device=device, dtype=dtype)
+    if bool(getattr(cfg, "cdro_per_example_sigma_ladders", True)):
+        sigma_levels = sample_rf_stage_time_stratified_levels_batch(
+            float(getattr(cfg, "sigma_max", 1.0)),
+            int(getattr(cfg, "n_steps_path", 1)),
+            device=device,
+            batch_size=int(batch_size),
+            stage_name=stage_name,
+            reflow_distribution=distribution,
+            dtype=dtype,
+        ).to(device=device, dtype=dtype)
+    else:
+        sigma_levels = sample_rf_stage_time_stratified_levels(
+            float(getattr(cfg, "sigma_max", 1.0)),
+            int(getattr(cfg, "n_steps_path", 1)),
+            device=device,
+            stage_name=stage_name,
+            reflow_distribution=distribution,
+            dtype=dtype,
+        ).to(device=device, dtype=dtype)
     transition_deltas = build_transition_deltas_for_objective(
         cfg=cfg,
         sigma_levels=sigma_levels,
@@ -657,6 +670,7 @@ def train_trajectory_robust_cdro(
                 dtype=sigma_levels.dtype,
                 time_horizon=time_horizon,
                 stage_name=current_rf_stage,
+                batch_size=x0.shape[0],
             )
             current_sigma_levels = stage_grid["sigma_levels"]
             current_transition_deltas = stage_grid["transition_deltas"]
