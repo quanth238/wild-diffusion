@@ -59,6 +59,7 @@ DEFAULT_CALIBRATION = os.path.join(
     "simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json",
 )
 DEFAULT_FID_BATCH_SIZE = 512
+DEFAULT_FID_SAMPLES = int(ToyConfig.fid_samples)
 DEFAULT_EDM_CLEAN_PROBE_BATCHES = 8
 
 
@@ -156,7 +157,7 @@ def parse_args() -> argparse.Namespace:
         choices=["conv", "songunet", "ddpmpp"],
     )
     parser.add_argument("--eval-samples", type=int, default=2000)
-    parser.add_argument("--fid-samples", type=int, default=50000)
+    parser.add_argument("--fid-samples", type=int, default=DEFAULT_FID_SAMPLES)
     parser.add_argument("--fid-batch-size", type=int, default=DEFAULT_FID_BATCH_SIZE)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
     parser.add_argument("--debug-terminal-step", type=int, default=20)
