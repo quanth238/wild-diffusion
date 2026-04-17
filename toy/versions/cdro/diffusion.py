@@ -7,6 +7,7 @@ import torch
 from ...shared.objective import compute_training_loss, rf_time_levels_from_sigma_levels
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import build_log_sigma_quantile_ladder
+from ...utils import batch_scalar_like
 
 DETERMINISTIC_MIDPOINT_QUANTILE_LADDER = "deterministic_midpoint_quantile"
 STOCHASTIC_STRATIFIED_QUANTILE_LADDER = "stochastic_stratified_quantile"
@@ -46,6 +47,44 @@ def resolve_cdro_edm_ladder_mode(cfg) -> str:
     )
 
 
+def _num_path_steps(sigma_levels: torch.Tensor) -> int:
+    if sigma_levels.ndim not in (1, 2):
+        raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
+    return int(sigma_levels.shape[-1] - 1)
+
+
+def _step_scalar_vector(values: torch.Tensor, step_idx: int, *, batch_size: int, reference: torch.Tensor) -> torch.Tensor:
+    if values.ndim == 1:
+        return torch.full(
+            (batch_size,),
+            float(values[step_idx].item()),
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+    if values.ndim == 2:
+        return values[:, step_idx].to(device=reference.device, dtype=reference.dtype)
+    raise ValueError(f"values must be rank 1 or 2, got shape={tuple(values.shape)}")
+
+
+def _path_step_sigma_batch(sigma_levels: torch.Tensor, step_idx: int, x_ref: torch.Tensor) -> torch.Tensor:
+    return _step_scalar_vector(sigma_levels, step_idx, batch_size=x_ref.shape[0], reference=x_ref)
+
+
+def _step_scalar_like(values: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+    if values.ndim != 1:
+        raise ValueError(f"Expected rank-1 per-sample values, got shape={tuple(values.shape)}")
+    return batch_scalar_like(values, reference).to(device=reference.device, dtype=reference.dtype)
+
+
+def _gather_target_sigmas(sigma_levels: torch.Tensor, target_indices: torch.Tensor, x_ref: torch.Tensor) -> torch.Tensor:
+    if sigma_levels.ndim == 1:
+        return sigma_levels[target_indices].to(device=x_ref.device, dtype=x_ref.dtype)
+    if sigma_levels.ndim == 2:
+        batch_index = torch.arange(target_indices.shape[0], device=target_indices.device)
+        return sigma_levels[batch_index, target_indices].to(device=x_ref.device, dtype=x_ref.dtype)
+    raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
+
+
 def project_l2_ball(delta_raw: torch.Tensor, radius: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Project each sample in `delta_raw` onto an L2 ball with per-sample radius."""
 
@@ -68,7 +107,7 @@ def build_kappa_schedule(
 ) -> torch.Tensor:
     """Return per-transition control radius multipliers kappa_k for k->k+1."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
         raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
 
@@ -100,9 +139,9 @@ def build_tau_levels(
 ) -> torch.Tensor:
     """Build the positive continuation tau ladder from the actual sigma ladder."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        raise ValueError(f"sigma_levels must contain at least 2 ladder points, got shape={tuple(sigma_levels.shape)}")
     if time_horizon <= 0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
     if sigma_min <= 0.0 or sigma_max <= 0.0:
@@ -110,10 +149,10 @@ def build_tau_levels(
     if sigma_min >= sigma_max:
         raise ValueError(f"sigma_min must be < sigma_max, got {sigma_min} >= {sigma_max}")
 
-    positive_sigma = sigma_levels[1:]
+    positive_sigma = sigma_levels[..., 1:]
     if torch.any(positive_sigma <= 0):
         raise ValueError("sigma_levels[1:] must be strictly positive for the log-sigma CDRO clock.")
-    if positive_sigma.numel() > 1 and not torch.all(positive_sigma[1:] > positive_sigma[:-1]):
+    if positive_sigma.shape[-1] > 1 and not torch.all(positive_sigma[..., 1:] > positive_sigma[..., :-1]):
         raise ValueError("Continuation sigma ladder must be strictly increasing.")
 
     log_span = math.log(float(sigma_max)) - math.log(float(sigma_min))
@@ -123,7 +162,7 @@ def build_tau_levels(
     tau = float(time_horizon) * (positive_sigma.log() - math.log(float(sigma_min))) / log_span
     if torch.any(tau <= 0):
         raise ValueError("Continuation tau ladder must be strictly positive.")
-    if tau.numel() > 1 and not torch.all(tau[1:] > tau[:-1]):
+    if tau.shape[-1] > 1 and not torch.all(tau[..., 1:] > tau[..., :-1]):
         raise ValueError("Continuation tau ladder must be strictly increasing.")
     return tau
 
@@ -144,9 +183,9 @@ def build_time_deltas(
         sigma_max=sigma_max,
     )
     dt = torch.empty_like(tau)
-    dt[0] = tau[0]
-    if tau.numel() > 1:
-        dt[1:] = tau[1:] - tau[:-1]
+    dt[..., 0] = tau[..., 0]
+    if tau.shape[-1] > 1:
+        dt[..., 1:] = tau[..., 1:] - tau[..., :-1]
     if torch.any(dt <= 0):
         raise ValueError("All continuation transition sizes Delta_tau_k must be strictly positive.")
     return dt
@@ -160,9 +199,9 @@ def _build_rf_path_deltas(sigma_levels: torch.Tensor, *, sigma_max: Optional[flo
     else:
         sigma_max_value = max(float(sigma_max), 1e-8)
         t_levels = (sigma_levels / sigma_max_value).clamp(0.0, 1.0)
-    dt = t_levels[1:] - t_levels[:-1]
-    total = float(dt.sum().item())
-    if total <= 0.0:
+    dt = t_levels[..., 1:] - t_levels[..., :-1]
+    total = dt.sum(dim=-1) if dt.ndim == 2 else dt.sum()
+    if torch.any(total <= 0):
         raise ValueError("RF time grid must have positive total length.")
     return dt
 
@@ -178,9 +217,9 @@ def build_transition_deltas_for_objective(
     if _is_rf_objective(cfg):
         dt = _build_rf_path_deltas(
             sigma_levels,
-            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[..., -1].max().item()))),
         )
-        total = float(dt.sum().item())
+        total = dt.sum(dim=-1, keepdim=True) if dt.ndim == 2 else dt.sum()
         return dt * (float(time_horizon) / total)
     ladder_mode = resolve_cdro_edm_ladder_mode(cfg)
     if ladder_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER:
@@ -215,7 +254,9 @@ def _build_checked_warmup_quantile_ladder(
 ):
     """Build the config-implied warmup ladder and assert it matches runtime sigma levels."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    if sigma_levels.ndim != 1:
+        raise ValueError("Deterministic midpoint quantile ladders currently require shared rank-1 sigma_levels.")
+    n_steps = _num_path_steps(sigma_levels)
     ladder = build_log_sigma_quantile_ladder(
         float(getattr(cfg, "sigma_min", 0.0)),
         float(getattr(cfg, "sigma_max", 0.0)),
@@ -281,9 +322,9 @@ def build_constraint_radii(
 ) -> torch.Tensor:
     """Exact Route-A local cap expressed in state-increment (`delta`) space."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        raise ValueError(f"sigma_levels must contain at least 2 ladder points, got shape={tuple(sigma_levels.shape)}")
     if total_budget < 0:
         raise ValueError(f"total_budget must be >= 0, got {total_budget}")
 
@@ -306,9 +347,9 @@ def build_constraint_radii_for_objective(
 ) -> torch.Tensor:
     """Exact Route-A local delta caps implied by the u-space projection rule."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        raise ValueError(f"sigma_levels must contain at least 2 ladder points, got shape={tuple(sigma_levels.shape)}")
     if total_budget < 0:
         raise ValueError(f"total_budget must be >= 0, got {total_budget}")
     dt = build_transition_deltas_for_objective(cfg=cfg, sigma_levels=sigma_levels, time_horizon=time_horizon)
@@ -317,9 +358,13 @@ def build_constraint_radii_for_objective(
 
 
 def _as_sigma_batch(value: torch.Tensor, batch_size: int, x_ref: torch.Tensor) -> torch.Tensor:
-    """Expand scalar sigma to `[B]` in the same device/dtype as inputs."""
+    """Expand scalar sigma or cast per-sample sigma to `[B]`."""
 
-    return torch.full((batch_size,), float(value.item()), device=x_ref.device, dtype=x_ref.dtype)
+    if value.ndim == 0:
+        return torch.full((batch_size,), float(value.item()), device=x_ref.device, dtype=x_ref.dtype)
+    if value.ndim == 1 and value.shape[0] == batch_size:
+        return value.to(device=x_ref.device, dtype=x_ref.dtype)
+    raise ValueError(f"value must be scalar or [batch], got shape={tuple(value.shape)}")
 
 
 def _l2_normalize_per_sample(value: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -373,9 +418,9 @@ def rollout_path_heuristic_attack(
     """Greedy Route-A CDRO attack with literal u-space drift controls."""
 
     batch_size = x0.shape[0]
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        raise ValueError(f"sigma_levels must contain at least 2 ladder points, got shape={tuple(sigma_levels.shape)}")
     if inner_steps < 0:
         raise ValueError(f"inner_steps must be >= 0, got {inner_steps}")
     if step_size <= 0:
@@ -392,7 +437,7 @@ def rollout_path_heuristic_attack(
     rf_path_dt = (
         _build_rf_path_deltas(
             sigma_levels,
-            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[..., -1].max().item()))),
         )
         if rf_objective
         else None
@@ -419,31 +464,33 @@ def rollout_path_heuristic_attack(
     attack_net.eval()
 
     for k in range(n_steps):
-        sigma_k = sigma_levels[k]
-        sigma_next = sigma_levels[k + 1]
+        sigma_k = _path_step_sigma_batch(sigma_levels, k, x0)
+        sigma_next = _path_step_sigma_batch(sigma_levels, k + 1, x0)
         if rf_objective:
             # The reference path follows the normalized RF straight path.
             # The auxiliary CDRO clock only scales control magnitudes and budgets.
-            delta_t = float(rf_path_dt[k].item())
-            base_increment = delta_t * (x0 - x_left)
+            delta_t = _step_scalar_vector(rf_path_dt, k, batch_size=batch_size, reference=x0)
+            base_increment = _step_scalar_like(delta_t, x0) * (x0 - x_left)
         else:
             variance_increment = sigma_next.square() - sigma_k.square()
-            if float(variance_increment.item()) < -1e-12:
+            if float(variance_increment.min().item()) < -1e-12:
                 raise ValueError("VE variance increments must be nonnegative.")
             delta_sigma = torch.sqrt(variance_increment.clamp_min(0.0))
             eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
-            base_increment = delta_sigma * eps
+            base_increment = _step_scalar_like(delta_sigma, x0) * eps
         reference_state = (x_ref + base_increment).detach()
         x_nominal_next = (x_ctrl + base_increment).detach()
         sigma_batch = _as_sigma_batch(sigma_next, batch_size, x0)
 
         control = torch.zeros_like(x_ctrl)
-        step_delta_tau = float(dt[k].item())
-        if step_delta_tau > 0.0 and control_radius > 0.0 and int(inner_steps) == 1:
+        step_delta_tau = _step_scalar_vector(dt, k, batch_size=batch_size, reference=x0)
+        step_delta_tau_value = float(step_delta_tau.max().item())
+        step_delta_tau_full = _step_scalar_like(step_delta_tau, x0)
+        if step_delta_tau_value > 0.0 and control_radius > 0.0 and int(inner_steps) == 1:
             # With one inner step, solve the linearized local-cap problem exactly:
             # max_{||u|| <= sqrt(rho / T_tau)} <grad, u> under the local u-space cap.
             control = control.requires_grad_(True)
-            candidate = x_nominal_next + step_delta_tau * control
+            candidate = x_nominal_next + step_delta_tau_full * control
             with autocast_context(x0.device, amp_dtype):
                 step_loss = compute_training_loss(
                     cfg,
@@ -458,11 +505,11 @@ def rollout_path_heuristic_attack(
             grad_unit = _l2_normalize_per_sample(grad)
             control_cap = torch.full((batch_size,), control_radius, device=x0.device, dtype=x0.dtype)
             control = (grad_unit.reshape(batch_size, -1) * control_cap[:, None]).reshape_as(grad).detach()
-        elif step_delta_tau > 0.0 and control_radius > 0.0:
+        elif step_delta_tau_value > 0.0 and control_radius > 0.0:
             control_cap = torch.full((batch_size,), control_radius, device=x0.device, dtype=x0.dtype)
             for _ in range(int(inner_steps)):
                 control.requires_grad_(True)
-                candidate = x_nominal_next + step_delta_tau * control
+                candidate = x_nominal_next + step_delta_tau_full * control
                 with autocast_context(x0.device, amp_dtype):
                     step_loss = compute_training_loss(
                         cfg,
@@ -480,7 +527,7 @@ def rollout_path_heuristic_attack(
                 control = (control + step).detach()
                 control = project_l2_ball(control, control_cap).detach()
 
-        delta_effective = step_delta_tau * control
+        delta_effective = step_delta_tau_full * control
         candidate_final = (x_nominal_next + delta_effective).detach()
         x_ref = reference_state
         x_ctrl = candidate_final
@@ -497,7 +544,7 @@ def rollout_path_heuristic_attack(
     delta_path = torch.stack(path_delta, dim=1)
     control_path = torch.stack(path_control, dim=1)
     x_target = states_ctrl[torch.arange(batch_size, device=x0.device), target_indices]
-    sigma_target = sigma_levels[target_indices]
+    sigma_target = _gather_target_sigmas(sigma_levels, target_indices, x0)
     return RolloutResult(
         x_target=x_target,
         sigma_target=sigma_target,
@@ -534,14 +581,14 @@ def rollout_controlled_ve(
     del control_net, grad_through_control, control_radius_kappa, kappa_by_step, total_budget
 
     batch_size = x0.shape[0]
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _num_path_steps(sigma_levels)
     if n_steps <= 0:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        raise ValueError(f"sigma_levels must contain at least 2 ladder points, got shape={tuple(sigma_levels.shape)}")
     rf_objective = bool(cfg is not None and _is_rf_objective(cfg))
     rf_path_dt = (
         _build_rf_path_deltas(
             sigma_levels,
-            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item()))),
+            sigma_max=float(getattr(cfg, "sigma_max", float(sigma_levels[..., -1].max().item()))),
         )
         if rf_objective
         else None
@@ -564,18 +611,18 @@ def rollout_controlled_ve(
     path_control = []
 
     for k in range(n_steps):
-        sigma_k = sigma_levels[k]
-        sigma_next = sigma_levels[k + 1]
+        sigma_k = _path_step_sigma_batch(sigma_levels, k, x0)
+        sigma_next = _path_step_sigma_batch(sigma_levels, k + 1, x0)
         if rf_objective:
-            delta_t = float(rf_path_dt[k].item())
-            x_ref = x_ref + delta_t * (x0 - x_left)
+            delta_t = _step_scalar_vector(rf_path_dt, k, batch_size=batch_size, reference=x0)
+            x_ref = x_ref + _step_scalar_like(delta_t, x0) * (x0 - x_left)
         else:
             variance_increment = sigma_next.square() - sigma_k.square()
-            if float(variance_increment.item()) < -1e-12:
+            if float(variance_increment.min().item()) < -1e-12:
                 raise ValueError("VE variance increments must be nonnegative.")
             delta_sigma = torch.sqrt(variance_increment.clamp_min(0.0))
             eps = torch.randn_like(x0) if eps_schedule is None else eps_schedule[k]
-            x_ref = x_ref + delta_sigma * eps
+            x_ref = x_ref + _step_scalar_like(delta_sigma, x0) * eps
         path_ref.append(x_ref)
         path_ctrl.append(x_ref)
         path_delta.append(torch.zeros_like(x_ref))
@@ -586,7 +633,7 @@ def rollout_controlled_ve(
     delta_path = torch.stack(path_delta, dim=1)
     control_path = torch.stack(path_control, dim=1)
     x_target = states_ctrl[torch.arange(batch_size, device=x0.device), target_indices]
-    sigma_target = sigma_levels[target_indices]
+    sigma_target = _gather_target_sigmas(sigma_levels, target_indices, x0)
 
     return RolloutResult(
         x_target=x_target,

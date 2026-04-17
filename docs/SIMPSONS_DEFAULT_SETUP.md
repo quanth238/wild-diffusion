@@ -4,7 +4,7 @@ This is the active Simpsons-MNIST RGB default for CDRO-EDM work in this repo.
 
 ## Locked Default
 
-- Label: `simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw030_cw000`
+- Label: `simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw100_cw000`
 - Method: `method_version=cdro`
 - Training objective: `training_objective=edm`
 - Dataset: Simpsons-MNIST RGB, 5% train subset
@@ -14,9 +14,9 @@ This is the active Simpsons-MNIST RGB default for CDRO-EDM work in this repo.
 - EMA eval: official EMA enabled
 - Warmup fraction: `0.2`
 - Attack steps: `inner_steps=1`
-- Outer weights: `outer_attack_weight=0.3`, `outer_clean_weight=0.0`
+- Outer weights: `outer_attack_weight=1.0`, `outer_clean_weight=0.0`
 - CDRO path steps: `cdro_n_steps_path=32`
-- CDRO ladder: `cdro_edm_ladder_mode=stochastic_stratified_quantile`
+- CDRO ladder: `cdro_edm_ladder_mode=stochastic_stratified_quantile`, sampled per example
 - CDRO step size: `cdro_step_size=0.02`
 - CDRO budget: `cdro_total_budget_rho=32.0`
 
@@ -74,13 +74,14 @@ For direct `toy/run_toy.py` runs, `toy/config.py` now defaults to this CDRO imag
 
 - `inner_steps=1`
 - `attack_num_steps` is optional and remains a legacy-compatible override; unset means use `inner_steps`
-- `outer_attack_weight=0.3`
+- `outer_attack_weight=1.0`
 - `outer_clean_weight=0.0`
 - `cdro_step_size=0.02`
 - `cdro_total_budget_rho=32.0`
 - `cdro_time_horizon=1.0`
 - `cdro_warmup_fraction=0.2`
 - `cdro_edm_ladder_mode=stochastic_stratified_quantile`
+- `cdro_per_example_sigma_ladders=true`
 - effective CDRO path steps: `32`
 
 ## Comparison Protocol
@@ -133,7 +134,7 @@ Run the locked 5% three-method family with explicit knobs:
 ```bash
 python toy/scripts/collect_three_method_seed_data.py \
   --outdir toy_outputs/simpsons5_cdro_400k_warmup20_rho32_n032_cw0_default \
-  --prefix simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw030_cw000_default \
+  --prefix simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw100_cw000_default \
   --seeds 0 \
   --device cuda \
   --amp-dtype auto \
@@ -170,7 +171,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --wdro-max-total-steps 160000 \
   --wdro-warmup-fraction 0.2 \
   --inner-steps 1 \
-  --outer-attack-weight 0.3 \
+  --outer-attack-weight 1.0 \
   --outer-clean-weight 0.0 \
   --cdro-step-size 0.02 \
   --cdro-total-budget-rho 32.0 \

@@ -290,7 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-attack-step-size", type=float, default=1e-3)
     parser.add_argument("--wdro-gamma", type=float, default=1.0)
     parser.add_argument("--inner-steps", type=int, default=1)
-    parser.add_argument("--outer-attack-weight", type=float, default=0.3)
+    parser.add_argument("--outer-attack-weight", type=float, default=1.0)
     parser.add_argument("--outer-clean-weight", type=float, default=0.0)
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=32.0)
@@ -1104,6 +1104,7 @@ def _cdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
     units = cdro_robust_step_weighted_compute_units(
         n_steps_path=int(_effective_cdro_n_steps_path(args)),
         inner_steps=int(args.inner_steps),
+        total_budget_rho=float(args.cdro_total_budget_rho),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
         calibration=calibration,

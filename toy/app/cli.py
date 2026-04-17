@@ -397,6 +397,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ToyConfig.cdro_edm_ladder_mode,
         choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
     )
+    parser.add_argument(
+        "--cdro-per-example-sigma-ladders",
+        action="store_true",
+        default=ToyConfig.cdro_per_example_sigma_ladders,
+    )
+    parser.add_argument("--disable-cdro-per-example-sigma-ladders", action="store_true")
     parser.add_argument("--cdro-warmup-fraction", type=float, default=ToyConfig.cdro_warmup_fraction)
     parser.add_argument("--control-radius-kappa", type=float, default=ToyConfig.control_radius_kappa)
     parser.add_argument("--v21-rho", type=float, default=ToyConfig.v21_rho)
@@ -496,6 +502,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
+    disable_cdro_per_example_sigma_ladders = bool(args_dict.pop("disable_cdro_per_example_sigma_ladders"))
     disable_wild_fixed_noise_inner = bool(args_dict.pop("disable_wild_fixed_noise_inner"))
     collapse_v_l2_tol_legacy = args_dict.pop("collapse_v_l2_tol")
     args_dict["wandb_enabled"] = bool(args_dict.pop("wandb"))
@@ -537,6 +544,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.use_time_dependent_kappa = False
     if disable_kappa_preserve_l2_budget:
         cfg.kappa_preserve_l2_budget = False
+    if disable_cdro_per_example_sigma_ladders:
+        cfg.cdro_per_example_sigma_ladders = False
     if disable_wild_fixed_noise_inner:
         cfg.wild_fixed_noise_inner = False
     if collapse_v_l2_tol_legacy is not None:

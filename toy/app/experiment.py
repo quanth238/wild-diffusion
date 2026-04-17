@@ -584,16 +584,25 @@ def _compute_weighted_accounting(
             )
             if method_name == "cdro":
                 cdro_attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
-                attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cdro_attack_num_steps) > 0)
+                attack_enabled = bool(
+                    float(getattr(cfg, "cdro_total_budget_rho", 0.0)) > 0.0
+                    and float(cfg.outer_attack_weight) > 0.0
+                    and int(cdro_attack_num_steps) > 0
+                )
             else:
                 attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
             if method_name == "cdro":
                 robust_n_fwd = 0.0
             else:
                 robust_n_fwd = float(path_steps * robust_steps_total)
-            active_outer_branches = _count_positive_weight(float(cfg.outer_attack_weight)) + _count_positive_weight(
-                float(cfg.outer_clean_weight)
-            )
+            if method_name == "cdro" and not attack_enabled:
+                active_outer_branches = _count_positive_weight(
+                    float(cfg.outer_attack_weight) + float(cfg.outer_clean_weight)
+                )
+            else:
+                active_outer_branches = _count_positive_weight(float(cfg.outer_attack_weight)) + _count_positive_weight(
+                    float(cfg.outer_clean_weight)
+                )
             robust_n_fwd_parambackward = float(path_steps * robust_steps_total * active_outer_branches)
             robust_count_source = "history_inferred_cdro_adjusted" if method_name == "cdro" else "history_inferred_pathwise"
         elif method_name == "clean":
@@ -949,13 +958,20 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     if path_steps <= 0:
         return 0.0
     attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
-    attack_enabled = float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and int(attack_num_steps) > 0
-    clean_enabled = float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
+    attack_enabled = (
+        float(getattr(cfg, "cdro_total_budget_rho", 0.0)) > 0.0
+        and float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0
+        and int(attack_num_steps) > 0
+    )
+    reference_path_enabled = (
+        float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0
+        or (float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 and not attack_enabled)
+    )
     if not attack_enabled:
-        return float(path_steps if clean_enabled else 0.0)
+        return float(path_steps if reference_path_enabled else 0.0)
     attack_construction_units = float(path_steps * max(int(attack_num_steps), 0))
     attack_eval_units = float(path_steps * 2)
-    clean_eval_units = float(path_steps if clean_enabled else 0)
+    clean_eval_units = float(path_steps if float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0 else 0)
     return attack_construction_units + attack_eval_units + clean_eval_units
 
 
@@ -1044,6 +1060,7 @@ def _resolve_phase_steps(
                     cdro_robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
                         n_steps_path=int(getattr(cfg, "n_steps_path", 0)),
                         inner_steps=int(cdro_attack_num_steps),
+                        total_budget_rho=float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
                         outer_attack_weight=float(getattr(cfg, "outer_attack_weight", 0.0)),
                         outer_clean_weight=float(getattr(cfg, "outer_clean_weight", 0.0)),
                         calibration=weighted_calibration,
@@ -2299,6 +2316,7 @@ def run_experiment(cfg) -> dict:
             "cdro_total_budget_rho": float(getattr(cfg, "cdro_total_budget_rho", 0.0)),
             "cdro_time_horizon": float(getattr(cfg, "cdro_time_horizon", 0.0)),
             "cdro_edm_ladder_mode": str(getattr(cfg, "cdro_edm_ladder_mode", "deterministic_midpoint_quantile")),
+            "cdro_per_example_sigma_ladders": bool(getattr(cfg, "cdro_per_example_sigma_ladders", False)),
             "cdro_warmup_fraction": float(getattr(cfg, "cdro_warmup_fraction", 0.0)),
             "method_version": cfg.method_version,
             "method_description": getattr(method, "DESCRIPTION", ""),

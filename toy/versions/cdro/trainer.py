@@ -12,8 +12,9 @@ from ...shared.trainer_common import generate_reflow_pairs
 from ...shared.sigma import (
     build_rf_stage_time_quantile_levels,
     resolve_rf_stage_t_distribution,
-    sample_rf_stage_time_stratified_levels,
     sample_log_sigma_stratified_quantile_ladder,
+    sample_log_sigma_stratified_quantile_ladder_batch,
+    sample_rf_stage_time_stratified_levels,
     sample_target_indices,
     sample_target_indices_log_normal,
 )
@@ -34,7 +35,17 @@ def _control_transport_cost(control_path: torch.Tensor, transition_deltas: torch
 
     flat = control_path.reshape(control_path.shape[0], control_path.shape[1], -1)
     control_sq = flat.pow(2).sum(dim=2)
-    dt = transition_deltas.view(1, -1).to(device=control_sq.device, dtype=control_sq.dtype)
+    if transition_deltas.ndim == 1:
+        dt = transition_deltas.view(1, -1).to(device=control_sq.device, dtype=control_sq.dtype)
+    elif transition_deltas.ndim == 2:
+        if transition_deltas.shape != control_sq.shape:
+            raise ValueError(
+                "Per-example transition_deltas must match control_path step shape, got "
+                f"{tuple(transition_deltas.shape)} vs {tuple(control_sq.shape)}"
+            )
+        dt = transition_deltas.to(device=control_sq.device, dtype=control_sq.dtype)
+    else:
+        raise ValueError(f"transition_deltas must be rank 1 or 2, got shape={tuple(transition_deltas.shape)}")
     return (control_sq * dt).sum(dim=1).mean()
 
 
@@ -42,23 +53,52 @@ def _is_rf_objective(cfg) -> bool:
     return str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
 
 
-def _sample_cdro_edm_step_ladder(cfg, sigma_levels: torch.Tensor) -> torch.Tensor:
+def _sample_cdro_edm_step_ladder(cfg, sigma_levels: torch.Tensor, *, batch_size: int) -> torch.Tensor:
     """Sample one CDRO-EDM stratified ladder with the same support and step count."""
 
-    ladder = sample_log_sigma_stratified_quantile_ladder(
-        float(getattr(cfg, "sigma_min", 0.0)),
-        float(getattr(cfg, "sigma_max", 0.0)),
-        int(sigma_levels.numel() - 1),
-        p_mean=float(getattr(cfg, "p_mean", -1.2)),
-        p_std=float(getattr(cfg, "p_std", 1.2)),
-        device=sigma_levels.device,
-        dtype=sigma_levels.dtype,
-    )
+    ladder_kwargs = {
+        "sigma_min": float(getattr(cfg, "sigma_min", 0.0)),
+        "sigma_max": float(getattr(cfg, "sigma_max", 0.0)),
+        "n_steps": int(sigma_levels.shape[-1] - 1),
+        "p_mean": float(getattr(cfg, "p_mean", -1.2)),
+        "p_std": float(getattr(cfg, "p_std", 1.2)),
+        "device": sigma_levels.device,
+        "dtype": sigma_levels.dtype,
+    }
+    if bool(getattr(cfg, "cdro_per_example_sigma_ladders", True)):
+        ladder = sample_log_sigma_stratified_quantile_ladder_batch(
+            batch_size=int(batch_size),
+            **ladder_kwargs,
+        )
+    else:
+        ladder = sample_log_sigma_stratified_quantile_ladder(**ladder_kwargs)
     return ladder.sigma_levels
 
 
 def _snapshot_tensor_values(value: torch.Tensor) -> list[float]:
-    return [float(v.item()) for v in value.detach().cpu()]
+    snapshot = value.detach().cpu()
+    if snapshot.ndim > 1:
+        snapshot = snapshot[0]
+    return [float(v.item()) for v in snapshot.reshape(-1)]
+
+
+def _path_n_steps(sigma_levels: torch.Tensor) -> int:
+    if sigma_levels.ndim not in (1, 2):
+        raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
+    return int(sigma_levels.shape[-1] - 1)
+
+
+def _path_step_sigma_batch(sigma_levels: torch.Tensor, step_idx: int, x0: torch.Tensor) -> torch.Tensor:
+    if sigma_levels.ndim == 1:
+        return torch.full(
+            (x0.shape[0],),
+            float(sigma_levels[step_idx].item()),
+            device=x0.device,
+            dtype=x0.dtype,
+        )
+    if sigma_levels.ndim == 2:
+        return sigma_levels[:, step_idx].to(device=x0.device, dtype=x0.dtype)
+    raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
 
 
 def _resolve_attack_num_steps(cfg) -> tuple[int, str]:
@@ -194,18 +234,13 @@ def _path_average_training_loss(
 ) -> torch.Tensor:
     """Average weighted denoise loss over all rollout timesteps k=1..N."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _path_n_steps(sigma_levels)
     if states.shape[1] != n_steps + 1:
         raise ValueError(f"states step dim must be {n_steps + 1}, got {states.shape[1]}")
 
     total_loss = None
     for step_idx in range(n_steps):
-        sigma = torch.full(
-            (x0.shape[0],),
-            float(sigma_levels[step_idx + 1].item()),
-            device=x0.device,
-            dtype=x0.dtype,
-        )
+        sigma = _path_step_sigma_batch(sigma_levels, step_idx + 1, x0)
         loss_step = compute_training_loss(
             cfg,
             denoiser,
@@ -235,7 +270,7 @@ def _path_outer_loss_backward(
 ) -> tuple[float, float, float]:
     """Accumulate exact path-mean outer loss with per-timestep backward passes."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _path_n_steps(sigma_levels)
     if states_ctrl.shape[1] != n_steps + 1:
         raise ValueError(f"states_ctrl step dim must be {n_steps + 1}, got {states_ctrl.shape[1]}")
     if states_ref.shape[1] != n_steps + 1:
@@ -246,12 +281,7 @@ def _path_outer_loss_backward(
     outer_loss_total = 0.0
 
     for step_idx in range(n_steps):
-        sigma = torch.full(
-            (x0.shape[0],),
-            float(sigma_levels[step_idx + 1].item()),
-            device=x0.device,
-            dtype=x0.dtype,
-        )
+        sigma = _path_step_sigma_batch(sigma_levels, step_idx + 1, x0)
         with autocast_context(sigma_levels.device, amp_dtype):
             if lambda_ctrl > 0.0:
                 attack_loss_step = compute_training_loss(
@@ -306,7 +336,7 @@ def _path_outer_loss_backward(
 def _path_batch_equiv_denoiser_evals(sigma_levels: torch.Tensor) -> float:
     """Count one denoiser eval over `B*T` path states as `T` batch-equivalent evals."""
 
-    return float(max(int(sigma_levels.numel()) - 1, 0))
+    return float(max(_path_n_steps(sigma_levels), 0))
 
 
 def _rollout_delta_diagnostics(roll, radius_by_step: torch.Tensor):
@@ -320,14 +350,19 @@ def _rollout_delta_diagnostics(roll, radius_by_step: torch.Tensor):
     delta_l2 = pathwise_l2(roll.delta_path)
     delta_norm_mean = delta_l2.mean()
     delta_norm_max = delta_l2.max()
-    radius = radius_by_step.view(1, -1).to(device=delta_l2.device, dtype=delta_l2.dtype)
+    if radius_by_step.ndim == 1:
+        radius = radius_by_step.view(1, -1).to(device=delta_l2.device, dtype=delta_l2.dtype)
+    elif radius_by_step.ndim == 2:
+        radius = radius_by_step.to(device=delta_l2.device, dtype=delta_l2.dtype)
+    else:
+        raise ValueError(f"radius_by_step must be rank 1 or 2, got shape={tuple(radius_by_step.shape)}")
     delta_ratio = delta_l2 / radius.clamp_min(1e-8)
     delta_ratio_mean = delta_ratio.mean()
     delta_ratio_max = delta_ratio.max()
     return path_delta_mean, terminal_delta_mean, delta_norm_mean, delta_norm_max, delta_ratio_mean, delta_ratio_max
 
 
-def _path_clean_only_loss_backward(
+def _path_reference_only_loss_backward(
     *,
     cfg,
     denoiser,
@@ -336,25 +371,26 @@ def _path_clean_only_loss_backward(
     x_left: Optional[torch.Tensor],
     x_right: Optional[torch.Tensor],
     sigma_levels: torch.Tensor,
-    lambda_ref: float,
+    lambda_ctrl_equiv: float,
+    lambda_ref_equiv: float,
     amp_dtype,
 ) -> tuple[float, float, float]:
-    """Accumulate clean-only path loss without the redundant attacked-path pass."""
+    """Accumulate one reference-path loss while preserving branch-weight accounting."""
 
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = _path_n_steps(sigma_levels)
     if states_ref.shape[1] != n_steps + 1:
         raise ValueError(f"states_ref step dim must be {n_steps + 1}, got {states_ref.shape[1]}")
 
+    total_mass = float(lambda_ctrl_equiv) + float(lambda_ref_equiv)
+    if total_mass <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    attack_loss_total = 0.0
     clean_loss_total = 0.0
     outer_loss_total = 0.0
 
     for step_idx in range(n_steps):
-        sigma = torch.full(
-            (x0.shape[0],),
-            float(sigma_levels[step_idx + 1].item()),
-            device=x0.device,
-            dtype=x0.dtype,
-        )
+        sigma = _path_step_sigma_batch(sigma_levels, step_idx + 1, x0)
         with autocast_context(sigma_levels.device, amp_dtype):
             clean_loss_step = compute_training_loss(
                 cfg,
@@ -365,17 +401,21 @@ def _path_clean_only_loss_backward(
                 x_left=x_left,
                 x_right=x_right,
             )
-            chunk_outer = lambda_ref * clean_loss_step / float(n_steps)
+            chunk_outer = total_mass * clean_loss_step / float(n_steps)
 
         if has_nan_or_inf(chunk_outer):
-            raise RuntimeError("NaN/Inf detected in cdro clean-only outer loss.")
+            raise RuntimeError("NaN/Inf detected in cdro reference-only outer loss.")
         if chunk_outer.requires_grad:
             chunk_outer.backward()
 
-        clean_loss_total += scalarize(clean_loss_step) / float(n_steps)
+        loss_value = scalarize(clean_loss_step) / float(n_steps)
+        if lambda_ctrl_equiv > 0.0:
+            attack_loss_total += loss_value
+        if lambda_ref_equiv > 0.0:
+            clean_loss_total += loss_value
         outer_loss_total += scalarize(chunk_outer)
 
-    return 0.0, clean_loss_total, outer_loss_total
+    return attack_loss_total, clean_loss_total, outer_loss_total
 
 
 def train_trajectory_robust_cdro(
@@ -629,7 +669,7 @@ def train_trajectory_robust_cdro(
             history["stochastic_ladder_last_sigma_levels"] = _snapshot_tensor_values(current_sigma_levels)
             history["stochastic_ladder_last_transition_deltas"] = _snapshot_tensor_values(current_transition_deltas)
         elif use_stochastic_edm_ladders:
-            current_sigma_levels = _sample_cdro_edm_step_ladder(cfg, sigma_levels)
+            current_sigma_levels = _sample_cdro_edm_step_ladder(cfg, sigma_levels, batch_size=x0.shape[0])
             current_transition_deltas = build_transition_deltas_for_objective(
                 cfg=cfg,
                 sigma_levels=current_sigma_levels,
@@ -667,9 +707,10 @@ def train_trajectory_robust_cdro(
             raise RuntimeError("CDRO continuation mixture must have positive total mass.")
         lambda_ref = raw_lambda_ref / mixture_mass
         lambda_ctrl = raw_lambda_ctrl / mixture_mass
-        phi_lr_scale = 1.0 if lambda_ctrl > 0.0 else 0.0
-        control_updates_enabled = lambda_ctrl > 0.0
-        attack_enabled = bool(control_updates_enabled and attack_num_steps > 0)
+        attack_path_enabled = bool(lambda_ctrl > 0.0 and attack_num_steps > 0 and total_budget > 0.0)
+        reference_path_weight = float(lambda_ref + (lambda_ctrl if not attack_path_enabled else 0.0))
+        phi_lr_scale = 1.0 if attack_path_enabled else 0.0
+        control_updates_enabled = attack_path_enabled
         rollout_schedules = [None]
         rollout_multiplier = 1.0
         attack_construction_units = 0.0
@@ -677,7 +718,7 @@ def train_trajectory_robust_cdro(
 
         set_requires_grad(denoiser, False)
         for eps_schedule in rollout_schedules:
-            if attack_enabled:
+            if attack_path_enabled:
                 roll = rollout_path_heuristic_attack(
                     cfg=cfg,
                     x0=x0,
@@ -707,12 +748,12 @@ def train_trajectory_robust_cdro(
                     rf_pair_left=rf_pair_left,
                 )
             rollouts.append(roll)
-        if attack_enabled:
+        if attack_path_enabled:
             attack_construction_units = (
                 path_batch_equiv_evals * float(max(int(attack_num_steps), 0)) * rollout_multiplier
             )
 
-        if attack_enabled:
+        if attack_path_enabled:
             attack_loss_inner = None
             transport_inner = None
             for roll in rollouts:
@@ -745,13 +786,20 @@ def train_trajectory_robust_cdro(
             transport_inner = transport_inner / rollout_multiplier
             inner_obj = torch.zeros((), device=x0.device, dtype=x0.dtype)
 
-        last_inner_obj = scalarize(inner_obj) if attack_enabled else 0.0
+        last_inner_obj = scalarize(inner_obj) if attack_path_enabled else 0.0
         last_transport = scalarize(transport_inner)
         delta_norm_mean_values = []
         delta_norm_max_values = []
         delta_ratio_mean_values = []
         delta_ratio_max_values = []
-        radius = current_radius_by_step.view(1, -1)
+        if current_radius_by_step.ndim == 1:
+            radius = current_radius_by_step.view(1, -1)
+        elif current_radius_by_step.ndim == 2:
+            radius = current_radius_by_step
+        else:
+            raise ValueError(
+                f"current_radius_by_step must be rank 1 or 2, got shape={tuple(current_radius_by_step.shape)}"
+            )
         for roll in rollouts:
             delta_l2 = pathwise_l2(roll.delta_path)
             delta_ratio = delta_l2 / radius.to(device=delta_l2.device, dtype=delta_l2.dtype).clamp_min(1e-8)
@@ -769,10 +817,11 @@ def train_trajectory_robust_cdro(
         outer_loss_attack_vals = []
         outer_loss_clean_vals = []
         outer_loss_vals = []
-        if lambda_ctrl <= 0.0:
+        if not attack_path_enabled:
+            lambda_ctrl_scaled = float(lambda_ctrl) / rollout_multiplier
             lambda_ref_scaled = float(lambda_ref) / rollout_multiplier
             for roll in rollouts:
-                outer_loss_attack_val, outer_loss_clean_val, outer_loss_val = _path_clean_only_loss_backward(
+                outer_loss_attack_val, outer_loss_clean_val, outer_loss_val = _path_reference_only_loss_backward(
                     cfg=cfg,
                     denoiser=denoiser,
                     states_ref=roll.states_ref,
@@ -780,14 +829,15 @@ def train_trajectory_robust_cdro(
                     x_left=roll.x_left,
                     x_right=roll.x_right,
                     sigma_levels=current_sigma_levels,
-                    lambda_ref=lambda_ref_scaled,
+                    lambda_ctrl_equiv=lambda_ctrl_scaled,
+                    lambda_ref_equiv=lambda_ref_scaled,
                     amp_dtype=amp_dtype,
                 )
                 outer_loss_attack_vals.append(float(outer_loss_attack_val))
                 outer_loss_clean_vals.append(float(outer_loss_clean_val))
                 outer_loss_vals.append(float(outer_loss_val))
             attack_eval_units = 0.0
-            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if lambda_ref > 0.0 else 0.0
+            clean_eval_units = path_batch_equiv_evals * rollout_multiplier if reference_path_weight > 0.0 else 0.0
         else:
             lambda_ctrl_scaled = float(lambda_ctrl) / rollout_multiplier
             lambda_ref_scaled = float(lambda_ref) / rollout_multiplier
@@ -844,13 +894,16 @@ def train_trajectory_robust_cdro(
         history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
         history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
+        effective_outer_branches = (
+            float(int(lambda_ctrl > 0.0) + int(lambda_ref > 0.0))
+            if attack_path_enabled
+            else float(int(reference_path_weight > 0.0))
+        )
         append_denoiser_op_count_step(
             history,
-            n_fwd=float(path_batch_equiv_evals) * rollout_multiplier if attack_enabled else 0.0,
+            n_fwd=float(path_batch_equiv_evals) * rollout_multiplier if attack_path_enabled else 0.0,
             n_fwd_inputgrad=float(attack_construction_units),
-            n_fwd_parambackward=float(path_batch_equiv_evals)
-            * float(int(lambda_ctrl > 0.0) + int(lambda_ref > 0.0))
-            * rollout_multiplier,
+            n_fwd_parambackward=float(path_batch_equiv_evals) * effective_outer_branches * rollout_multiplier,
         )
 
         run_diag = (
@@ -858,7 +911,7 @@ def train_trajectory_robust_cdro(
             and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(cfg.steps))
         )
         if run_diag:
-            if lambda_ctrl > 0.0 and attack_num_steps > 0:
+            if attack_path_enabled:
                 set_requires_grad(denoiser, False)
                 roll_cur_diag = rollout_path_heuristic_attack(
                     cfg=cfg,

@@ -272,6 +272,7 @@ def cdro_robust_step_weighted_compute_units(
     *,
     n_steps_path: int,
     inner_steps: int,
+    total_budget_rho: float,
     outer_attack_weight: float,
     outer_clean_weight: float,
     calibration: Dict[str, Any],
@@ -290,9 +291,13 @@ def cdro_robust_step_weighted_compute_units(
             n_fwd_parambackward=0.0,
             calibration=calibration,
         )
-    attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(inner_steps) > 0)
-    clean_enabled = bool(float(outer_clean_weight) > 0.0)
-    active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
+    attack_enabled = bool(float(total_budget_rho) > 0.0 and float(outer_attack_weight) > 0.0 and int(inner_steps) > 0)
+    reference_path_enabled = bool(float(outer_clean_weight) > 0.0 or (float(outer_attack_weight) > 0.0 and not attack_enabled))
+    active_outer_branches = (
+        int(float(outer_attack_weight) > 0.0) + int(float(outer_clean_weight) > 0.0)
+        if attack_enabled
+        else int(reference_path_enabled)
+    )
     return weighted_compute_units(
         n_fwd=0.0,
         n_fwd_inputgrad=float(path_steps * max(int(inner_steps), 0)) if attack_enabled else 0.0,

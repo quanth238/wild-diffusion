@@ -226,11 +226,27 @@ def sample_sigmas_log_normal(
 def assign_sigmas_to_nearest_levels(sigmas: torch.Tensor, sigma_levels: torch.Tensor) -> torch.Tensor:
     """Map continuous sigmas to the nearest positive ladder point for diagnostics only."""
 
-    if sigma_levels.numel() < 2:
-        raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
-    d = (sigmas.unsqueeze(1) - sigma_levels[1:].unsqueeze(0)).abs()
-    nearest = torch.argmin(d, dim=1)
-    return nearest + 1
+    if sigma_levels.ndim == 1:
+        if sigma_levels.numel() < 2:
+            raise ValueError(f"sigma_levels must contain at least 2 values, got {sigma_levels.numel()}")
+        d = (sigmas.unsqueeze(1) - sigma_levels[1:].unsqueeze(0)).abs()
+        nearest = torch.argmin(d, dim=1)
+        return nearest + 1
+    if sigma_levels.ndim == 2:
+        if sigma_levels.shape[1] < 2:
+            raise ValueError(
+                "Per-example sigma_levels must contain at least 2 ladder points, "
+                f"got shape={tuple(sigma_levels.shape)}"
+            )
+        if sigmas.ndim != 1 or sigmas.shape[0] != sigma_levels.shape[0]:
+            raise ValueError(
+                "Per-example sigma snapping expects sigmas with shape [batch], got "
+                f"{tuple(sigmas.shape)} for sigma_levels {tuple(sigma_levels.shape)}"
+            )
+        d = (sigmas.unsqueeze(1) - sigma_levels[:, 1:]).abs()
+        nearest = torch.argmin(d, dim=1)
+        return nearest + 1
+    raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
 
 
 def build_sigma_levels_from_warmup_quantiles(
@@ -370,6 +386,66 @@ def sample_log_sigma_stratified_quantile_ladder(
     )
 
 
+def sample_log_sigma_stratified_quantile_ladder_batch(
+    sigma_min: float,
+    sigma_max: float,
+    n_steps: int,
+    *,
+    batch_size: int,
+    p_mean: float = -1.2,
+    p_std: float = 1.2,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> LogSigmaQuantileLadder:
+    """Sample one independent stratified inverse-CDF ladder per batch element."""
+
+    if n_steps <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    normal, cdf_min, cdf_max = _truncated_log_sigma_cdf_bounds(
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+        p_mean=p_mean,
+        p_std=p_std,
+    )
+    out_device = torch.device("cpu") if device is None else device
+    out_dtype = torch.float32 if dtype is None else dtype
+
+    mass = cdf_max - cdf_min
+    jitter = torch.empty((int(batch_size), int(n_steps)), dtype=torch.float64).uniform_(1e-12, 1.0 - 1e-12)
+    strata = torch.arange(0, int(n_steps), dtype=torch.float64).view(1, int(n_steps))
+    probs = (strata + jitter) / float(n_steps)
+    trunc_cdf = cdf_min + probs * mass
+    z_nodes = normal.icdf(trunc_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
+    sigma_positive = torch.exp(z_nodes)
+    if torch.any(sigma_positive <= 0):
+        raise ValueError("Per-example stratified continuation ladders must be strictly positive.")
+    if sigma_positive.shape[1] > 1 and not torch.all(sigma_positive[:, 1:] > sigma_positive[:, :-1]):
+        raise ValueError("Per-example stratified continuation ladders must be strictly increasing.")
+
+    sigma_levels = torch.cat(
+        [
+            torch.zeros((int(batch_size), 1), dtype=torch.float64),
+            sigma_positive,
+        ],
+        dim=1,
+    ).to(device=out_device, dtype=out_dtype)
+    positive_out = sigma_levels[:, 1:]
+    if torch.any(positive_out <= 0):
+        raise ValueError("Per-example stratified continuation ladders must remain positive after dtype conversion.")
+    if positive_out.shape[1] > 1 and not torch.all(positive_out[:, 1:] > positive_out[:, :-1]):
+        raise ValueError(
+            "Per-example stratified continuation ladders must remain strictly increasing after dtype conversion."
+        )
+
+    return LogSigmaQuantileLadder(
+        sigma_levels=sigma_levels,
+        log_sigma_nodes=z_nodes.to(device=out_device, dtype=out_dtype),
+        quantile_nodes=probs.to(device=out_device, dtype=out_dtype),
+    )
+
+
 def build_log_sigma_quantile_cell_edges(
     sigma_min: float,
     sigma_max: float,
@@ -399,7 +475,9 @@ def build_log_sigma_quantile_cell_edges(
 def sample_target_indices(batch_size: int, sigma_levels: torch.Tensor) -> torch.Tensor:
     """Uniformly sample training target steps i in {1, ..., N}."""
 
-    return torch.randint(1, sigma_levels.numel(), (batch_size,), device=sigma_levels.device)
+    if sigma_levels.ndim not in (1, 2):
+        raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
+    return torch.randint(1, sigma_levels.shape[-1], (batch_size,), device=sigma_levels.device)
 
 
 def sample_target_indices_log_normal(
@@ -410,10 +488,18 @@ def sample_target_indices_log_normal(
 ) -> torch.Tensor:
     """EDM-style sigma sampling snapped to the nearest continuation ladder point."""
 
+    if sigma_levels.ndim == 1:
+        sigma_min_value = float(sigma_levels[1].item())
+        sigma_max_value = float(sigma_levels[-1].item())
+    elif sigma_levels.ndim == 2:
+        sigma_min_value = float(sigma_levels[:, 1].min().item())
+        sigma_max_value = float(sigma_levels[:, -1].max().item())
+    else:
+        raise ValueError(f"sigma_levels must be rank 1 or 2, got shape={tuple(sigma_levels.shape)}")
     sigma = sample_sigmas_log_normal(
         batch_size,
-        sigma_min=float(sigma_levels[1].item()),
-        sigma_max=float(sigma_levels[-1].item()),
+        sigma_min=sigma_min_value,
+        sigma_max=sigma_max_value,
         device=sigma_levels.device,
         p_mean=p_mean,
         p_std=p_std,

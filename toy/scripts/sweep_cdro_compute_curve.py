@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-list", type=str, default=DEFAULT_STEPS_LIST)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--inner-steps", type=int, default=1)
-    parser.add_argument("--outer-attack-weight", type=float, default=0.3)
-    parser.add_argument("--outer-clean-weight", type=float, default=1.0)
+    parser.add_argument("--outer-attack-weight", type=float, default=1.0)
+    parser.add_argument("--outer-clean-weight", type=float, default=0.0)
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
     parser.add_argument("--cdro-total-budget-rho", type=float, default=4.0)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
@@ -333,6 +333,7 @@ def match_cdro_steps_to_reference_weighted_budget(
     robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
         n_steps_path=int(args.n_steps_path),
         inner_steps=int(args.inner_steps),
+        total_budget_rho=float(args.cdro_total_budget_rho),
         outer_attack_weight=float(args.outer_attack_weight),
         outer_clean_weight=float(args.outer_clean_weight),
         calibration=calibration,
@@ -683,7 +684,11 @@ def extract_cdro_row(
         attack_weight = float(flow.get("outer_attack_weight", config.get("outer_attack_weight", 0.0)))
         clean_weight = float(flow.get("outer_clean_weight", config.get("outer_clean_weight", 0.0)))
         inner_steps = int(flow.get("inner_steps", config.get("inner_steps", 0)))
-        attack_enabled = bool(attack_weight > 0.0 and inner_steps > 0)
+        attack_enabled = bool(
+            float(flow.get("cdro_total_budget_rho", config.get("cdro_total_budget_rho", 0.0))) > 0.0
+            and attack_weight > 0.0
+            and inner_steps > 0
+        )
         baseline_weighted_compute = weighted_compute_units(
             n_fwd=0.0,
             n_fwd_inputgrad=0.0,
@@ -693,7 +698,15 @@ def extract_cdro_row(
         robust_weighted_compute = weighted_compute_units(
             n_fwd=0.0,
             n_fwd_inputgrad=float(path_steps * inner_steps * robust_phase_steps) if attack_enabled else 0.0,
-            n_fwd_parambackward=float(path_steps * robust_phase_steps * int((attack_weight > 0.0) + (clean_weight > 0.0))),
+            n_fwd_parambackward=float(
+                path_steps
+                * robust_phase_steps
+                * (
+                    int((attack_weight > 0.0) + (clean_weight > 0.0))
+                    if attack_enabled
+                    else int((attack_weight > 0.0) or (clean_weight > 0.0))
+                )
+            ),
             calibration=calibration,
         )
         if baseline_weighted_compute is not None and robust_weighted_compute is not None:
@@ -951,6 +964,7 @@ def build_run_plan(args: argparse.Namespace, calibration: Dict[str, Any]) -> Dic
                 cdro_robust_step_weighted_units = cdro_robust_step_weighted_compute_units(
                     n_steps_path=int(args.n_steps_path),
                     inner_steps=int(args.inner_steps),
+                    total_budget_rho=float(args.cdro_total_budget_rho),
                     outer_attack_weight=float(args.outer_attack_weight),
                     outer_clean_weight=float(args.outer_clean_weight),
                     calibration=calibration,
