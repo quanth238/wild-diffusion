@@ -265,6 +265,15 @@ class EDMLossCDRO:
         training_stats.report("CDRO/n_fwd_parambackward_step", torch.as_tensor(n_fwd_parambackward, device=device))
         training_stats.report("CDRO/batch_equiv_denoiser_evals_step", torch.as_tensor(batch_equiv_evals, device=device))
 
+    def probe_clean_loss(self, net, images, labels=None, augment_pipe=None):
+        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        n = torch.randn_like(y) * sigma
+        pred = net(y + n, sigma, labels, augment_labels=augment_labels)
+        return weight * ((pred - y) ** 2)
+
     def __call__(self, net, images, labels=None, augment_pipe=None):
         y, augment_labels, sigma_levels, transition_deltas, radius_by_step = self._prepare_batch(
             images,

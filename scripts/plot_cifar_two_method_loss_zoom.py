@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 STYLE = {
     "baseline": {"label": "Baseline EDM", "color": "tab:blue"},
     "wild_diffusion": {"label": "Wild-Diffusion EDM", "color": "tab:orange"},
-    "cdro": {"label": "CDRO EDM (outer)", "color": "tab:green"},
+    "cdro": {"label": "CDRO EDM", "color": "tab:green"},
 }
 STYLE_ORDER = ["baseline", "wild_diffusion", "cdro"]
 
@@ -49,25 +49,34 @@ def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def _extract_loss_mean(payload: Dict) -> float:
-    for key in ("Loss", "Loss/loss"):
+def _extract_loss_mean_any(payload: Dict, *keys: str) -> Tuple[float, str]:
+    for key in keys:
         value = payload.get(key, {})
         if isinstance(value, dict) and value.get("mean") is not None:
-            return float(value["mean"])
-    raise KeyError("Missing loss metric: expected 'Loss' or legacy 'Loss/loss'.")
+            return float(value["mean"]), key
+    raise KeyError(f"Missing loss metric: expected one of {keys!r}.")
 
 
-def load_loss_trace(stats_path: Path) -> List[Tuple[float, float]]:
-    trace: List[Tuple[float, float]] = []
+def _loss_keys_for_method(robust_method: str) -> Tuple[str, ...]:
+    if robust_method == "cdro":
+        return ("CDRO/edm_clean_probe", "Loss", "Loss/loss")
+    return ("Loss", "Loss/loss")
+
+
+def load_loss_trace(stats_path: Path, *, robust_method: str) -> List[Tuple[float, float, str]]:
+    trace: List[Tuple[float, float, str]] = []
+    loss_keys = _loss_keys_for_method(robust_method)
     with stats_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             payload = json.loads(line)
+            loss_value, loss_key = _extract_loss_mean_any(payload, *loss_keys)
             trace.append(
                 (
                     float(payload["Progress/kimg"]["mean"]),
-                    _extract_loss_mean(payload),
+                    loss_value,
+                    loss_key,
                 )
             )
     if not trace:
@@ -76,28 +85,31 @@ def load_loss_trace(stats_path: Path) -> List[Tuple[float, float]]:
     return trace
 
 
-def nearest_loss(trace: List[Tuple[float, float]], target_kimg: float) -> Tuple[float, float]:
+def nearest_loss(trace: List[Tuple[float, float, str]], target_kimg: float) -> Tuple[float, float, str]:
     return min(trace, key=lambda item: abs(item[0] - float(target_kimg)))
 
 
 def build_rows(manifest_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
-    trace_cache: Dict[Path, List[Tuple[float, float]]] = {}
+    trace_cache: Dict[Tuple[Path, str], List[Tuple[float, float, str]]] = {}
     out: List[Dict[str, object]] = []
     for row in manifest_rows:
         if row.get("robust_method") not in STYLE:
             continue
+        robust_method = str(row["robust_method"])
         run_dir = Path(str(row["run_dir"])).resolve()
         stats_path = run_dir / "stats.jsonl"
-        if stats_path not in trace_cache:
-            trace_cache[stats_path] = load_loss_trace(stats_path)
-        matched_kimg, loss_value = nearest_loss(trace_cache[stats_path], float(row["step"]))
+        cache_key = (stats_path, robust_method)
+        if cache_key not in trace_cache:
+            trace_cache[cache_key] = load_loss_trace(stats_path, robust_method=robust_method)
+        matched_kimg, loss_value, loss_metric_key = nearest_loss(trace_cache[cache_key], float(row["step"]))
         out.append(
             {
-                "robust_method": row["robust_method"],
-                "series_label": STYLE[row["robust_method"]]["label"],
+                "robust_method": robust_method,
+                "series_label": STYLE[robust_method]["label"],
                 "step": int(float(row["step"])),
                 "matched_stats_kimg": float(matched_kimg),
                 "loss_mean": float(loss_value),
+                "loss_metric_key": str(loss_metric_key),
                 "train_wall_clock_sec": float(row["train_wall_clock_sec"]),
                 "weighted_compute_units": float(row["weighted_compute_units"]),
                 "baseline_train_wall_clock_sec_effective": (
@@ -149,13 +161,22 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
             method_rows.sort(key=lambda row: float(row[x_key]))
             if not method_rows:
                 continue
+            label = style["label"]
+            if robust_method == "cdro":
+                metric_keys = {str(row.get("loss_metric_key", "")) for row in method_rows}
+                if metric_keys == {"CDRO/edm_clean_probe"}:
+                    label = "CDRO EDM (clean probe)"
+                elif metric_keys.issubset({"Loss", "Loss/loss"}):
+                    label = "CDRO EDM (outer)"
+                else:
+                    label = "CDRO EDM (mixed probe/outer)"
             ax.plot(
                 [float(row[x_key]) for row in method_rows],
                 [float(row["loss_mean"]) for row in method_rows],
                 marker="o",
                 linewidth=2.0,
                 color=style["color"],
-                label=style["label"],
+                label=label,
             )
         if robust_rows:
             boundary = (

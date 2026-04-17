@@ -89,6 +89,7 @@ def load_stats_trace(path: Path) -> List[Dict[str, float]]:
                     "kimg": float(kimg),
                     "total_sec": float(total_sec),
                     "loss": _safe_mean_field_any(payload, "Loss", "Loss/loss"),
+                    "cdro_edm_clean_probe": _safe_mean_field(payload, "CDRO/edm_clean_probe"),
                     "cdro_outer_loss": _safe_mean_field(payload, "CDRO/outer_loss"),
                     "cdro_outer_loss_attack": _safe_mean_field(payload, "CDRO/outer_loss_attack"),
                     "cdro_outer_loss_clean": _safe_mean_field(payload, "CDRO/outer_loss_clean"),
@@ -244,6 +245,32 @@ def build_rows(args: argparse.Namespace):
                 "eval_dir": str(eval_root / eval_tag),
                 "loss_final": "" if loss_final is None else float(loss_final),
                 "loss_mean_last": "" if trace_row["loss"] is None else float(trace_row["loss"]),
+                "loss_comparable_final": (
+                    ""
+                    if trace_row["cdro_edm_clean_probe"] is None
+                    else float(trace_row["cdro_edm_clean_probe"])
+                ),
+                "loss_comparable_key": (
+                    ""
+                    if trace_row["cdro_edm_clean_probe"] is None
+                    else "CDRO/edm_clean_probe"
+                ),
+                "cdro_edm_clean_probe": (
+                    ""
+                    if trace_row["cdro_edm_clean_probe"] is None
+                    else float(trace_row["cdro_edm_clean_probe"])
+                ),
+                "cdro_outer_loss": "" if trace_row["cdro_outer_loss"] is None else float(trace_row["cdro_outer_loss"]),
+                "cdro_outer_loss_attack": (
+                    ""
+                    if trace_row["cdro_outer_loss_attack"] is None
+                    else float(trace_row["cdro_outer_loss_attack"])
+                ),
+                "cdro_outer_loss_clean": (
+                    ""
+                    if trace_row["cdro_outer_loss_clean"] is None
+                    else float(trace_row["cdro_outer_loss_clean"])
+                ),
                 "fixed_warmup_steps": float(warmup_compute_be),
             }
         )
