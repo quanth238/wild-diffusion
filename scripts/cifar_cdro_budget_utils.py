@@ -22,7 +22,7 @@ DEFAULT_BASELINE_RUN_DIR = (
 DEFAULT_BASELINE_RESUME_KIMG = 40000
 DEFAULT_WDRO_COMPARE_CSV = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
-    "cifar10_baseline_vs_wdro_coarse_three_method_compare.csv"
+    "cifar10_baseline_vs_wdro_coarse_20260414_three_method_compare.csv"
 )
 DEFAULT_WDRO_SUMMARY_JSON = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
