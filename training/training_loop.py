@@ -154,15 +154,11 @@ def training_loop(
         step_start_nimg = cur_nimg
         step_loss_accum = 0.0
         step_loss_rounds = 0
-        probe_images = None
-        probe_labels = None
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = images.to(device).to(torch.float32) / 127.5 - 1
                 labels = labels.to(device)
-                probe_images = images.detach()
-                probe_labels = labels.detach()
                 gain = loss_scaling / batch_gpu_total
                 if hasattr(loss_fn, 'accumulate_gradients'):
                     loss_value = loss_fn.accumulate_gradients(
@@ -229,22 +225,6 @@ def training_loop(
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
-
-        # For CDRO, log a comparable clean one-step EDM probe once per tick without
-        # perturbing the main training RNG stream.
-        if hasattr(loss_fn, 'probe_clean_loss') and probe_images is not None:
-            probe_net = ddp.module if hasattr(ddp, 'module') else ddp
-            fork_devices = []
-            if device.type == 'cuda':
-                fork_devices = [device.index if device.index is not None else torch.cuda.current_device()]
-            with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
-                probe_loss = loss_fn.probe_clean_loss(
-                    net=probe_net,
-                    images=probe_images,
-                    labels=probe_labels,
-                    augment_pipe=augment_pipe,
-                )
-            training_stats.report('CDRO/edm_clean_probe', probe_loss)
 
         # Print status line, accumulating the same information in training_stats.
         tick_end_time = time.time()

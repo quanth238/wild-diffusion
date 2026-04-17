@@ -49,6 +49,15 @@ def write_csv(path: Path, rows: List[Dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
+def _safe_float(value):
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _extract_loss_mean_any(payload: Dict, *keys: str) -> Tuple[float, str]:
     for key in keys:
         value = payload.get(key, {})
@@ -96,12 +105,19 @@ def build_rows(manifest_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
         if row.get("robust_method") not in STYLE:
             continue
         robust_method = str(row["robust_method"])
+        direct_loss = _safe_float(row.get("loss_comparable_final"))
+        direct_key = str(row.get("loss_comparable_key", "")).strip()
         run_dir = Path(str(row["run_dir"])).resolve()
-        stats_path = run_dir / "stats.jsonl"
-        cache_key = (stats_path, robust_method)
-        if cache_key not in trace_cache:
-            trace_cache[cache_key] = load_loss_trace(stats_path, robust_method=robust_method)
-        matched_kimg, loss_value, loss_metric_key = nearest_loss(trace_cache[cache_key], float(row["step"]))
+        if direct_loss is not None:
+            matched_kimg = float(row["step"])
+            loss_value = float(direct_loss)
+            loss_metric_key = direct_key or "loss_comparable_final"
+        else:
+            stats_path = run_dir / "stats.jsonl"
+            cache_key = (stats_path, robust_method)
+            if cache_key not in trace_cache:
+                trace_cache[cache_key] = load_loss_trace(stats_path, robust_method=robust_method)
+            matched_kimg, loss_value, loss_metric_key = nearest_loss(trace_cache[cache_key], float(row["step"]))
         out.append(
             {
                 "robust_method": robust_method,
@@ -164,11 +180,13 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
             label = style["label"]
             if robust_method == "cdro":
                 metric_keys = {str(row.get("loss_metric_key", "")) for row in method_rows}
-                if metric_keys == {"CDRO/edm_clean_probe"}:
-                    label = "CDRO EDM (clean probe)"
+                if metric_keys == {"checkpoint_clean_edm_probe"}:
+                    label = "CDRO EDM"
+                elif metric_keys == {"CDRO/edm_clean_probe"}:
+                    label = "CDRO EDM (inline clean probe)"
                 elif metric_keys.issubset({"Loss", "Loss/loss"}):
                     label = "CDRO EDM (outer)"
-                else:
+                elif len(metric_keys) > 1:
                     label = "CDRO EDM (mixed probe/outer)"
             ax.plot(
                 [float(row[x_key]) for row in method_rows],
