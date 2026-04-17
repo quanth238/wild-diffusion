@@ -150,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-val-size", type=int, default=2000)
     parser.add_argument("--image-split-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--baseline-train-batch-gpu", type=int, default=0)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument(
         "--image-backbone",
