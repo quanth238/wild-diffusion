@@ -113,6 +113,7 @@ class EDMLossCDRO:
         cdro_sigma_min=0.002,
         cdro_sigma_max=80.0,
         cdro_edm_ladder_mode="stochastic_stratified_quantile",
+        cdro_per_example_sigma_ladders=True,
         attack_num_steps=1,
         outer_attack_weight=0.3,
         outer_clean_weight=0.0,
@@ -137,9 +138,35 @@ class EDMLossCDRO:
         self.cdro_sigma_min = float(cdro_sigma_min)
         self.cdro_sigma_max = float(cdro_sigma_max)
         self.cdro_edm_ladder_mode = str(cdro_edm_ladder_mode)
+        self.cdro_per_example_sigma_ladders = bool(cdro_per_example_sigma_ladders)
         self.attack_num_steps = int(attack_num_steps)
         self.outer_attack_weight = float(outer_attack_weight)
         self.outer_clean_weight = float(outer_clean_weight)
+
+    @staticmethod
+    def _path_n_steps(sigma_levels: torch.Tensor) -> int:
+        return int(sigma_levels.shape[-1] - 1)
+
+    @staticmethod
+    def _sigma_batch_for_step(sigma_levels: torch.Tensor, *, step_idx: int, batch_size: int, device: torch.device) -> torch.Tensor:
+        if sigma_levels.ndim == 1:
+            return torch.full(
+                (batch_size,),
+                float(sigma_levels[step_idx + 1].item()),
+                device=device,
+                dtype=torch.float32,
+            )
+        if sigma_levels.ndim == 2:
+            return sigma_levels[:, step_idx + 1].to(device=device, dtype=torch.float32)
+        raise ValueError(f"Expected rank-1 or rank-2 sigma ladder, got shape={tuple(sigma_levels.shape)}")
+
+    @staticmethod
+    def _delta_ratio(delta_l2: torch.Tensor, radius_by_step: torch.Tensor) -> torch.Tensor:
+        if radius_by_step.ndim == 1:
+            return delta_l2 / radius_by_step.view(1, -1).clamp_min(1e-8)
+        if radius_by_step.ndim == 2:
+            return delta_l2 / radius_by_step.clamp_min(1e-8)
+        raise ValueError(f"Expected rank-1 or rank-2 path radii, got shape={tuple(radius_by_step.shape)}")
 
     def _prepare_batch(self, images, augment_pipe=None):
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
@@ -152,6 +179,8 @@ class EDMLossCDRO:
             total_budget_rho=self.cdro_total_budget_rho,
             time_horizon=self.cdro_time_horizon,
             ladder_mode=self.cdro_edm_ladder_mode,
+            batch_size=int(images.shape[0]),
+            per_example_sigma_ladders=self.cdro_per_example_sigma_ladders,
             device=y.device,
             dtype=y.dtype,
         )
@@ -226,6 +255,10 @@ class EDMLossCDRO:
         training_stats.report("CDRO/lambda_clean", torch.as_tensor(lambda_ref, device=device))
         training_stats.report("CDRO/path_steps", torch.as_tensor(float(self.cdro_n_steps_path), device=device))
         training_stats.report("CDRO/attack_num_steps", torch.as_tensor(float(self.attack_num_steps), device=device))
+        training_stats.report(
+            "CDRO/per_example_sigma_ladders",
+            torch.as_tensor(float(self.cdro_per_example_sigma_ladders), device=device),
+        )
         training_stats.report("CDRO/rho", torch.as_tensor(float(self.cdro_total_budget_rho), device=device))
         training_stats.report("CDRO/n_fwd_step", torch.as_tensor(n_fwd, device=device))
         training_stats.report("CDRO/n_fwd_inputgrad_step", torch.as_tensor(n_fwd_inputgrad, device=device))
@@ -247,15 +280,15 @@ class EDMLossCDRO:
             radius_by_step=radius_by_step,
         )
         lambda_ctrl, lambda_ref = self._resolve_outer_weights()
-        n_steps = int(sigma_levels.numel() - 1)
+        n_steps = self._path_n_steps(sigma_levels)
         attack_total = None
         clean_total = None
         for step_idx in range(n_steps):
-            sigma_batch = torch.full(
-                (y.shape[0],),
-                float(sigma_levels[step_idx + 1].item()),
+            sigma_batch = self._sigma_batch_for_step(
+                sigma_levels,
+                step_idx=step_idx,
+                batch_size=int(y.shape[0]),
                 device=y.device,
-                dtype=torch.float32,
             )
             attack_step = weighted_edm_loss_per_pixel(
                 net=net,
@@ -293,7 +326,7 @@ class EDMLossCDRO:
         clean_scalar = 0.0 if clean_total is None else float(reduce_per_sample(clean_loss.detach()).mean().item())
         outer_scalar = float(loss.detach().mean().item())
         delta_l2 = pathwise_l2(rollout.delta_path)
-        delta_ratio = delta_l2 / rollout.radius_by_step.view(1, -1).clamp_min(1e-8)
+        delta_ratio = self._delta_ratio(delta_l2, rollout.radius_by_step)
         control_cost = control_transport_cost(rollout.control_path, rollout.transition_deltas).mean()
         self._report_stats(
             device=y.device,
@@ -323,17 +356,17 @@ class EDMLossCDRO:
             radius_by_step=radius_by_step,
         )
         lambda_ctrl, lambda_ref = self._resolve_outer_weights()
-        n_steps = int(sigma_levels.numel() - 1)
+        n_steps = self._path_n_steps(sigma_levels)
         outer_mean_per_pixel = 0.0
         outer_attack_scalar = 0.0
         outer_clean_scalar = 0.0
 
         for step_idx in range(n_steps):
-            sigma_batch = torch.full(
-                (y.shape[0],),
-                float(sigma_levels[step_idx + 1].item()),
+            sigma_batch = self._sigma_batch_for_step(
+                sigma_levels,
+                step_idx=step_idx,
+                batch_size=int(y.shape[0]),
                 device=y.device,
-                dtype=torch.float32,
             )
             if lambda_ctrl > 0.0:
                 attack_step = weighted_edm_loss_per_pixel(
@@ -365,7 +398,7 @@ class EDMLossCDRO:
                 outer_clean_scalar += float(reduce_per_sample(clean_step.detach()).mean().item()) / float(n_steps)
 
         delta_l2 = pathwise_l2(rollout.delta_path)
-        delta_ratio = delta_l2 / rollout.radius_by_step.view(1, -1).clamp_min(1e-8)
+        delta_ratio = self._delta_ratio(delta_l2, rollout.radius_by_step)
         control_cost = control_transport_cost(rollout.control_path, rollout.transition_deltas).mean()
         self._report_stats(
             device=y.device,

@@ -28,6 +28,17 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
 )
 
 
+def parse_bool_arg(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -74,6 +85,7 @@ def parse_args() -> argparse.Namespace:
         choices=["deterministic_midpoint_quantile", "stochastic_stratified_quantile"],
         default="stochastic_stratified_quantile",
     )
+    parser.add_argument("--cdro-per-example-sigma-ladders", type=parse_bool_arg, default=True)
     parser.add_argument("--attack-num-steps", type=int, default=1)
     parser.add_argument("--outer-attack-weight", type=float, default=0.3)
     parser.add_argument("--outer-clean-weight", type=float, default=0.0)
@@ -110,6 +122,7 @@ def format_run_desc(args: argparse.Namespace, target_wcu: float) -> str:
         f"{int(args.cifar_train_percent)}pct-n{int(args.cdro_n_steps_path):03d}-"
         f"rho{float(args.cdro_total_budget_rho):.1f}-i{int(args.attack_num_steps)}-"
         f"aw{float(args.outer_attack_weight):.2f}-cw{float(args.outer_clean_weight):.2f}-"
+        f"pel{int(bool(args.cdro_per_example_sigma_ladders))}-"
         f"bg{int(args.batch_gpu)}-resume{int(args.baseline_resume_kimg):06d}-wcu{wcu_tag}"
     )
     return desc.replace(".", "p")
@@ -124,6 +137,7 @@ def build_launch_env(args: argparse.Namespace, *, resume_state: Path, total_kimg
         f"--cdro-sigma-min={float(args.cdro_sigma_min)}",
         f"--cdro-sigma-max={float(args.cdro_sigma_max)}",
         f"--cdro-edm-ladder-mode={str(args.cdro_edm_ladder_mode)}",
+        f"--cdro-per-example-sigma-ladders={'True' if bool(args.cdro_per_example_sigma_ladders) else 'False'}",
         f"--attack-num-steps={int(args.attack_num_steps)}",
         f"--outer-attack-weight={float(args.outer_attack_weight)}",
         f"--outer-clean-weight={float(args.outer_clean_weight)}",
@@ -235,6 +249,7 @@ def main() -> None:
             "cdro_sigma_min": float(args.cdro_sigma_min),
             "cdro_sigma_max": float(args.cdro_sigma_max),
             "cdro_edm_ladder_mode": str(args.cdro_edm_ladder_mode),
+            "cdro_per_example_sigma_ladders": bool(args.cdro_per_example_sigma_ladders),
             "attack_num_steps": int(args.attack_num_steps),
             "outer_attack_weight": float(args.outer_attack_weight),
             "outer_clean_weight": float(args.outer_clean_weight),

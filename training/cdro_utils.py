@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -134,6 +134,48 @@ def sample_log_sigma_stratified_quantile_ladder(
     return sigma_levels
 
 
+def sample_log_sigma_stratified_quantile_ladder_batch(
+    *,
+    sigma_min: float,
+    sigma_max: float,
+    n_steps: int,
+    batch_size: int,
+    p_mean: float,
+    p_std: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if int(n_steps) <= 0:
+        raise ValueError(f"n_steps must be > 0, got {n_steps}")
+    if int(batch_size) <= 0:
+        raise ValueError(f"batch_size must be > 0, got {batch_size}")
+    normal, cdf_min, cdf_max = _truncated_log_sigma_cdf_bounds(
+        sigma_min=sigma_min,
+        sigma_max=sigma_max,
+        p_mean=p_mean,
+        p_std=p_std,
+    )
+    mass = cdf_max - cdf_min
+    jitter = torch.empty((int(batch_size), int(n_steps)), dtype=torch.float64).uniform_(1e-12, 1.0 - 1e-12)
+    strata = torch.arange(0, int(n_steps), dtype=torch.float64).view(1, int(n_steps))
+    probs = (strata + jitter) / float(n_steps)
+    trunc_cdf = cdf_min + probs * mass
+    z_nodes = normal.icdf(trunc_cdf.clamp(min=1e-12, max=1.0 - 1e-12))
+    sigma_positive = torch.exp(z_nodes)
+    if torch.any(sigma_positive <= 0):
+        raise ValueError("Per-example stratified continuation ladders must be strictly positive.")
+    if sigma_positive.shape[1] > 1 and not torch.all(sigma_positive[:, 1:] > sigma_positive[:, :-1]):
+        raise ValueError("Per-example stratified continuation ladders must be strictly increasing.")
+    sigma_levels = torch.cat(
+        [
+            torch.zeros((int(batch_size), 1), dtype=torch.float64),
+            sigma_positive,
+        ],
+        dim=1,
+    ).to(device=device, dtype=dtype)
+    return sigma_levels
+
+
 def build_transition_deltas(
     *,
     sigma_levels: torch.Tensor,
@@ -146,13 +188,13 @@ def build_transition_deltas(
     if float(time_horizon) <= 0.0:
         raise ValueError(f"time_horizon must be > 0, got {time_horizon}")
     if ladder_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER:
-        positive_sigma = sigma_levels[1:]
+        positive_sigma = sigma_levels[..., 1:]
         log_span = math.log(float(sigma_max)) - math.log(float(sigma_min))
         tau = float(time_horizon) * (positive_sigma.log() - math.log(float(sigma_min))) / log_span
         dt = torch.empty_like(tau)
-        dt[0] = tau[0]
-        if tau.numel() > 1:
-            dt[1:] = tau[1:] - tau[:-1]
+        dt[..., 0] = tau[..., 0]
+        if tau.shape[-1] > 1:
+            dt[..., 1:] = tau[..., 1:] - tau[..., :-1]
         return dt
     if log_sigma_edges is None:
         raise ValueError("Deterministic CDRO ladders require log_sigma_edges.")
@@ -212,7 +254,16 @@ def reduce_per_sample(loss: torch.Tensor) -> torch.Tensor:
 def control_transport_cost(control_path: torch.Tensor, transition_deltas: torch.Tensor) -> torch.Tensor:
     flat = control_path.reshape(control_path.shape[0], control_path.shape[1], -1)
     control_sq = flat.pow(2).sum(dim=2)
-    dt = transition_deltas.view(1, -1).to(device=control_sq.device, dtype=control_sq.dtype)
+    if transition_deltas.ndim == 1:
+        dt = transition_deltas.view(1, -1)
+    elif transition_deltas.ndim == 2:
+        dt = transition_deltas
+    else:
+        raise ValueError(
+            "transition_deltas must have shape [steps] or [batch, steps], "
+            f"got {tuple(transition_deltas.shape)}"
+        )
+    dt = dt.to(device=control_sq.device, dtype=control_sq.dtype)
     return (control_sq * dt).sum(dim=1)
 
 
@@ -230,11 +281,30 @@ def build_cdro_ladder(
     total_budget_rho: float,
     time_horizon: float,
     ladder_mode: str,
+    batch_size: Optional[int],
+    per_example_sigma_ladders: bool,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     resolved_mode = resolve_cdro_edm_ladder_mode(ladder_mode)
-    if resolved_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER:
+    if resolved_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER and bool(per_example_sigma_ladders):
+        if batch_size is None or int(batch_size) <= 0:
+            raise ValueError(
+                "Per-example stochastic CDRO ladders require a positive batch_size, "
+                f"got {batch_size}"
+            )
+        sigma_levels = sample_log_sigma_stratified_quantile_ladder_batch(
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            n_steps=n_steps_path,
+            batch_size=int(batch_size),
+            p_mean=p_mean,
+            p_std=p_std,
+            device=device,
+            dtype=dtype,
+        )
+        log_sigma_edges = None
+    elif resolved_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER:
         sigma_levels = sample_log_sigma_stratified_quantile_ladder(
             sigma_min=sigma_min,
             sigma_max=sigma_max,
@@ -271,6 +341,37 @@ def build_cdro_ladder(
     return sigma_levels, transition_deltas, radius_by_step
 
 
+def _path_step_value(values: torch.Tensor, step_idx: int) -> torch.Tensor:
+    if values.ndim == 1:
+        return values[step_idx]
+    if values.ndim == 2:
+        return values[:, step_idx]
+    raise ValueError(f"Expected rank-1 or rank-2 path values, got shape={tuple(values.shape)}")
+
+
+def _batch_vector(value: Union[torch.Tensor, float], *, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return torch.full((batch_size,), float(value.item()), device=device, dtype=dtype)
+        if value.ndim == 1 and int(value.shape[0]) == int(batch_size):
+            return value.to(device=device, dtype=dtype)
+        raise ValueError(
+            "Expected scalar tensor or per-example vector with length batch_size, "
+            f"got shape={tuple(value.shape)} for batch_size={batch_size}"
+        )
+    return torch.full((batch_size,), float(value), device=device, dtype=dtype)
+
+
+def _step_scalar_like(value: Union[torch.Tensor, float], reference: torch.Tensor) -> torch.Tensor:
+    batch_vector = _batch_vector(
+        value,
+        batch_size=int(reference.shape[0]),
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    return batch_vector.view(reference.shape[0], *([1] * (reference.ndim - 1)))
+
+
 def rollout_path_heuristic_attack(
     *,
     attack_net,
@@ -285,7 +386,7 @@ def rollout_path_heuristic_attack(
     augment_labels=None,
 ) -> CDRORollout:
     batch_size = x0.shape[0]
-    n_steps = int(sigma_levels.numel() - 1)
+    n_steps = int(sigma_levels.shape[-1] - 1)
     x_ref = x0.detach()
     x_ctrl = x0.detach()
     path_ref = [x_ref]
@@ -297,34 +398,45 @@ def rollout_path_heuristic_attack(
     attack_net.eval()
     try:
         for step_idx in range(n_steps):
-            sigma_k = sigma_levels[step_idx]
-            sigma_next = sigma_levels[step_idx + 1]
+            sigma_k = _path_step_value(sigma_levels, step_idx)
+            sigma_next = _path_step_value(sigma_levels, step_idx + 1)
             variance_increment = sigma_next.square() - sigma_k.square()
-            if float(variance_increment.item()) < -1e-12:
+            if float(variance_increment.min().item()) < -1e-12:
                 raise ValueError("VE variance increments must be nonnegative.")
             delta_sigma = torch.sqrt(variance_increment.clamp_min(0.0))
-            base_increment = delta_sigma * torch.randn_like(x0)
+            base_increment = _step_scalar_like(delta_sigma, x0) * torch.randn_like(x0)
             reference_state = (x_ref + base_increment).detach()
             x_nominal_next = (x_ctrl + base_increment).detach()
-            sigma_batch = torch.full(
-                (batch_size,),
-                float(sigma_next.item()),
+            sigma_batch = _batch_vector(
+                sigma_next,
+                batch_size=batch_size,
                 device=x0.device,
                 dtype=torch.float32,
             )
 
             control = torch.zeros_like(x_ctrl)
-            delta_tau = float(transition_deltas[step_idx].item())
-            control_cap = torch.full(
-                (batch_size,),
-                float(radius_by_step[step_idx].item()) / max(delta_tau, 1e-12) if delta_tau > 0.0 else 0.0,
+            delta_tau = _batch_vector(
+                _path_step_value(transition_deltas, step_idx),
+                batch_size=batch_size,
                 device=x0.device,
                 dtype=x0.dtype,
             )
-            if delta_tau > 0.0 and torch.any(control_cap > 0.0) and int(inner_steps) > 0:
+            delta_tau_full = _step_scalar_like(delta_tau, x0)
+            radius_step = _batch_vector(
+                _path_step_value(radius_by_step, step_idx),
+                batch_size=batch_size,
+                device=x0.device,
+                dtype=x0.dtype,
+            )
+            control_cap = torch.where(
+                delta_tau > 0.0,
+                radius_step / delta_tau.clamp_min(1e-12),
+                torch.zeros_like(radius_step),
+            )
+            if float(delta_tau.max().item()) > 0.0 and torch.any(control_cap > 0.0) and int(inner_steps) > 0:
                 if int(inner_steps) == 1:
                     control = control.requires_grad_(True)
-                    candidate = x_nominal_next + delta_tau * control
+                    candidate = x_nominal_next + delta_tau_full * control
                     loss_step = weighted_edm_loss_per_pixel(
                         net=attack_net,
                         x_noisy=candidate,
@@ -340,7 +452,7 @@ def rollout_path_heuristic_attack(
                 else:
                     for _ in range(int(inner_steps)):
                         control = control.requires_grad_(True)
-                        candidate = x_nominal_next + delta_tau * control
+                        candidate = x_nominal_next + delta_tau_full * control
                         loss_step = weighted_edm_loss_per_pixel(
                             net=attack_net,
                             x_noisy=candidate,
@@ -356,7 +468,7 @@ def rollout_path_heuristic_attack(
                             control_cap,
                         ).detach()
 
-            delta_effective = delta_tau * control
+            delta_effective = delta_tau_full * control
             x_ref = reference_state
             x_ctrl = (x_nominal_next + delta_effective).detach()
             path_ref.append(x_ref)

@@ -48,6 +48,7 @@ def parse_int_list(s):
 @click.option('--cdro-sigma-min', help='Minimum sigma for the CDRO path ladder', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=0.002, show_default=True)
 @click.option('--cdro-sigma-max', help='Maximum sigma for the CDRO path ladder', metavar='FLOAT', type=click.FloatRange(min=0, min_open=True), default=80.0, show_default=True)
 @click.option('--cdro-edm-ladder-mode', help='CDRO EDM ladder mode', metavar='MODE', type=click.Choice(['deterministic_midpoint_quantile', 'stochastic_stratified_quantile']), default='stochastic_stratified_quantile', show_default=True)
+@click.option('--cdro-per-example-sigma-ladders', help='Use one stochastic CDRO sigma ladder per example when the ladder mode is stochastic', metavar='BOOL', type=bool, default=True, show_default=True)
 @click.option('--attack-num-steps', help='CDRO inner attack steps', metavar='INT', type=click.IntRange(min=0, max=2), default=1, show_default=True)
 @click.option('--outer-attack-weight', help='CDRO attacked-path outer weight', metavar='FLOAT', type=click.FloatRange(min=0), default=0.3, show_default=True)
 @click.option('--outer-clean-weight', help='CDRO clean-path outer weight', metavar='FLOAT', type=click.FloatRange(min=0), default=0.0, show_default=True)
@@ -170,6 +171,7 @@ def main(**kwargs):
             cdro_sigma_min=opts.cdro_sigma_min,
             cdro_sigma_max=opts.cdro_sigma_max,
             cdro_edm_ladder_mode=opts.cdro_edm_ladder_mode,
+            cdro_per_example_sigma_ladders=opts.cdro_per_example_sigma_ladders,
             attack_num_steps=opts.attack_num_steps,
             outer_attack_weight=opts.outer_attack_weight,
             outer_clean_weight=opts.outer_clean_weight,
@@ -288,6 +290,7 @@ def main(**kwargs):
             f"T={c.loss_kwargs.cdro_time_horizon} "
             f"sigma=[{c.loss_kwargs.cdro_sigma_min}, {c.loss_kwargs.cdro_sigma_max}] "
             f"ladder={c.loss_kwargs.cdro_edm_ladder_mode} "
+            f"per_example_ladders={c.loss_kwargs.cdro_per_example_sigma_ladders} "
             f"attack_steps={c.loss_kwargs.attack_num_steps} "
             f"outer_attack={c.loss_kwargs.outer_attack_weight} "
             f"outer_clean={c.loss_kwargs.outer_clean_weight}"
