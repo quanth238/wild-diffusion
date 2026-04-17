@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--venv-dir", type=str, default="/home/bachlc/.venvs/wild-diffusion-h100")
     parser.add_argument("--install-deps", type=str, default="0")
     parser.add_argument("--prepare-dataset", type=str, default="0")
+    parser.add_argument("--fid-backend", type=str, choices=["edm", "pytorch_fid"], default="edm")
     parser.add_argument("--ref-mode", type=str, default="path")
     parser.add_argument("--ref-path", type=str, default="/home/bachlc/GM-CDRO/datasets/fid-refs/cifar10-32x32.npz")
     parser.add_argument("--only-pending", action="store_true", default=False)
@@ -102,6 +103,7 @@ def run_single_eval(row: Dict[str, str], *, args: argparse.Namespace, eval_root:
     if not network_pkl:
         raise RuntimeError(f"Row is missing network_pkl: {row}")
     run_dir = str(row.get("run_dir", "")).strip() or str(Path(network_pkl).resolve().parent)
+    ref_path = str(row.get("ref_path", "")).strip() or str(args.ref_path)
     env = os.environ.copy()
     env.update(
         {
@@ -109,6 +111,7 @@ def run_single_eval(row: Dict[str, str], *, args: argparse.Namespace, eval_root:
             "VENV_DIR": str(args.venv_dir),
             "INSTALL_DEPS": str(args.install_deps),
             "PREPARE_DATASET": str(args.prepare_dataset),
+            "FID_BACKEND": str(args.fid_backend),
             "RUN_DIR": run_dir,
             "NETWORK_PKL": network_pkl,
             "EVAL_ROOT": str(eval_root),
@@ -120,7 +123,7 @@ def run_single_eval(row: Dict[str, str], *, args: argparse.Namespace, eval_root:
             "FID_BATCH": str(args.fid_batch),
             "GEN_STEPS": str(args.gen_steps),
             "REF_MODE": str(args.ref_mode),
-            "REF_PATH": str(args.ref_path),
+            "REF_PATH": ref_path,
             "PYTORCH_CUDA_ALLOC_CONF": env.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         }
     )

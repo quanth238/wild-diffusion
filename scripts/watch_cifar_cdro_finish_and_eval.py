@@ -30,6 +30,10 @@ DEFAULT_MERGED_SUMMARY_JSON = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
     "cifar10_baseline_vs_wdro_cdro_budgeted_compare_summary.json"
 )
+DEFAULT_PYTORCH_FID_REF = (
+    "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
+    "pytorch_fid_cifar10_train_ref_stats.npz"
+)
 DEFAULT_VENV_DIR = "/home/bachlc/.venvs/wild-diffusion-h100"
 
 
@@ -55,6 +59,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--venv-dir", type=str, default=DEFAULT_VENV_DIR)
     parser.add_argument("--install-deps", type=str, default="0")
     parser.add_argument("--prepare-dataset", type=str, default="0")
+    parser.add_argument("--fid-backend", type=str, choices=["edm", "pytorch_fid"], default="pytorch_fid")
+    parser.add_argument("--ref-mode", type=str, default="path")
+    parser.add_argument("--ref-path", type=str, default=DEFAULT_PYTORCH_FID_REF)
     parser.add_argument("--num-images", type=int, default=50000)
     parser.add_argument("--seed-start", type=int, default=0)
     parser.add_argument("--gen-batch", type=int, default=128)
@@ -205,6 +212,12 @@ def run_cdro_eval_in_job(args: argparse.Namespace, manifest_csv: Path, eval_root
         str(args.install_deps),
         "--prepare-dataset",
         str(args.prepare_dataset),
+        "--fid-backend",
+        str(args.fid_backend),
+        "--ref-mode",
+        str(args.ref_mode),
+        "--ref-path",
+        str(args.ref_path),
         "--num-images",
         str(int(args.num_images)),
         "--seed-start",
