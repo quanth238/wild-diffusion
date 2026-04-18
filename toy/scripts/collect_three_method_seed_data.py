@@ -283,6 +283,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-wdro-raw-csv", type=str, default="")
     parser.add_argument("--reuse-cdro-warmup-runs-csv", type=str, default="")
     parser.add_argument("--reuse-cdro-warmup-aggregate-csv", type=str, default="")
+    parser.add_argument(
+        "--robust-warmup-mode",
+        type=str,
+        default="shared_exact",
+        choices=["shared_exact", "method_local_compute_fraction"],
+    )
     parser.add_argument("--wdro-warmup-fraction", type=float, default=0.2)
     parser.add_argument("--wdro-refresh-epochs", type=float, default=100.0)
     parser.add_argument("--wdro-adv-prob", type=float, default=0.3)
@@ -750,6 +756,25 @@ def _canonical_robust_method(method_name: str) -> str:
     return method
 
 
+def _uniform_int_field_from_rows(
+    *,
+    rows: List[Dict],
+    field_name: str,
+    context: str,
+) -> int:
+    values = {
+        int(parsed)
+        for row in rows
+        for parsed in [_optional_int(row.get(field_name))]
+        if parsed is not None
+    }
+    if not values:
+        raise RuntimeError(f"Missing '{field_name}' values in {context}.")
+    if len(values) != 1:
+        raise RuntimeError(f"Expected one unique '{field_name}' in {context}, found {sorted(values)}.")
+    return int(next(iter(values)))
+
+
 def _robust_label(method_name: str) -> str:
     robust_method = _canonical_robust_method(method_name)
     if robust_method == "baseline":
@@ -1132,6 +1157,26 @@ def _wdro_reference_warmup_weighted_fraction(
     return 0.0 if total_weighted <= 0.0 else float(baseline_weighted / total_weighted)
 
 
+def _resolve_fixed_robust_warmup_steps(
+    *,
+    total_steps: int,
+    args: argparse.Namespace,
+    baseline_step_weighted_units: float,
+    wdro_robust_step_weighted_units: float,
+    cdro_robust_step_weighted_units: float,
+    shared_fixed_warmup_steps: Optional[int] = None,
+) -> int:
+    if shared_fixed_warmup_steps is not None:
+        return max(0, min(int(shared_fixed_warmup_steps), max(int(total_steps), 0)))
+    return _cdro_fixed_warmup_steps(
+        total_steps=int(total_steps),
+        args=args,
+        baseline_step_weighted_units=float(baseline_step_weighted_units),
+        wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+        cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+    )
+
+
 def _cdro_fixed_warmup_steps(
     *,
     total_steps: int,
@@ -1243,16 +1288,18 @@ def _solve_cdro_total_steps_for_shared_cap(
     baseline_step_weighted_units: float,
     wdro_robust_step_weighted_units: float,
     cdro_robust_step_weighted_units: float,
+    shared_fixed_warmup_steps: Optional[int] = None,
 ) -> Tuple[int, int, float]:
     target = max(float(shared_weighted_cap), 0.0)
     lo, hi = 0, max(int(args.wdro_max_total_steps), 1)
     while True:
-        warmup = _cdro_fixed_warmup_steps(
+        warmup = _resolve_fixed_robust_warmup_steps(
             total_steps=int(hi),
             args=args,
             baseline_step_weighted_units=float(baseline_step_weighted_units),
             wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
             cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+            shared_fixed_warmup_steps=shared_fixed_warmup_steps,
         )
         weighted = _piecewise_weighted_prefix(
             total_steps_prefix=int(hi),
@@ -1268,12 +1315,13 @@ def _solve_cdro_total_steps_for_shared_cap(
             raise RuntimeError("Could not bracket CDRO total steps for the shared weighted cap.")
     while lo < hi:
         mid = (lo + hi) // 2
-        warmup = _cdro_fixed_warmup_steps(
+        warmup = _resolve_fixed_robust_warmup_steps(
             total_steps=int(mid),
             args=args,
             baseline_step_weighted_units=float(baseline_step_weighted_units),
             wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
             cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+            shared_fixed_warmup_steps=shared_fixed_warmup_steps,
         )
         weighted = _piecewise_weighted_prefix(
             total_steps_prefix=int(mid),
@@ -1286,12 +1334,13 @@ def _solve_cdro_total_steps_for_shared_cap(
         else:
             hi = mid
     total_steps = int(lo)
-    warmup_steps = _cdro_fixed_warmup_steps(
+    warmup_steps = _resolve_fixed_robust_warmup_steps(
         total_steps=int(total_steps),
         args=args,
         baseline_step_weighted_units=float(baseline_step_weighted_units),
         wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
         cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+        shared_fixed_warmup_steps=shared_fixed_warmup_steps,
     )
     weighted_total = _piecewise_weighted_prefix(
         total_steps_prefix=int(total_steps),
@@ -2132,6 +2181,33 @@ def main() -> None:
     baseline_step_weighted_units = _baseline_step_weighted_units(calibration)
     wdro_robust_step_weighted_units = _wdro_expected_robust_step_weighted_units(args, calibration)
     cdro_robust_step_weighted_units = _cdro_expected_robust_step_weighted_units(args, calibration)
+    reused_baseline_runs_csv = str(args.reuse_baseline_runs_csv).strip()
+    reused_baseline_aggregate_csv = str(args.reuse_baseline_aggregate_csv).strip()
+    reused_wdro_raw_csv = str(args.reuse_wdro_raw_csv).strip()
+    wdro_enabled = bool(reused_wdro_raw_csv) or str(args.training_objective).strip().lower() != "rf"
+    reused_wdro_rows_cache: List[Dict] = []
+    reused_wdro_fixed_warmup_steps: Optional[int] = None
+    reused_wdro_trajectory_total_steps_max: Optional[int] = None
+    if reused_wdro_raw_csv:
+        if not os.path.isfile(reused_wdro_raw_csv):
+            raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
+        reused_wdro_rows_cache = [
+            _apply_wall_clock_accounting(row=_ensure_row_fid_fields(row), args=args)
+            for row in load_csv_rows(reused_wdro_raw_csv)
+            if _canonical_robust_method(str(row.get("method", ""))) == "wild_diffusion" and int(row["seed"]) in seeds
+        ]
+        if not reused_wdro_rows_cache:
+            raise RuntimeError(f"No WDRO rows found in reused raw CSV for seeds={seeds}: {reused_wdro_raw_csv}")
+        reused_wdro_fixed_warmup_steps = _uniform_int_field_from_rows(
+            rows=reused_wdro_rows_cache,
+            field_name="fixed_warmup_steps",
+            context=f"reused WDRO raw CSV {reused_wdro_raw_csv}",
+        )
+        reused_wdro_trajectory_total_steps_max = _uniform_int_field_from_rows(
+            rows=reused_wdro_rows_cache,
+            field_name="trajectory_total_steps_max",
+            context=f"reused WDRO raw CSV {reused_wdro_raw_csv}",
+        )
 
     baseline_cap_from_limit = float(int(args.baseline_max_steps)) * float(baseline_step_weighted_units)
     requested_shared_cap = (
@@ -2139,17 +2215,21 @@ def main() -> None:
         if float(args.shared_weighted_cap) <= 0.0
         else min(float(args.shared_weighted_cap), float(baseline_cap_from_limit))
     )
-    wdro_max_total_steps = _solve_total_steps_for_target_weighted(
-        target_weighted_units=float(requested_shared_cap),
-        max_total_steps=int(args.wdro_max_total_steps),
-        warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
-        baseline_step_weighted_units=float(baseline_step_weighted_units),
-        robust_step_weighted_units=float(wdro_robust_step_weighted_units),
-    )
-    wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
-        total_steps=int(wdro_max_total_steps),
-        args=args,
-    )
+    if reused_wdro_rows_cache:
+        wdro_max_total_steps = int(reused_wdro_trajectory_total_steps_max)
+        wdro_fixed_warmup_steps = int(reused_wdro_fixed_warmup_steps)
+    else:
+        wdro_max_total_steps = _solve_total_steps_for_target_weighted(
+            target_weighted_units=float(requested_shared_cap),
+            max_total_steps=int(args.wdro_max_total_steps),
+            warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
+            baseline_step_weighted_units=float(baseline_step_weighted_units),
+            robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+        )
+        wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
+            total_steps=int(wdro_max_total_steps),
+            args=args,
+        )
     wdro_shared_cap = _piecewise_weighted_prefix(
         total_steps_prefix=int(wdro_max_total_steps),
         fixed_warmup_steps=int(wdro_fixed_warmup_steps),
@@ -2157,6 +2237,11 @@ def main() -> None:
         robust_step_weighted_units=float(wdro_robust_step_weighted_units),
     )
     shared_weighted_cap = min(float(requested_shared_cap), float(wdro_shared_cap))
+    shared_robust_fixed_warmup_steps = (
+        int(wdro_fixed_warmup_steps)
+        if bool(wdro_enabled) and str(args.robust_warmup_mode).strip().lower() == "shared_exact"
+        else None
+    )
 
     cdro_max_total_steps, cdro_fixed_warmup_steps, cdro_shared_cap = _solve_cdro_total_steps_for_shared_cap(
         shared_weighted_cap=float(shared_weighted_cap),
@@ -2164,19 +2249,24 @@ def main() -> None:
         baseline_step_weighted_units=float(baseline_step_weighted_units),
         wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
         cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+        shared_fixed_warmup_steps=shared_robust_fixed_warmup_steps,
     )
     shared_weighted_cap = min(float(shared_weighted_cap), float(cdro_shared_cap))
-    wdro_max_total_steps = _solve_total_steps_for_target_weighted(
-        target_weighted_units=float(shared_weighted_cap),
-        max_total_steps=int(args.wdro_max_total_steps),
-        warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
-        baseline_step_weighted_units=float(baseline_step_weighted_units),
-        robust_step_weighted_units=float(wdro_robust_step_weighted_units),
-    )
-    wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
-        total_steps=int(wdro_max_total_steps),
-        args=args,
-    )
+    if reused_wdro_rows_cache:
+        wdro_max_total_steps = int(reused_wdro_trajectory_total_steps_max)
+        wdro_fixed_warmup_steps = int(reused_wdro_fixed_warmup_steps)
+    else:
+        wdro_max_total_steps = _solve_total_steps_for_target_weighted(
+            target_weighted_units=float(shared_weighted_cap),
+            max_total_steps=int(args.wdro_max_total_steps),
+            warmup_steps_fn=lambda total: _wdro_warmup_steps_for_total(total_steps=int(total), args=args),
+            baseline_step_weighted_units=float(baseline_step_weighted_units),
+            robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+        )
+        wdro_fixed_warmup_steps = _wdro_warmup_steps_for_total(
+            total_steps=int(wdro_max_total_steps),
+            args=args,
+        )
     wdro_shared_cap = _piecewise_weighted_prefix(
         total_steps_prefix=int(wdro_max_total_steps),
         fixed_warmup_steps=int(wdro_fixed_warmup_steps),
@@ -2276,13 +2366,14 @@ def main() -> None:
     print(
         "[collect-weighted] wdro "
         f"max_total_steps={int(wdro_max_total_steps)} "
-        f"warmup_mode=fixed_from_max_budget fixed_warmup_steps={int(wdro_fixed_warmup_steps)}",
+        f"warmup_mode={'reused_raw_trajectory' if reused_wdro_raw_csv else 'fixed_from_max_budget'} "
+        f"fixed_warmup_steps={int(wdro_fixed_warmup_steps)}",
         flush=True,
     )
     print(
         "[collect-weighted] cdro "
         f"max_total_steps={int(cdro_max_total_steps)} "
-        f"warmup_mode=fixed_from_max_budget fixed_warmup_steps={int(cdro_fixed_warmup_steps)}",
+        f"warmup_mode={str(args.robust_warmup_mode).strip().lower()} fixed_warmup_steps={int(cdro_fixed_warmup_steps)}",
         flush=True,
     )
     print(f"[collect-weighted] weighted_targets={weighted_grid_targets}", flush=True)
@@ -2304,11 +2395,6 @@ def main() -> None:
     print(f"[collect-weighted] wdro_fid_eval_steps={wdro_fid_eval_steps}", flush=True)
     print(f"[collect-weighted] cdro_steps={cdro_curve_steps}", flush=True)
     print(f"[collect-weighted] cdro_fid_eval_steps={cdro_fid_eval_steps}", flush=True)
-
-    reused_baseline_runs_csv = str(args.reuse_baseline_runs_csv).strip()
-    reused_baseline_aggregate_csv = str(args.reuse_baseline_aggregate_csv).strip()
-    reused_wdro_raw_csv = str(args.reuse_wdro_raw_csv).strip()
-    wdro_enabled = bool(reused_wdro_raw_csv) or str(args.training_objective).strip().lower() != "rf"
 
     baseline_outdir = os.path.join(args.outdir, "baseline")
     wdro_root = os.path.join(args.outdir, "wdro")
@@ -2388,21 +2474,14 @@ def main() -> None:
             flush=True,
         )
     elif reused_wdro_raw_csv:
-        if not os.path.isfile(reused_wdro_raw_csv):
-            raise FileNotFoundError(f"Requested reused WDRO raw CSV not found: {reused_wdro_raw_csv}")
-        reused_rows = [
-            _apply_wall_clock_accounting(row=_ensure_row_fid_fields(row), args=args)
-            for row in load_csv_rows(reused_wdro_raw_csv)
-            if _canonical_robust_method(str(row.get("method", ""))) == "wild_diffusion" and int(row["seed"]) in seeds
-        ]
-        if not reused_rows:
-            raise RuntimeError(f"No WDRO rows found in reused raw CSV for seeds={seeds}: {reused_wdro_raw_csv}")
-        wdro_rows.extend(reused_rows)
+        wdro_rows.extend(reused_wdro_rows_cache)
         wdro_rows.sort(key=lambda row: (int(row["seed"]), int(row["step"])))
         wdro_seed_manifests = [
             {
                 "seed": int(seed),
                 "reused_raw_csv": reused_wdro_raw_csv,
+                "trajectory_total_steps_max": int(wdro_max_total_steps),
+                "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
             }
             for seed in seeds
         ]
@@ -2740,10 +2819,11 @@ def main() -> None:
                 "Raw per-seed data collection on a shared weighted-compute grid. Baseline runs as one native "
                 "checkpointed trajectory. WDRO and CDRO each use one same-seed same-method trajectory: a "
                 "method-local checkpointed warmup baseline trajectory up to a fixed warmup checkpoint, then a "
-                "continued robust trajectory resumed only from that method's own checkpoints. Comparison rows are "
-                "emitted only at shared weighted-grid checkpoints, while FID evaluation may run on a coarser "
-                "schedule over those saved checkpoints; exact warmup checkpoints are auxiliary support artifacts. "
-                "Aggregation is intentionally deferred to later analysis."
+                "continued robust trajectory resumed only from that method's own checkpoints. When "
+                "robust_warmup_mode=shared_exact, WDRO and CDRO share the same exact warmup checkpoint step. "
+                "Comparison rows are emitted only at shared weighted-grid checkpoints, while FID evaluation may run "
+                "on a coarser schedule over those saved checkpoints; exact warmup checkpoints are auxiliary support "
+                "artifacts. Aggregation is intentionally deferred to later analysis."
             ),
             "seeds": seeds,
             "shared_grid_template_name": str(grid_template["name"]),
@@ -2790,6 +2870,10 @@ def main() -> None:
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
             "wdro_enabled": bool(wdro_enabled),
             "wdro_optional_for_rf_first_milestone": bool(str(args.training_objective).strip().lower() == "rf"),
+            "robust_warmup_mode": str(args.robust_warmup_mode).strip().lower(),
+            "shared_robust_fixed_warmup_steps": (
+                None if shared_robust_fixed_warmup_steps is None else int(shared_robust_fixed_warmup_steps)
+            ),
         },
         "weighted_compute": {
             "shared_cap": float(shared_weighted_cap),
@@ -2811,7 +2895,9 @@ def main() -> None:
             "wdro": {
                 "enabled": bool(wdro_enabled),
                 "max_total_steps": int(wdro_max_total_steps),
-                "warmup_mode": "fixed_from_max_budget_trajectory",
+                "warmup_mode": (
+                    "reused_raw_trajectory" if reused_wdro_raw_csv else "fixed_from_max_budget_trajectory"
+                ),
                 "fixed_warmup_steps": int(wdro_fixed_warmup_steps),
                 "warmup_support_steps": [int(wdro_fixed_warmup_steps)] if int(wdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": wdro_curve_steps,
@@ -2819,7 +2905,7 @@ def main() -> None:
             },
             "cdro": {
                 "max_total_steps": int(cdro_max_total_steps),
-                "warmup_mode": "fixed_from_max_budget_trajectory",
+                "warmup_mode": str(args.robust_warmup_mode).strip().lower(),
                 "fixed_warmup_steps": int(cdro_fixed_warmup_steps),
                 "warmup_support_steps": [int(cdro_fixed_warmup_steps)] if int(cdro_fixed_warmup_steps) > 0 else [],
                 "checkpoint_steps": cdro_curve_steps,

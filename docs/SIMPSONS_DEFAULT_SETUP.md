@@ -169,6 +169,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --robust-fid-mode posthoc_from_checkpoints \
   --baseline-max-steps 160000 \
   --wdro-max-total-steps 160000 \
+  --robust-warmup-mode shared_exact \
   --wdro-warmup-fraction 0.2 \
   --inner-steps 1 \
   --outer-attack-weight 1.0 \

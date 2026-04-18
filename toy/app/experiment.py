@@ -25,6 +25,7 @@ from ..compute_accounting import (
     solve_warmup_steps_for_target_compute_fraction,
     wdro_robust_step_weighted_compute_units,
     weighted_compute_units,
+    weighted_compute_units_from_count_record,
 )
 from ..data_backends.provider import DatasetBundle, build_dataset_bundle
 from ..diagnostics_backends.provider import build_diagnostics_bundle
@@ -375,7 +376,7 @@ def _warm_start_rf_model_from_state_dict(model, source_state_dict: Dict[str, tor
     }
 
 
-def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle) -> Dict[str, Any]:
+def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dict[str, Any]) -> Dict[str, Any]:
     """Initialize RF models from an EDM checkpoint when requested."""
 
     objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
@@ -386,6 +387,19 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle) -> Dict[str, Any
         "source_state_key": None,
         "baseline": None,
         "robust": None,
+        "prefix_accounting": {
+            "available": False,
+            "source": "unavailable",
+            "runtime_source": "unavailable",
+            "count_source": "unavailable",
+            "step": None,
+            "batch_size": None,
+            "images_seen_total": None,
+            "batch_equiv_denoiser_evals_total": None,
+            "train_wall_clock_sec": None,
+            "weighted_counts": None,
+            "weighted_compute_units": None,
+        },
     }
     if objective != "rf" or not ckpt_path:
         return report
@@ -396,6 +410,11 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle) -> Dict[str, Any
     source_state, source_key = _checkpoint_state_dict_for_rf_init(payload)
     report["path"] = abs_path
     report["source_state_key"] = source_key
+    report["prefix_accounting"] = _extract_rf_init_prefix_accounting(
+        ckpt_path=abs_path,
+        payload=payload,
+        calibration=calibration,
+    )
     report["baseline"] = _warm_start_rf_model_from_state_dict(model_bundle.baseline, source_state)
     report["robust"] = _warm_start_rf_model_from_state_dict(model_bundle.robust, source_state)
     if int(report["baseline"]["transferred_count"]) <= 0:
@@ -429,6 +448,94 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _optional_int(value: Any) -> Optional[int]:
+    parsed = _optional_float(value)
+    if parsed is None:
+        return None
+    return int(parsed)
+
+
+def _normalize_count_record(count_record: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    if not isinstance(count_record, dict):
+        return None
+    n_fwd = _optional_float(count_record.get("n_fwd"))
+    n_fwd_inputgrad = _optional_float(count_record.get("n_fwd_inputgrad"))
+    n_fwd_parambackward = _optional_float(count_record.get("n_fwd_parambackward"))
+    if n_fwd is None or n_fwd_inputgrad is None or n_fwd_parambackward is None:
+        return None
+    return {
+        "n_fwd": float(n_fwd),
+        "n_fwd_inputgrad": float(n_fwd_inputgrad),
+        "n_fwd_parambackward": float(n_fwd_parambackward),
+    }
+
+
+def _add_count_records(
+    left: Optional[Dict[str, float]],
+    right: Optional[Dict[str, float]],
+) -> Optional[Dict[str, float]]:
+    if left is None and right is None:
+        return None
+    if left is None:
+        return dict(right)
+    if right is None:
+        return dict(left)
+    return {
+        "n_fwd": float(left["n_fwd"] + right["n_fwd"]),
+        "n_fwd_inputgrad": float(left["n_fwd_inputgrad"] + right["n_fwd_inputgrad"]),
+        "n_fwd_parambackward": float(left["n_fwd_parambackward"] + right["n_fwd_parambackward"]),
+    }
+
+
+def _count_record_batch_equiv_total(count_record: Optional[Dict[str, float]]) -> Optional[float]:
+    if count_record is None:
+        return None
+    return float(
+        float(count_record["n_fwd"])
+        + float(count_record["n_fwd_inputgrad"])
+        + float(count_record["n_fwd_parambackward"])
+    )
+
+
+def _prefix_count_record_from_history(history: Optional[Dict[str, Any]], prefix_steps: int) -> Optional[Dict[str, float]]:
+    prefix_steps_value = max(int(prefix_steps), 0)
+    if prefix_steps_value <= 0:
+        return {
+            "n_fwd": 0.0,
+            "n_fwd_inputgrad": 0.0,
+            "n_fwd_parambackward": 0.0,
+        }
+    if not isinstance(history, dict) or not bool(history.get("denoiser_op_counts_recorded", False)):
+        return None
+    ensure_denoiser_op_count_history(history)
+    step_n_fwd = history.get("denoiser_op_n_fwd_step", [])
+    step_n_fwd_inputgrad = history.get("denoiser_op_n_fwd_inputgrad_step", [])
+    step_n_fwd_parambackward = history.get("denoiser_op_n_fwd_parambackward_step", [])
+    if (
+        len(step_n_fwd) < prefix_steps_value
+        or len(step_n_fwd_inputgrad) < prefix_steps_value
+        or len(step_n_fwd_parambackward) < prefix_steps_value
+    ):
+        return None
+    return {
+        "n_fwd": float(sum(float(v) for v in step_n_fwd[:prefix_steps_value])),
+        "n_fwd_inputgrad": float(sum(float(v) for v in step_n_fwd_inputgrad[:prefix_steps_value])),
+        "n_fwd_parambackward": float(sum(float(v) for v in step_n_fwd_parambackward[:prefix_steps_value])),
+    }
+
+
+def _prefix_wall_clock_from_history(history: Optional[Dict[str, Any]], prefix_steps: int) -> Optional[float]:
+    prefix_steps_value = max(int(prefix_steps), 0)
+    if prefix_steps_value <= 0:
+        return 0.0
+    if not isinstance(history, dict):
+        return None
+    step_wall_clock = history.get("rf_step_wall_clock_sec", [])
+    if len(step_wall_clock) < prefix_steps_value:
+        return None
+    return float(sum(float(v) for v in step_wall_clock[:prefix_steps_value]))
+
+
 def _sum_float_series(values) -> float:
     """Stable float sum over metric histories that may contain mixed scalar types."""
 
@@ -457,6 +564,197 @@ def _device_accounting_metadata(device: torch.device) -> Dict[str, Any]:
         "train_accelerator_count": int(accelerator_count),
         "train_gpu_count": int(1 if device_type == "cuda" else 0),
     }
+
+
+def _extract_rf_init_prefix_accounting(
+    *,
+    ckpt_path: str,
+    payload: Any,
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    report: Dict[str, Any] = {
+        "available": False,
+        "source": "unavailable",
+        "runtime_source": "unavailable",
+        "count_source": "unavailable",
+        "step": None,
+        "batch_size": None,
+        "images_seen_total": None,
+        "batch_equiv_denoiser_evals_total": None,
+        "train_wall_clock_sec": None,
+        "weighted_counts": None,
+        "weighted_compute_units": None,
+    }
+    if not isinstance(payload, dict):
+        return report
+
+    cumulative = payload.get("cumulative_accounting")
+    if isinstance(cumulative, dict):
+        count_record = _normalize_count_record(cumulative.get("baseline_weighted_counts"))
+        batch_equiv_total = _optional_float(cumulative.get("baseline_batch_equiv_denoiser_evals_total"))
+        if batch_equiv_total is None:
+            batch_equiv_total = _count_record_batch_equiv_total(count_record)
+        weighted_total = _optional_float(cumulative.get("baseline_weighted_compute_units"))
+        if weighted_total is None and count_record is not None:
+            weighted_total = weighted_compute_units_from_count_record(
+                count_record=count_record,
+                calibration=calibration,
+            )
+        train_wall_clock_sec = _optional_float(cumulative.get("baseline_train_wall_clock_sec_effective"))
+        report.update(
+            {
+                "available": bool(
+                    count_record is not None
+                    or batch_equiv_total is not None
+                    or weighted_total is not None
+                    or train_wall_clock_sec is not None
+                ),
+                "source": "robust_resume_cumulative_accounting",
+                "runtime_source": (
+                    "robust_resume_cumulative_accounting" if train_wall_clock_sec is not None else "unavailable"
+                ),
+                "count_source": "robust_resume_cumulative_accounting" if count_record is not None else "unavailable",
+                "images_seen_total": _optional_int(cumulative.get("baseline_images_seen_total")),
+                "batch_equiv_denoiser_evals_total": (
+                    None if batch_equiv_total is None else float(batch_equiv_total)
+                ),
+                "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
+                "weighted_counts": count_record,
+                "weighted_compute_units": None if weighted_total is None else float(weighted_total),
+            }
+        )
+        return report
+
+    baseline_signature = payload.get("baseline_signature")
+    if not isinstance(baseline_signature, dict):
+        baseline_signature = {}
+    step = _optional_int(baseline_signature.get("baseline_steps", payload.get("step")))
+    batch_size = _optional_int(baseline_signature.get("batch_size"))
+    baseline_history = payload.get("baseline_history")
+    count_record = None
+    count_source = "unavailable"
+    if isinstance(baseline_history, dict):
+        count_record = _normalize_count_record(read_denoiser_op_count_totals(baseline_history))
+        if count_record is not None:
+            count_source = "baseline_history_direct"
+    if count_record is None and step is not None:
+        count_record = {
+            "n_fwd": 0.0,
+            "n_fwd_inputgrad": 0.0,
+            "n_fwd_parambackward": float(max(int(step), 0)),
+        }
+        count_source = "baseline_steps_inference"
+    batch_equiv_total = _count_record_batch_equiv_total(count_record)
+    weighted_total = None
+    if count_record is not None:
+        weighted_total = weighted_compute_units_from_count_record(
+            count_record=count_record,
+            calibration=calibration,
+        )
+    train_wall_clock_sec = None
+    runtime_source = "unavailable"
+    runtime = payload.get("baseline_runtime")
+    if isinstance(runtime, dict):
+        train_wall_clock_sec = _optional_float(runtime.get("train_wall_clock_sec", runtime.get("baseline_train_wall_clock_sec")))
+        if train_wall_clock_sec is not None:
+            runtime_source = "baseline_runtime_payload"
+    if train_wall_clock_sec is None and step is not None:
+        resolved_runtime = _resolve_baseline_reference_train_wall_clock_sec(
+            ckpt_path=ckpt_path,
+            planned_steps=int(step),
+        )
+        train_wall_clock_sec = _optional_float(resolved_runtime.get("train_wall_clock_sec"))
+        if train_wall_clock_sec is not None:
+            runtime_source = str(resolved_runtime.get("source", "baseline_reference_runtime"))
+    images_seen_total = None
+    if step is not None and batch_size is not None:
+        images_seen_total = int(max(int(step), 0) * max(int(batch_size), 0))
+    report.update(
+        {
+            "available": bool(
+                count_record is not None
+                or batch_equiv_total is not None
+                or weighted_total is not None
+                or train_wall_clock_sec is not None
+            ),
+            "source": "baseline_checkpoint_accounting",
+            "runtime_source": str(runtime_source),
+            "count_source": str(count_source),
+            "step": None if step is None else int(step),
+            "batch_size": None if batch_size is None else int(batch_size),
+            "images_seen_total": images_seen_total,
+            "batch_equiv_denoiser_evals_total": None if batch_equiv_total is None else float(batch_equiv_total),
+            "train_wall_clock_sec": None if train_wall_clock_sec is None else float(train_wall_clock_sec),
+            "weighted_counts": count_record,
+            "weighted_compute_units": None if weighted_total is None else float(weighted_total),
+        }
+    )
+    return report
+
+
+def _build_rf_stage_boundary_accounting(
+    *,
+    history: Optional[Dict[str, Any]],
+    stage1_steps: int,
+    reflow_steps: int,
+    prefix_batch_equiv_total: Optional[float],
+    prefix_weighted_compute_units: Optional[float],
+    prefix_train_wall_clock_sec: Optional[float],
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    report = {
+        "available": False,
+        "stage1_steps": int(max(int(stage1_steps), 0)),
+        "reflow_steps": int(max(int(reflow_steps), 0)),
+        "continuation_batch_equiv_denoiser_evals": None,
+        "continuation_weighted_compute_units": None,
+        "continuation_train_wall_clock_sec": None,
+        "absolute_batch_equiv_denoiser_evals": None,
+        "absolute_weighted_compute_units": None,
+        "absolute_train_wall_clock_sec": None,
+    }
+    if int(reflow_steps) <= 0:
+        return report
+    stage1_count_record = _prefix_count_record_from_history(history, int(stage1_steps))
+    stage1_batch_equiv_total = _count_record_batch_equiv_total(stage1_count_record)
+    stage1_weighted_total = None
+    if stage1_count_record is not None:
+        stage1_weighted_total = weighted_compute_units_from_count_record(
+            count_record=stage1_count_record,
+            calibration=calibration,
+        )
+    stage1_wall_clock_sec = _prefix_wall_clock_from_history(history, int(stage1_steps))
+    absolute_batch_equiv_total = None
+    if prefix_batch_equiv_total is not None and stage1_batch_equiv_total is not None:
+        absolute_batch_equiv_total = float(prefix_batch_equiv_total + stage1_batch_equiv_total)
+    absolute_weighted_total = None
+    if prefix_weighted_compute_units is not None and stage1_weighted_total is not None:
+        absolute_weighted_total = float(prefix_weighted_compute_units + stage1_weighted_total)
+    absolute_wall_clock_sec = None
+    if prefix_train_wall_clock_sec is not None and stage1_wall_clock_sec is not None:
+        absolute_wall_clock_sec = float(prefix_train_wall_clock_sec + stage1_wall_clock_sec)
+    report.update(
+        {
+            "available": bool(
+                stage1_batch_equiv_total is not None
+                or stage1_weighted_total is not None
+                or stage1_wall_clock_sec is not None
+            ),
+            "continuation_batch_equiv_denoiser_evals": (
+                None if stage1_batch_equiv_total is None else float(stage1_batch_equiv_total)
+            ),
+            "continuation_weighted_compute_units": (
+                None if stage1_weighted_total is None else float(stage1_weighted_total)
+            ),
+            "continuation_train_wall_clock_sec": (
+                None if stage1_wall_clock_sec is None else float(stage1_wall_clock_sec)
+            ),
+            "absolute_batch_equiv_denoiser_evals": absolute_batch_equiv_total,
+            "absolute_weighted_compute_units": absolute_weighted_total,
+            "absolute_train_wall_clock_sec": absolute_wall_clock_sec,
+        }
+    )
+    return report
 
 
 def _resolve_baseline_reference_train_wall_clock_sec(
@@ -530,6 +828,7 @@ def _compute_weighted_accounting(
     attack_training_executed: bool,
     calibration: Dict[str, Any],
     preserved_baseline_counts: Optional[Dict[str, Any]] = None,
+    baseline_prefix_counts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build method-aware weighted-op counts and totals from training histories."""
 
@@ -555,6 +854,14 @@ def _compute_weighted_accounting(
             baseline_n_fwd_inputgrad = float(direct_baseline_counts["n_fwd_inputgrad"])
             baseline_n_fwd_parambackward = float(direct_baseline_counts["n_fwd_parambackward"])
             baseline_count_source = "history_direct"
+    prefix_baseline_counts = _normalize_count_record(baseline_prefix_counts)
+    if preserved_baseline_counts is None and prefix_baseline_counts is not None:
+        baseline_n_fwd = float(baseline_n_fwd + prefix_baseline_counts["n_fwd"])
+        baseline_n_fwd_inputgrad = float(baseline_n_fwd_inputgrad + prefix_baseline_counts["n_fwd_inputgrad"])
+        baseline_n_fwd_parambackward = float(
+            baseline_n_fwd_parambackward + prefix_baseline_counts["n_fwd_parambackward"]
+        )
+        baseline_count_source = f"{baseline_count_source}+rf_init_prefix"
 
     robust_n_fwd = 0.0
     robust_n_fwd_inputgrad = 0.0
@@ -564,9 +871,7 @@ def _compute_weighted_accounting(
         direct_robust_counts = read_denoiser_op_count_totals(history_robust)
         if direct_robust_counts is not None:
             if method_name == "cdro":
-                # Exclude the attacked-path frozen-denoiser reevaluation used only for
-                # `inner_obj` monitoring / NaN guarding from weighted compute.
-                robust_n_fwd = 0.0
+                robust_n_fwd = float(direct_robust_counts["n_fwd"])
                 robust_count_source = "history_direct_cdro_adjusted"
             else:
                 robust_n_fwd = float(direct_robust_counts["n_fwd"])
@@ -593,7 +898,7 @@ def _compute_weighted_accounting(
             else:
                 attack_enabled = bool(float(cfg.outer_attack_weight) > 0.0 and int(cfg.inner_steps) > 0)
             if method_name == "cdro":
-                robust_n_fwd = 0.0
+                robust_n_fwd = _sum_float_series(history_robust.get("rf_reflow_pair_fwd_units", []))
             else:
                 robust_n_fwd = float(path_steps * robust_steps_total)
             if method_name == "cdro" and not attack_enabled:
@@ -1709,7 +2014,7 @@ def run_experiment(cfg) -> dict:
     baseline = model_bundle.baseline
     robust = model_bundle.robust
     control = model_bundle.control
-    rf_edm_init_report = _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle)
+    rf_edm_init_report = _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, weighted_calibration)
     if is_cdro_rf and not rf_edm_init_report.get("enabled"):
         raise RuntimeError(
             "CDRO-RF requires a shared EDM warm-start checkpoint. "
