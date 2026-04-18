@@ -159,10 +159,14 @@ def cdro_adjusted_weighted_compute_from_compute_accounting(
         count_record=baseline_counts,
         calibration=effective_calibration,
     )
+    robust_count_source = str(robust_counts.get("count_source", "")).strip().lower()
+    override_n_fwd = 0.0
+    if robust_count_source in {"history_direct_cdro_adjusted", "history_inferred_cdro_adjusted"}:
+        override_n_fwd = _safe_float(robust_counts.get("n_fwd"))
     robust_weighted = weighted_compute_units_from_count_record(
         count_record=robust_counts,
         calibration=effective_calibration,
-        override_n_fwd=0.0,
+        override_n_fwd=override_n_fwd,
     )
     robust_logging_only_forward_count = _safe_float(robust_counts.get("n_fwd"))
     if baseline_weighted is None or robust_weighted is None:
@@ -172,7 +176,11 @@ def cdro_adjusted_weighted_compute_from_compute_accounting(
         "robust_weighted_compute_units": float(robust_weighted),
         "weighted_compute_units": float(baseline_weighted + robust_weighted),
         "robust_logging_only_forward_count_excluded": (
-            0.0 if robust_logging_only_forward_count is None else float(robust_logging_only_forward_count)
+            (
+                0.0
+                if robust_logging_only_forward_count is None
+                else float(max(float(robust_logging_only_forward_count) - float(override_n_fwd or 0.0), 0.0))
+            )
         ),
     }
 

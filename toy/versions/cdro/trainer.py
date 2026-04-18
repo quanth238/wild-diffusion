@@ -1,4 +1,5 @@
 import copy
+import time
 from typing import Callable, Optional
 
 import torch
@@ -485,6 +486,8 @@ def train_trajectory_robust_cdro(
         "batch_equiv_denoiser_evals_attack_construction": [],
         "batch_equiv_denoiser_evals_attack_eval": [],
         "batch_equiv_denoiser_evals_clean_eval": [],
+        "rf_reflow_pair_fwd_units": [],
+        "rf_step_wall_clock_sec": [],
         "batch_equiv_denoiser_evals_cumulative": [],
     }
     for key in (
@@ -515,6 +518,8 @@ def train_trajectory_robust_cdro(
         "batch_equiv_denoiser_evals_attack_construction",
         "batch_equiv_denoiser_evals_attack_eval",
         "batch_equiv_denoiser_evals_clean_eval",
+        "rf_reflow_pair_fwd_units",
+        "rf_step_wall_clock_sec",
         "batch_equiv_denoiser_evals_cumulative",
     ):
         history.setdefault(key, [])
@@ -633,6 +638,7 @@ def train_trajectory_robust_cdro(
     )
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
+        step_t0 = time.perf_counter()
         x_data = sample_train_batch(
             cfg,
             centers,
@@ -643,6 +649,7 @@ def train_trajectory_robust_cdro(
         x0 = x_data
         rf_pair_left = None
         current_rf_stage = None
+        reflow_pair_fwd_units = 0.0
         current_sigma_levels = sigma_levels
         current_transition_deltas = transition_deltas
         current_radius_by_step = radius_by_step
@@ -663,6 +670,7 @@ def train_trajectory_robust_cdro(
                     x_data,
                     sample_terminal_batch_fn=None,
                 )
+                reflow_pair_fwd_units = float(max(int(rf_stage_grids["rf_reflow"]["sigma_levels"].numel()) - 1, 0))
                 current_rf_stage = "rf_reflow"
             stage_grid = _sample_rf_cdro_stage_grid_info(
                 cfg,
@@ -888,7 +896,7 @@ def train_trajectory_robust_cdro(
         outer_loss_attack = torch.tensor(outer_loss_attack_val, device=x0.device, dtype=x0.dtype)
         outer_loss_clean = torch.tensor(outer_loss_clean_val, device=x0.device, dtype=x0.dtype)
         outer_loss = torch.tensor(outer_loss_val, device=x0.device, dtype=x0.dtype)
-        step_batch_equiv_evals = attack_construction_units + attack_eval_units + clean_eval_units
+        step_batch_equiv_evals = attack_construction_units + attack_eval_units + clean_eval_units + reflow_pair_fwd_units
         cumulative_batch_equiv_evals += step_batch_equiv_evals
 
         history["outer_loss"].append(scalarize(outer_loss))
@@ -907,6 +915,7 @@ def train_trajectory_robust_cdro(
         history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
         history["batch_equiv_denoiser_evals_attack_eval"].append(float(attack_eval_units))
         history["batch_equiv_denoiser_evals_clean_eval"].append(float(clean_eval_units))
+        history["rf_reflow_pair_fwd_units"].append(float(reflow_pair_fwd_units))
         history["batch_equiv_denoiser_evals_cumulative"].append(float(cumulative_batch_equiv_evals))
         effective_outer_branches = (
             float(int(lambda_ctrl > 0.0) + int(lambda_ref > 0.0))
@@ -915,10 +924,11 @@ def train_trajectory_robust_cdro(
         )
         append_denoiser_op_count_step(
             history,
-            n_fwd=float(path_batch_equiv_evals) * rollout_multiplier if attack_path_enabled else 0.0,
+            n_fwd=float(reflow_pair_fwd_units),
             n_fwd_inputgrad=float(attack_construction_units),
             n_fwd_parambackward=float(path_batch_equiv_evals) * effective_outer_branches * rollout_multiplier,
         )
+        history["rf_step_wall_clock_sec"].append(float(time.perf_counter() - step_t0))
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)

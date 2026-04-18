@@ -2029,6 +2029,15 @@ def run_experiment(cfg) -> dict:
             f"robust_transferred={rf_edm_init_report['robust']['transferred_count']}",
             flush=True,
         )
+        prefix_info = rf_edm_init_report.get("prefix_accounting", {})
+        print(
+            "[rf-init] prefix_accounting "
+            f"available={bool(prefix_info.get('available', False))} "
+            f"source={prefix_info.get('source', 'unavailable')} "
+            f"weighted={prefix_info.get('weighted_compute_units')} "
+            f"wall_clock={prefix_info.get('train_wall_clock_sec')}",
+            flush=True,
+        )
 
     check_report = {}
     if cfg.run_checks:
@@ -2536,6 +2545,23 @@ def run_experiment(cfg) -> dict:
             or "baseline_weighted_counts" in robust_resume_accounting
         )
     )
+    rf_init_prefix_accounting = rf_edm_init_report.get("prefix_accounting", {})
+    rf_init_prefix_counts = None
+    rf_init_prefix_images_seen_total = None
+    rf_init_prefix_batch_equiv_total = None
+    rf_init_prefix_train_wall_clock_sec = None
+    if not preserve_baseline_from_resume and isinstance(rf_init_prefix_accounting, dict):
+        if bool(rf_init_prefix_accounting.get("available", False)):
+            rf_init_prefix_counts = _normalize_count_record(rf_init_prefix_accounting.get("weighted_counts"))
+            rf_init_prefix_images_seen_total = _optional_int(rf_init_prefix_accounting.get("images_seen_total"))
+            rf_init_prefix_batch_equiv_total = _optional_float(
+                rf_init_prefix_accounting.get("batch_equiv_denoiser_evals_total")
+            )
+            if rf_init_prefix_batch_equiv_total is None:
+                rf_init_prefix_batch_equiv_total = _count_record_batch_equiv_total(rf_init_prefix_counts)
+            rf_init_prefix_train_wall_clock_sec = _optional_float(
+                rf_init_prefix_accounting.get("train_wall_clock_sec")
+            )
     baseline_phase_images_seen_total = int(baseline_steps_for_phase * int(cfg.batch_size))
     baseline_phase_batch_equiv_total = float(baseline_steps_for_phase)
     direct_baseline_batch_equiv_counts = read_denoiser_op_count_totals(history_baseline)
@@ -2548,14 +2574,14 @@ def run_experiment(cfg) -> dict:
     baseline_images_seen_total = int(
         robust_resume_accounting.get("baseline_images_seen_total", 0)
         if preserve_baseline_from_resume
-        else baseline_phase_images_seen_total
+        else baseline_phase_images_seen_total + int(rf_init_prefix_images_seen_total or 0)
     )
     robust_images_seen_total = int(actual_robust_steps_completed * int(cfg.batch_size) if attack_training_executed else 0)
     effective_train_images_seen_total = int(baseline_images_seen_total + robust_images_seen_total)
     baseline_batch_equiv_total = float(
         robust_resume_accounting.get("baseline_batch_equiv_denoiser_evals_total", 0.0)
         if preserve_baseline_from_resume
-        else baseline_phase_batch_equiv_total
+        else baseline_phase_batch_equiv_total + float(rf_init_prefix_batch_equiv_total or 0.0)
     )
     robust_batch_equiv_total = float(robust_batch_equiv_cumulative_summary["final"] or 0.0)
     effective_train_batch_equiv_total = float(baseline_batch_equiv_total + robust_batch_equiv_total)
@@ -2566,15 +2592,33 @@ def run_experiment(cfg) -> dict:
     )
     baseline_train_wall_clock_source = "robust_resume_accounting"
     if baseline_train_wall_clock_sec_effective is None:
+        baseline_continuation_wall_clock_sec = None
+        baseline_continuation_wall_clock_source = "missing_reused_baseline_reference_runtime"
         if baseline_steps_for_phase <= 0:
-            baseline_train_wall_clock_sec_effective = 0.0
-            baseline_train_wall_clock_source = "zero_steps"
+            baseline_continuation_wall_clock_sec = 0.0
+            baseline_continuation_wall_clock_source = "zero_steps"
         elif runtime_sec["baseline_train"] > 0.0:
-            baseline_train_wall_clock_sec_effective = float(runtime_sec["baseline_train"])
-            baseline_train_wall_clock_source = "executed_in_run"
+            baseline_continuation_wall_clock_sec = float(runtime_sec["baseline_train"])
+            baseline_continuation_wall_clock_source = "executed_in_run"
         elif baseline_reference_runtime["train_wall_clock_sec"] is not None:
-            baseline_train_wall_clock_sec_effective = float(baseline_reference_runtime["train_wall_clock_sec"])
-            baseline_train_wall_clock_source = str(baseline_reference_runtime["source"])
+            baseline_continuation_wall_clock_sec = float(baseline_reference_runtime["train_wall_clock_sec"])
+            baseline_continuation_wall_clock_source = str(baseline_reference_runtime["source"])
+
+        if rf_init_prefix_train_wall_clock_sec is not None and baseline_continuation_wall_clock_sec is not None:
+            baseline_train_wall_clock_sec_effective = float(
+                rf_init_prefix_train_wall_clock_sec + baseline_continuation_wall_clock_sec
+            )
+            baseline_train_wall_clock_source = (
+                f"rf_init_prefix_accounting+{baseline_continuation_wall_clock_source}"
+            )
+        elif rf_init_prefix_train_wall_clock_sec is not None and baseline_steps_for_phase <= 0:
+            baseline_train_wall_clock_sec_effective = float(rf_init_prefix_train_wall_clock_sec)
+            baseline_train_wall_clock_source = "rf_init_prefix_accounting"
+        elif baseline_continuation_wall_clock_sec is not None:
+            baseline_train_wall_clock_sec_effective = float(baseline_continuation_wall_clock_sec)
+            baseline_train_wall_clock_source = str(baseline_continuation_wall_clock_source)
+        elif rf_init_prefix_train_wall_clock_sec is not None:
+            baseline_train_wall_clock_source = "rf_init_prefix_accounting+missing_continuation_runtime"
         else:
             baseline_train_wall_clock_source = "missing_reused_baseline_reference_runtime"
     preserved_baseline_weighted_counts = None
@@ -2593,6 +2637,7 @@ def run_experiment(cfg) -> dict:
         attack_training_executed=attack_training_executed,
         calibration=weighted_calibration,
         preserved_baseline_counts=preserved_baseline_weighted_counts,
+        baseline_prefix_counts=rf_init_prefix_counts,
     )
     runtime_sec["baseline_weighted_n_fwd"] = float(weighted_accounting["baseline"]["n_fwd"])
     runtime_sec["baseline_weighted_n_fwd_inputgrad"] = float(weighted_accounting["baseline"]["n_fwd_inputgrad"])
@@ -2601,6 +2646,77 @@ def run_experiment(cfg) -> dict:
     )
     runtime_sec["baseline_weighted_compute_units"] = weighted_accounting["baseline"]["weighted_compute_units"]
     runtime_sec["baseline_train_wall_clock_sec_effective"] = baseline_train_wall_clock_sec_effective
+    runtime_sec["baseline_prefix_images_seen_total"] = (
+        None if rf_init_prefix_images_seen_total is None else int(rf_init_prefix_images_seen_total)
+    )
+    runtime_sec["baseline_prefix_batch_equiv_denoiser_evals_total"] = (
+        None if rf_init_prefix_batch_equiv_total is None else float(rf_init_prefix_batch_equiv_total)
+    )
+    runtime_sec["baseline_prefix_train_wall_clock_sec"] = (
+        None if rf_init_prefix_train_wall_clock_sec is None else float(rf_init_prefix_train_wall_clock_sec)
+    )
+    runtime_sec["baseline_prefix_weighted_compute_units"] = (
+        None
+        if not isinstance(rf_init_prefix_accounting, dict)
+        else _optional_float(rf_init_prefix_accounting.get("weighted_compute_units"))
+    )
+    runtime_sec["baseline_prefix_accounting_source"] = (
+        str(rf_init_prefix_accounting.get("source", "unavailable"))
+        if isinstance(rf_init_prefix_accounting, dict)
+        else "unavailable"
+    )
+
+    rf_init_enabled = bool(rf_edm_init_report.get("enabled"))
+    rf_prefix_batch_equiv_for_boundary = (
+        None
+        if rf_init_enabled and rf_init_prefix_batch_equiv_total is None
+        else float(rf_init_prefix_batch_equiv_total or 0.0)
+    )
+    rf_prefix_weighted_for_boundary = (
+        None
+        if rf_init_enabled and _optional_float(rf_init_prefix_accounting.get("weighted_compute_units")) is None
+        else float(_optional_float(rf_init_prefix_accounting.get("weighted_compute_units")) or 0.0)
+    )
+    rf_prefix_wall_clock_for_boundary = (
+        None
+        if rf_init_enabled and rf_init_prefix_train_wall_clock_sec is None
+        else float(rf_init_prefix_train_wall_clock_sec or 0.0)
+    )
+    robust_prefix_batch_equiv_for_boundary = (
+        None
+        if rf_init_enabled and baseline_steps_for_phase <= 0 and rf_init_prefix_batch_equiv_total is None
+        else float(baseline_batch_equiv_total)
+    )
+    robust_prefix_weighted_for_boundary = (
+        None
+        if rf_init_enabled
+        and baseline_steps_for_phase <= 0
+        and _optional_float(rf_init_prefix_accounting.get("weighted_compute_units")) is None
+        else _optional_float(weighted_accounting["baseline"]["weighted_compute_units"])
+    )
+    robust_prefix_wall_clock_for_boundary = (
+        None
+        if rf_init_enabled and baseline_steps_for_phase <= 0 and baseline_train_wall_clock_sec_effective is None
+        else baseline_train_wall_clock_sec_effective
+    )
+    baseline_rf_reflow_start = _build_rf_stage_boundary_accounting(
+        history=history_baseline,
+        stage1_steps=int(history_baseline.get("rf_stage1_steps", 0) or 0),
+        reflow_steps=int(history_baseline.get("rf_reflow_steps", 0) or 0),
+        prefix_batch_equiv_total=rf_prefix_batch_equiv_for_boundary,
+        prefix_weighted_compute_units=rf_prefix_weighted_for_boundary,
+        prefix_train_wall_clock_sec=rf_prefix_wall_clock_for_boundary,
+        calibration=weighted_calibration,
+    )
+    robust_rf_reflow_start = _build_rf_stage_boundary_accounting(
+        history=history_robust,
+        stage1_steps=int(history_robust.get("rf_stage1_steps", 0) or 0),
+        reflow_steps=int(history_robust.get("rf_reflow_steps", 0) or 0),
+        prefix_batch_equiv_total=robust_prefix_batch_equiv_for_boundary,
+        prefix_weighted_compute_units=robust_prefix_weighted_for_boundary,
+        prefix_train_wall_clock_sec=robust_prefix_wall_clock_for_boundary,
+        calibration=weighted_calibration,
+    )
 
     cdro_attack_num_steps, cdro_attack_num_steps_source = _resolve_cdro_attack_num_steps(cfg)
     metrics = {
@@ -2658,6 +2774,25 @@ def run_experiment(cfg) -> dict:
             "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
             "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
             "rf_edm_init": rf_edm_init_report,
+            "rf_stage_boundaries": {
+                "shared_edm_warm_start": (
+                    {
+                        "available": bool(
+                            isinstance(rf_init_prefix_accounting, dict)
+                            and rf_init_prefix_accounting.get("available", False)
+                        ),
+                        "batch_equiv_denoiser_evals_total": rf_init_prefix_batch_equiv_total,
+                        "weighted_compute_units": (
+                            None
+                            if not isinstance(rf_init_prefix_accounting, dict)
+                            else _optional_float(rf_init_prefix_accounting.get("weighted_compute_units"))
+                        ),
+                        "train_wall_clock_sec": rf_init_prefix_train_wall_clock_sec,
+                    }
+                ),
+                "baseline_reflow_start": baseline_rf_reflow_start,
+                "robust_reflow_start": robust_rf_reflow_start,
+            },
             "rf_cdro_pair_source": str(getattr(cfg, "rf_cdro_pair_source", "auto")),
             "rf_cdro_stage1_t_distribution": rf_cdro_stage1_t_distribution,
             "rf_cdro_reflow_t_distribution": rf_cdro_reflow_t_distribution,
@@ -2729,6 +2864,13 @@ def run_experiment(cfg) -> dict:
                 "train_accelerator_name": accelerator_meta["train_accelerator_name"],
                 "train_accelerator_count": int(accelerator_meta["train_accelerator_count"]),
                 "train_gpu_count": int(accelerator_meta["train_gpu_count"]),
+                "baseline_prefix_accounting_source": runtime_sec["baseline_prefix_accounting_source"],
+                "baseline_prefix_train_wall_clock_sec": runtime_sec["baseline_prefix_train_wall_clock_sec"],
+                "baseline_prefix_weighted_compute_units": runtime_sec["baseline_prefix_weighted_compute_units"],
+                "baseline_prefix_batch_equiv_denoiser_evals_total": (
+                    runtime_sec["baseline_prefix_batch_equiv_denoiser_evals_total"]
+                ),
+                "baseline_prefix_images_seen_total": runtime_sec["baseline_prefix_images_seen_total"],
                 "weighted_compute_units": weighted_accounting["effective"]["weighted_compute_units"],
                 "baseline_weighted_compute_units": weighted_accounting["baseline"]["weighted_compute_units"],
                 "robust_weighted_compute_units": weighted_accounting["robust"]["weighted_compute_units"],

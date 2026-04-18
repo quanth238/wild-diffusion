@@ -1,5 +1,6 @@
 import copy
 import math
+import time
 from typing import Callable, Optional
 
 import torch
@@ -130,6 +131,7 @@ def _train_rf_pair_stage(
     """Train one RF stage on explicit straight-path pairs."""
 
     for local_step in range(1, int(num_steps) + 1):
+        step_t0 = time.perf_counter()
         global_step = int(global_step_offset) + int(local_step)
         x_template = sample_train_batch(
             cfg,
@@ -198,7 +200,9 @@ def _train_rf_pair_stage(
                 f"loss={loss.item():.6f} proxy_weighted_denoise={proxy_loss.item():.6f} "
                 f"t_mean={float(t.detach().mean().item()):.4f}",
                 flush=True,
-            )
+                )
+
+        history.setdefault("rf_step_wall_clock_sec", []).append(float(time.perf_counter() - step_t0))
 
     return ema_model
 
@@ -221,6 +225,7 @@ def _train_strong_rf_baseline(
         "rf_stage": [],
         "rf_t_mean": [],
         "rf_reflow_pair_batches": [],
+        "rf_step_wall_clock_sec": [],
     }
     ensure_denoiser_op_count_history(history)
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
