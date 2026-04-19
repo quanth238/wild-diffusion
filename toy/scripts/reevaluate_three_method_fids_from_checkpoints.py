@@ -271,7 +271,11 @@ def _canonical_robust_method(method_name: str) -> str:
 def _is_baseline_style_row(row: Dict[str, str]) -> bool:
     robust_method = _canonical_robust_method(row.get("robust_method", row.get("method", "")))
     row_origin = str(row.get("row_origin", "")).strip()
-    return robust_method == "baseline" or row_origin == "trajectory_warmup_phase"
+    if row_origin == "trajectory_warmup_phase":
+        return True
+    if robust_method != "baseline":
+        return False
+    return row_origin != "trajectory_robust_phase"
 
 
 def _checkpoint_branch(row: Dict[str, str]) -> str:
@@ -1054,7 +1058,7 @@ def _evaluate_checkpoint_metrics(
         else:
             state_dict, checkpoint_state_variant = _load_robust_state_dict(
                 checkpoint_path,
-                str(row.get("method", "")),
+                str(row.get("method_version_used", row.get("method", ""))),
                 prefer_ema=bool(getattr(ctx.cfg, "use_ema_eval", False)),
             )
         log_handle.write(f"[fid-only] checkpoint_state_variant={checkpoint_state_variant}\n")

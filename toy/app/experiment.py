@@ -21,7 +21,9 @@ from ..compute_accounting import (
     cdro_robust_step_weighted_compute_units,
     ensure_denoiser_op_count_history,
     load_weighted_compute_calibration,
+    predicted_denoiser_wall_clock_sec_from_count_record,
     read_denoiser_op_count_totals,
+    resolve_default_weighted_compute_calibration_path,
     solve_warmup_steps_for_target_compute_fraction,
     wdro_robust_step_weighted_compute_units,
     weighted_compute_units,
@@ -757,6 +759,52 @@ def _build_rf_stage_boundary_accounting(
     return report
 
 
+def _cumulative_count_curves_from_history(history: Optional[Dict[str, Any]]) -> Optional[Dict[str, list[float]]]:
+    if not isinstance(history, dict) or not bool(history.get("denoiser_op_counts_recorded", False)):
+        return None
+    ensure_denoiser_op_count_history(history)
+    return {
+        "n_fwd": [float(v) for v in history.get("denoiser_op_n_fwd_cumulative", [])],
+        "n_fwd_inputgrad": [float(v) for v in history.get("denoiser_op_n_fwd_inputgrad_cumulative", [])],
+        "n_fwd_parambackward": [float(v) for v in history.get("denoiser_op_n_fwd_parambackward_cumulative", [])],
+    }
+
+
+def _cumulative_metric_curve_from_history(
+    *,
+    history: Optional[Dict[str, Any]],
+    prefix_value: float,
+    metric_fn,
+) -> list[float]:
+    count_curves = _cumulative_count_curves_from_history(history)
+    if count_curves is None:
+        return []
+    n_items = min(
+        len(count_curves["n_fwd"]),
+        len(count_curves["n_fwd_inputgrad"]),
+        len(count_curves["n_fwd_parambackward"]),
+    )
+    out: list[float] = []
+    for idx in range(n_items):
+        metric_value = metric_fn(
+            {
+                "n_fwd": float(count_curves["n_fwd"][idx]),
+                "n_fwd_inputgrad": float(count_curves["n_fwd_inputgrad"][idx]),
+                "n_fwd_parambackward": float(count_curves["n_fwd_parambackward"][idx]),
+            }
+        )
+        if metric_value is None:
+            return []
+        out.append(float(prefix_value + float(metric_value)))
+    return out
+
+
+def _subtract_optional(observed: Optional[float], predicted: Optional[float]) -> Optional[float]:
+    if observed is None or predicted is None:
+        return None
+    return float(observed - predicted)
+
+
 def _resolve_baseline_reference_train_wall_clock_sec(
     *,
     ckpt_path: str,
@@ -1316,7 +1364,15 @@ def _resolve_phase_steps(
             "cdro_robust_step_weighted_compute_units": None,
         }
 
-    if str(method_name).lower() == "wdro":
+    if str(method_name).lower() == "clean":
+        split_mode = "clean_baseline_steps_override" if baseline_steps_override > 0 else "clean_full_budget_continuation"
+        if baseline_steps_override > 0:
+            baseline_steps = int(cfg.baseline_steps_override)
+        else:
+            baseline_steps = 0
+        baseline_steps = max(0, min(baseline_steps, total_steps))
+        robust_steps = max(total_steps - baseline_steps, 0)
+    elif str(method_name).lower() == "wdro":
         split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
         if baseline_steps_override > 0:
             baseline_steps = int(cfg.baseline_steps_override)
@@ -1790,6 +1846,8 @@ def _run_robust_phase(
         if baseline_handoff_state is not None and method_name in ("clean", "wdro", "cdro"):
             trainer_kwargs["optimizer_theta_state"] = baseline_handoff_state.get("optimizer_theta_state")
             trainer_kwargs["ema_state_dict"] = baseline_handoff_state.get("ema_state_dict")
+            if method_name == "clean":
+                trainer_kwargs["start_step"] = int(baseline_handoff_state.get("step", 0) or 0)
 
     attack_training_executed = True
     train_result = method.train_trajectory_robust(
@@ -1845,10 +1903,36 @@ def run_experiment(cfg) -> dict:
         "plotting_and_persist": 0.0,
     }
     accelerator_meta = _device_accounting_metadata(device)
+    requested_weighted_calibration_path = str(getattr(cfg, "weighted_compute_calibration_path", "")).strip()
+    resolved_weighted_calibration_path = resolve_default_weighted_compute_calibration_path(
+        calibration_path=requested_weighted_calibration_path,
+        training_objective=str(getattr(cfg, "training_objective", "edm")),
+        image_backbone=str(getattr(cfg, "image_backbone", "conv")),
+        batch_size=int(getattr(cfg, "batch_size", 256)),
+        hidden_dim=int(getattr(cfg, "hidden_dim", 64)),
+        device=str(device),
+    )
     weighted_calibration = load_weighted_compute_calibration(
-        calibration_path=str(getattr(cfg, "weighted_compute_calibration_path", "")).strip(),
+        calibration_path=resolved_weighted_calibration_path,
         inputgrad_alpha=float(getattr(cfg, "weighted_inputgrad_alpha", 0.0)),
         parambackward_beta=float(getattr(cfg, "weighted_parambackward_beta", 0.0)),
+        training_objective=str(getattr(cfg, "training_objective", "edm")),
+        image_backbone=str(getattr(cfg, "image_backbone", "conv")),
+        batch_size=int(getattr(cfg, "batch_size", 256)),
+        hidden_dim=int(getattr(cfg, "hidden_dim", 64)),
+        image_size=int(getattr(cfg, "image_size", 0) or 0),
+        image_channels=int(getattr(cfg, "image_channels", 0) or 0),
+        device=str(device),
+        device_name=str(accelerator_meta["train_accelerator_name"]),
+        amp_dtype=format_amp_dtype(amp_dtype),
+        allow_tf32=bool(getattr(cfg, "allow_tf32", True)),
+        cudnn_benchmark=bool(getattr(cfg, "cudnn_benchmark", True)),
+        score_matching_weight_power=float(getattr(cfg, "score_matching_weight_power", 2.0)),
+    )
+    weighted_calibration = dict(weighted_calibration)
+    weighted_calibration["requested_calibration_path"] = requested_weighted_calibration_path or None
+    weighted_calibration["resolved_by_default"] = bool(
+        not requested_weighted_calibration_path and resolved_weighted_calibration_path
     )
 
     ensure_dir(cfg.outdir)
@@ -1910,10 +1994,41 @@ def run_experiment(cfg) -> dict:
         "[info] weighted_compute "
         f"available={weighted_calibration['available']} "
         f"source={weighted_calibration['source']} "
+        f"path={weighted_calibration.get('calibration_path')} "
+        f"resolved_by_default={weighted_calibration.get('resolved_by_default', False)} "
         f"alpha={weighted_calibration['inputgrad_alpha']} "
         f"beta={weighted_calibration['parambackward_beta']}",
         flush=True,
     )
+    calibration_compatibility = weighted_calibration.get("compatibility", {})
+    if isinstance(calibration_compatibility, dict) and calibration_compatibility.get("available", False):
+        advisory_mismatches = calibration_compatibility.get("advisory_mismatches", [])
+        if advisory_mismatches:
+            mismatch_summary = "; ".join(
+                f"{item['field']}: expected={item['expected']} actual={item['actual']}"
+                for item in advisory_mismatches
+                if isinstance(item, dict)
+            )
+            if mismatch_summary:
+                print(
+                    "[WARN] weighted_compute calibration hardware differs from the active run "
+                    f"(using timing ratios anyway): {mismatch_summary}",
+                    flush=True,
+                )
+    timing_payload = weighted_calibration.get("payload") if isinstance(weighted_calibration, dict) else None
+    forward_only_timing = None
+    if isinstance(timing_payload, dict):
+        timings_sec = timing_payload.get("timings_sec", {})
+        if isinstance(timings_sec, dict):
+            forward_stats = timings_sec.get("forward_only", {})
+            if isinstance(forward_stats, dict):
+                forward_only_timing = _optional_float(forward_stats.get("median_sec"))
+    if forward_only_timing is not None:
+        print(
+            "[info] weighted_compute_timing "
+            f"forward_only_median_sec={forward_only_timing:.6f}",
+            flush=True,
+        )
     print(f"[info] exp_dir={exp_dir}", flush=True)
     print(
         "[info] flow_mode="
@@ -2038,6 +2153,12 @@ def run_experiment(cfg) -> dict:
             f"wall_clock={prefix_info.get('train_wall_clock_sec')}",
             flush=True,
         )
+        if not bool(prefix_info.get("available", False)):
+            print(
+                "[WARN] RF warm-start checkpoint does not expose reusable prefix accounting; "
+                "absolute RF wall-clock / weighted-compute plots will be incomplete.",
+                flush=True,
+            )
 
     check_report = {}
     if cfg.run_checks:
@@ -2604,7 +2725,14 @@ def run_experiment(cfg) -> dict:
             baseline_continuation_wall_clock_sec = float(baseline_reference_runtime["train_wall_clock_sec"])
             baseline_continuation_wall_clock_source = str(baseline_reference_runtime["source"])
 
-        if rf_init_prefix_train_wall_clock_sec is not None and baseline_continuation_wall_clock_sec is not None:
+        if bool(rf_edm_init_report.get("enabled")) and rf_init_prefix_train_wall_clock_sec is None:
+            if baseline_continuation_wall_clock_sec is not None:
+                baseline_train_wall_clock_source = (
+                    f"missing_rf_init_prefix_runtime+{baseline_continuation_wall_clock_source}"
+                )
+            else:
+                baseline_train_wall_clock_source = "missing_rf_init_prefix_runtime"
+        elif rf_init_prefix_train_wall_clock_sec is not None and baseline_continuation_wall_clock_sec is not None:
             baseline_train_wall_clock_sec_effective = float(
                 rf_init_prefix_train_wall_clock_sec + baseline_continuation_wall_clock_sec
             )
@@ -2716,6 +2844,80 @@ def run_experiment(cfg) -> dict:
         prefix_weighted_compute_units=robust_prefix_weighted_for_boundary,
         prefix_train_wall_clock_sec=robust_prefix_wall_clock_for_boundary,
         calibration=weighted_calibration,
+    )
+    rf_init_prefix_weighted_compute_units = (
+        None
+        if not isinstance(rf_init_prefix_accounting, dict)
+        else _optional_float(rf_init_prefix_accounting.get("weighted_compute_units"))
+    )
+    rf_init_prefix_predicted_denoiser_wall_clock_sec = predicted_denoiser_wall_clock_sec_from_count_record(
+        count_record=rf_init_prefix_counts,
+        calibration=weighted_calibration,
+    )
+    baseline_predicted_denoiser_wall_clock_sec = predicted_denoiser_wall_clock_sec_from_count_record(
+        count_record=weighted_accounting["baseline"],
+        calibration=weighted_calibration,
+    )
+    robust_predicted_denoiser_wall_clock_sec = predicted_denoiser_wall_clock_sec_from_count_record(
+        count_record=weighted_accounting["robust"],
+        calibration=weighted_calibration,
+    )
+    predicted_denoiser_train_wall_clock_sec = predicted_denoiser_wall_clock_sec_from_count_record(
+        count_record=weighted_accounting["effective"],
+        calibration=weighted_calibration,
+    )
+    baseline_weighted_curve_reference = (
+        "continuation_only_missing_rf_prefix"
+        if rf_init_enabled and rf_init_prefix_weighted_compute_units is None
+        else "absolute"
+    )
+    baseline_predicted_curve_reference = (
+        "continuation_only_missing_rf_prefix"
+        if rf_init_enabled and rf_init_prefix_predicted_denoiser_wall_clock_sec is None
+        else "absolute"
+    )
+    robust_curve_reference = (
+        "absolute_incomplete_missing_rf_prefix" if rf_init_enabled and rf_init_prefix_counts is None else "absolute"
+    )
+    baseline_weighted_compute_units_curve = _cumulative_metric_curve_from_history(
+        history=history_baseline,
+        prefix_value=(
+            0.0
+            if baseline_weighted_curve_reference != "absolute"
+            else float(rf_init_prefix_weighted_compute_units or 0.0)
+        ),
+        metric_fn=lambda count_record: weighted_compute_units_from_count_record(
+            count_record=count_record,
+            calibration=weighted_calibration,
+        ),
+    )
+    robust_weighted_compute_units_curve = _cumulative_metric_curve_from_history(
+        history=history_robust,
+        prefix_value=float(weighted_accounting["baseline"]["weighted_compute_units"] or 0.0),
+        metric_fn=lambda count_record: weighted_compute_units_from_count_record(
+            count_record=count_record,
+            calibration=weighted_calibration,
+        ),
+    )
+    baseline_predicted_denoiser_wall_clock_sec_curve = _cumulative_metric_curve_from_history(
+        history=history_baseline,
+        prefix_value=(
+            0.0
+            if baseline_predicted_curve_reference != "absolute"
+            else float(rf_init_prefix_predicted_denoiser_wall_clock_sec or 0.0)
+        ),
+        metric_fn=lambda count_record: predicted_denoiser_wall_clock_sec_from_count_record(
+            count_record=count_record,
+            calibration=weighted_calibration,
+        ),
+    )
+    robust_predicted_denoiser_wall_clock_sec_curve = _cumulative_metric_curve_from_history(
+        history=history_robust,
+        prefix_value=float(baseline_predicted_denoiser_wall_clock_sec or 0.0),
+        metric_fn=lambda count_record: predicted_denoiser_wall_clock_sec_from_count_record(
+            count_record=count_record,
+            calibration=weighted_calibration,
+        ),
     )
 
     cdro_attack_num_steps, cdro_attack_num_steps_source = _resolve_cdro_attack_num_steps(cfg)
@@ -2864,6 +3066,9 @@ def run_experiment(cfg) -> dict:
                 "train_accelerator_name": accelerator_meta["train_accelerator_name"],
                 "train_accelerator_count": int(accelerator_meta["train_accelerator_count"]),
                 "train_gpu_count": int(accelerator_meta["train_gpu_count"]),
+                "baseline_prefix_accounting_available": bool(
+                    isinstance(rf_init_prefix_accounting, dict) and rf_init_prefix_accounting.get("available", False)
+                ),
                 "baseline_prefix_accounting_source": runtime_sec["baseline_prefix_accounting_source"],
                 "baseline_prefix_train_wall_clock_sec": runtime_sec["baseline_prefix_train_wall_clock_sec"],
                 "baseline_prefix_weighted_compute_units": runtime_sec["baseline_prefix_weighted_compute_units"],
@@ -2874,6 +3079,13 @@ def run_experiment(cfg) -> dict:
                 "weighted_compute_units": weighted_accounting["effective"]["weighted_compute_units"],
                 "baseline_weighted_compute_units": weighted_accounting["baseline"]["weighted_compute_units"],
                 "robust_weighted_compute_units": weighted_accounting["robust"]["weighted_compute_units"],
+                "predicted_denoiser_train_wall_clock_sec": predicted_denoiser_train_wall_clock_sec,
+                "baseline_predicted_denoiser_wall_clock_sec": baseline_predicted_denoiser_wall_clock_sec,
+                "robust_predicted_denoiser_wall_clock_sec": robust_predicted_denoiser_wall_clock_sec,
+                "non_denoiser_train_overhead_wall_clock_sec": None,
+                "baseline_non_denoiser_overhead_wall_clock_sec": None,
+                "robust_non_denoiser_overhead_wall_clock_sec": None,
+                "observed_over_predicted_denoiser_wall_clock_ratio": None,
                 "weighted_compute_calibration": weighted_calibration,
                 "weighted_counts": weighted_accounting,
                 "unit_name": "batch_equiv_denoiser_evals",
@@ -2955,10 +3167,26 @@ def run_experiment(cfg) -> dict:
             "baseline_sigma_counts": history_baseline.get("sigma_counts", []),
             "baseline_rf_stage_curve": [str(v) for v in history_baseline.get("rf_stage", [])],
             "baseline_rf_t_mean_curve": [float(v) for v in history_baseline.get("rf_t_mean", [])],
+            "baseline_rf_step_wall_clock_sec": summarize_series(history_baseline.get("rf_step_wall_clock_sec", [])),
+            "baseline_rf_step_wall_clock_sec_curve": [
+                float(v) for v in history_baseline.get("rf_step_wall_clock_sec", [])
+            ],
             "baseline_rf_stage1_steps": int(history_baseline.get("rf_stage1_steps", 0) or 0),
             "baseline_rf_reflow_steps": int(history_baseline.get("rf_reflow_steps", 0) or 0),
+            "baseline_weighted_compute_units_curve": baseline_weighted_compute_units_curve,
+            "baseline_weighted_compute_units_curve_reference": str(baseline_weighted_curve_reference),
+            "baseline_predicted_denoiser_wall_clock_sec_curve": baseline_predicted_denoiser_wall_clock_sec_curve,
+            "baseline_predicted_denoiser_wall_clock_sec_curve_reference": str(baseline_predicted_curve_reference),
             "robust_rf_stage_curve": [str(v) for v in history_robust.get("rf_stage", [])],
             "robust_rf_t_distribution_curve": [str(v) for v in history_robust.get("rf_t_distribution", [])],
+            "robust_rf_step_wall_clock_sec": summarize_series(history_robust.get("rf_step_wall_clock_sec", [])),
+            "robust_rf_step_wall_clock_sec_curve": [
+                float(v) for v in history_robust.get("rf_step_wall_clock_sec", [])
+            ],
+            "robust_rf_reflow_pair_fwd_units": summarize_series(history_robust.get("rf_reflow_pair_fwd_units", [])),
+            "robust_rf_reflow_pair_fwd_units_curve": [
+                float(v) for v in history_robust.get("rf_reflow_pair_fwd_units", [])
+            ],
             "robust_rf_stage1_t_distribution_resolved": str(
                 history_robust.get("rf_stage1_t_distribution_resolved", "")
             ),
@@ -2976,6 +3204,10 @@ def run_experiment(cfg) -> dict:
             ),
             "robust_rf_stage1_steps": int(history_robust.get("rf_stage1_steps", 0) or 0),
             "robust_rf_reflow_steps": int(history_robust.get("rf_reflow_steps", 0) or 0),
+            "robust_weighted_compute_units_curve": robust_weighted_compute_units_curve,
+            "robust_weighted_compute_units_curve_reference": str(robust_curve_reference),
+            "robust_predicted_denoiser_wall_clock_sec_curve": robust_predicted_denoiser_wall_clock_sec_curve,
+            "robust_predicted_denoiser_wall_clock_sec_curve_reference": str(robust_curve_reference),
             "robust_outer_loss": summarize_series(history_robust["outer_loss"]),
             "robust_outer_loss_attack": summarize_series(history_robust.get("outer_loss_attack", [])),
             "robust_outer_loss_clean": summarize_series(history_robust.get("outer_loss_clean", [])),
@@ -3456,12 +3688,42 @@ def run_experiment(cfg) -> dict:
         if train_wall_clock_sec is None
         else float(train_wall_clock_sec) * float(accelerator_meta["train_gpu_count"]) / 3600.0
     )
+    baseline_non_denoiser_overhead_wall_clock_sec = _subtract_optional(
+        baseline_train_wall_clock_sec_effective,
+        baseline_predicted_denoiser_wall_clock_sec,
+    )
+    robust_non_denoiser_overhead_wall_clock_sec = _subtract_optional(
+        _optional_float(runtime_sec.get("robust_phase")),
+        robust_predicted_denoiser_wall_clock_sec,
+    )
+    non_denoiser_train_overhead_wall_clock_sec = _subtract_optional(
+        train_wall_clock_sec,
+        predicted_denoiser_train_wall_clock_sec,
+    )
+    observed_over_predicted_denoiser_wall_clock_ratio = None
+    if (
+        train_wall_clock_sec is not None
+        and predicted_denoiser_train_wall_clock_sec is not None
+        and float(predicted_denoiser_train_wall_clock_sec) > 0.0
+    ):
+        observed_over_predicted_denoiser_wall_clock_ratio = float(
+            float(train_wall_clock_sec) / float(predicted_denoiser_train_wall_clock_sec)
+        )
     runtime_sec["train_wall_clock_sec"] = train_wall_clock_sec
     runtime_sec["train_gpu_hours"] = train_gpu_hours
     runtime_sec["train_wall_clock_complete"] = bool(train_wall_clock_complete)
     runtime_sec["baseline_train_wall_clock_sec_effective_source"] = baseline_train_wall_clock_source
     runtime_sec["baseline_reference_train_wall_clock_sec"] = baseline_reference_runtime["train_wall_clock_sec"]
     runtime_sec["baseline_reference_train_wall_clock_source"] = baseline_reference_runtime["source"]
+    runtime_sec["predicted_denoiser_train_wall_clock_sec"] = predicted_denoiser_train_wall_clock_sec
+    runtime_sec["baseline_predicted_denoiser_wall_clock_sec"] = baseline_predicted_denoiser_wall_clock_sec
+    runtime_sec["robust_predicted_denoiser_wall_clock_sec"] = robust_predicted_denoiser_wall_clock_sec
+    runtime_sec["non_denoiser_train_overhead_wall_clock_sec"] = non_denoiser_train_overhead_wall_clock_sec
+    runtime_sec["baseline_non_denoiser_overhead_wall_clock_sec"] = baseline_non_denoiser_overhead_wall_clock_sec
+    runtime_sec["robust_non_denoiser_overhead_wall_clock_sec"] = robust_non_denoiser_overhead_wall_clock_sec
+    runtime_sec["observed_over_predicted_denoiser_wall_clock_ratio"] = (
+        observed_over_predicted_denoiser_wall_clock_ratio
+    )
 
     metrics["flow_debug"]["compute_accounting"]["train_wall_clock_sec"] = train_wall_clock_sec
     metrics["flow_debug"]["compute_accounting"]["train_gpu_hours"] = train_gpu_hours
@@ -3474,6 +3736,27 @@ def run_experiment(cfg) -> dict:
     )
     metrics["flow_debug"]["compute_accounting"]["weighted_compute_units"] = (
         weighted_accounting["effective"]["weighted_compute_units"]
+    )
+    metrics["flow_debug"]["compute_accounting"]["predicted_denoiser_train_wall_clock_sec"] = (
+        predicted_denoiser_train_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["baseline_predicted_denoiser_wall_clock_sec"] = (
+        baseline_predicted_denoiser_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["robust_predicted_denoiser_wall_clock_sec"] = (
+        robust_predicted_denoiser_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["non_denoiser_train_overhead_wall_clock_sec"] = (
+        non_denoiser_train_overhead_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["baseline_non_denoiser_overhead_wall_clock_sec"] = (
+        baseline_non_denoiser_overhead_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["robust_non_denoiser_overhead_wall_clock_sec"] = (
+        robust_non_denoiser_overhead_wall_clock_sec
+    )
+    metrics["flow_debug"]["compute_accounting"]["observed_over_predicted_denoiser_wall_clock_ratio"] = (
+        observed_over_predicted_denoiser_wall_clock_ratio
     )
 
     metrics["flow_debug"]["runtime"] = runtime_sec

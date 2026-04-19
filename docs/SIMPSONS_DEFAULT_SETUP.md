@@ -98,7 +98,9 @@ For direct `toy/run_toy.py` runs, `toy/config.py` now defaults to this CDRO imag
 - Shared weighted cap: `400000`
 - Baseline max steps: `160000`
 - WDRO max total steps: `160000`
-- Weighted-compute calibration: `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
+- Weighted-compute calibration:
+  - EDM-family default: `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json`
+  - RF-family default: `toy_outputs/compute_calibration/simpsons_mnist_rgb_image_conv_rf_b256_h64_cuda.json`
 
 The collector saves dense checkpoints on the shared grid, then fills selected FIDs from checkpoints. Use `--baseline-fid-mode in_run` or `--robust-fid-mode in_run` only when intentionally restoring the older in-run FID behavior.
 
@@ -128,6 +130,8 @@ toy/scripts/run_simpsons_mnist_once.sh
 ```
 
 The smoke wrapper uses the active CDRO method knobs, but keeps smoke-scale `STEPS` and `EVAL_SAMPLES`.
+
+When `--weighted-compute-calibration-path` is omitted on the locked `conv/b256/h64/cuda` Simpsons setup, EDM-style runs default to the EDM calibration and RF-style runs default to the RF calibration.
 
 Run the locked 5% three-method family with explicit knobs:
 

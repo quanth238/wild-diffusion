@@ -177,6 +177,13 @@ def _resolve_weighted_calibration(args) -> Dict[str, Any]:
         calibration_path=str(getattr(args, "weighted_compute_calibration_path", "")).strip(),
         inputgrad_alpha=float(getattr(args, "weighted_inputgrad_alpha", 0.0)),
         parambackward_beta=float(getattr(args, "weighted_parambackward_beta", 0.0)),
+        training_objective=str(getattr(args, "training_objective", "edm")),
+        batch_size=int(getattr(args, "batch_size", 256)),
+        hidden_dim=int(getattr(args, "hidden_dim", 256)),
+        image_size=int(getattr(args, "image_size", 32)),
+        image_channels=int(getattr(args, "image_channels", 1)),
+        device=str(getattr(args, "device", "")),
+        amp_dtype=str(getattr(args, "amp_dtype", "auto")),
     )
 
 

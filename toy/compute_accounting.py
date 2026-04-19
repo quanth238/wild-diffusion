@@ -1,7 +1,7 @@
 import json
 import math
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 DENOISER_OP_COUNTS_RECORDED_KEY = "denoiser_op_counts_recorded"
@@ -26,11 +26,272 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _device_type_from_label(value: Any) -> Optional[str]:
+    label = str(value or "").strip().lower()
+    if not label:
+        return None
+    if label == "auto":
+        return None
+    if label.startswith("cuda"):
+        return "cuda"
+    if label.startswith("mps"):
+        return "mps"
+    if label.startswith("cpu"):
+        return "cpu"
+    return label
+
+
+def _amp_dtype_label(value: Any) -> Optional[str]:
+    label = str(value or "").strip().lower()
+    if not label or label == "auto":
+        return None
+    if label == "bf16":
+        return "bfloat16"
+    if label in {"fp16", "half"}:
+        return "float16"
+    return label
+
+
+def _compare_match_field(
+    *,
+    name: str,
+    expected: Any,
+    actual: Any,
+    mismatches: List[Dict[str, Any]],
+) -> None:
+    if expected is None or actual is None:
+        return
+    if expected == actual:
+        return
+    mismatches.append(
+        {
+            "field": str(name),
+            "expected": expected,
+            "actual": actual,
+        }
+    )
+
+
+def calibration_compatibility_report(
+    *,
+    payload: Optional[Dict[str, Any]],
+    training_objective: Optional[str] = None,
+    image_backbone: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+    image_size: Optional[int] = None,
+    image_channels: Optional[int] = None,
+    device: Optional[str] = None,
+    device_name: Optional[str] = None,
+    amp_dtype: Optional[str] = None,
+    allow_tf32: Optional[bool] = None,
+    cudnn_benchmark: Optional[bool] = None,
+    score_matching_weight_power: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Compare a calibration payload against the active workload/hardware."""
+
+    report = {
+        "available": False,
+        "required_match": True,
+        "exact_hardware_match": True,
+        "required_mismatches": [],
+        "advisory_mismatches": [],
+    }
+    if not isinstance(payload, dict):
+        return report
+
+    workload = payload.get("workload")
+    hardware = payload.get("hardware")
+    if not isinstance(workload, dict):
+        workload = {}
+    if not isinstance(hardware, dict):
+        hardware = {}
+
+    required_mismatches: List[Dict[str, Any]] = []
+    advisory_mismatches: List[Dict[str, Any]] = []
+    _compare_match_field(
+        name="workload.training_objective",
+        expected=str(training_objective).strip().lower() if training_objective is not None else None,
+        actual=(
+            str(workload.get("training_objective")).strip().lower()
+            if workload.get("training_objective") is not None
+            else None
+        ),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="workload.image_backbone",
+        expected=str(image_backbone).strip().lower() if image_backbone is not None else None,
+        actual=str(workload.get("image_backbone")).strip().lower() if workload.get("image_backbone") is not None else None,
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="workload.batch_size",
+        expected=_safe_int(batch_size),
+        actual=_safe_int(workload.get("batch_size")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="workload.hidden_dim",
+        expected=_safe_int(hidden_dim),
+        actual=_safe_int(workload.get("hidden_dim")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="workload.image_size",
+        expected=_safe_int(image_size),
+        actual=_safe_int(workload.get("image_size")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="workload.image_channels",
+        expected=_safe_int(image_channels),
+        actual=_safe_int(workload.get("image_channels")),
+        mismatches=required_mismatches,
+    )
+    if str(training_objective or "").strip().lower() == "score":
+        _compare_match_field(
+            name="workload.score_matching_weight_power",
+            expected=_safe_float(score_matching_weight_power),
+            actual=_safe_float(workload.get("score_matching_weight_power")),
+            mismatches=required_mismatches,
+        )
+
+    _compare_match_field(
+        name="hardware.device_type",
+        expected=_device_type_from_label(device),
+        actual=_device_type_from_label(hardware.get("device_type", hardware.get("device"))),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="hardware.amp_dtype",
+        expected=_amp_dtype_label(amp_dtype),
+        actual=_amp_dtype_label(hardware.get("amp_dtype")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="hardware.allow_tf32",
+        expected=_safe_bool(allow_tf32),
+        actual=_safe_bool(hardware.get("allow_tf32")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="hardware.cudnn_benchmark",
+        expected=_safe_bool(cudnn_benchmark),
+        actual=_safe_bool(hardware.get("cudnn_benchmark")),
+        mismatches=required_mismatches,
+    )
+    _compare_match_field(
+        name="hardware.device_name",
+        expected=str(device_name).strip() if device_name is not None else None,
+        actual=str(hardware.get("device_name")).strip() if hardware.get("device_name") is not None else None,
+        mismatches=advisory_mismatches,
+    )
+
+    report.update(
+        {
+            "available": True,
+            "required_match": bool(not required_mismatches),
+            "exact_hardware_match": bool(not advisory_mismatches),
+            "required_mismatches": required_mismatches,
+            "advisory_mismatches": advisory_mismatches,
+        }
+    )
+    return report
+
+
+def _timing_stat_sec(payload: Optional[Dict[str, Any]], op_name: str, stat_key: str = "median_sec") -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    timings = payload.get("timings_sec")
+    if not isinstance(timings, dict):
+        return None
+    op_stats = timings.get(op_name)
+    if not isinstance(op_stats, dict):
+        return None
+    return _safe_float(op_stats.get(stat_key))
+
+
+def resolve_default_weighted_compute_calibration_path(
+    *,
+    calibration_path: str = "",
+    training_objective: str = "edm",
+    image_backbone: str = "conv",
+    batch_size: int = 256,
+    hidden_dim: int = 64,
+    device: str = "cuda",
+) -> str:
+    """Resolve the default Simpsons weighted-compute calibration path.
+
+    This keeps the historical EDM calibration as the default for EDM-family
+    workloads, while allowing RF-family runs on the locked conv/b256/h64/cuda
+    profile to prefer the RF-specific calibration when it exists.
+    """
+
+    explicit_path = str(calibration_path).strip()
+    if explicit_path:
+        return explicit_path
+
+    backbone = str(image_backbone).strip().lower()
+    objective = str(training_objective).strip().lower()
+    device_label = str(device).strip().lower()
+    if backbone != "conv" or int(batch_size) != 256 or int(hidden_dim) != 64:
+        return ""
+    if device_label != "auto" and not device_label.startswith("cuda"):
+        return ""
+
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    calibration_dir = os.path.join(root_dir, "toy_outputs", "compute_calibration")
+    candidate_filenames = []
+    if objective == "rf":
+        candidate_filenames.append("simpsons_mnist_rgb_image_conv_rf_b256_h64_cuda.json")
+    candidate_filenames.append("simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json")
+    for filename in candidate_filenames:
+        candidate_path = os.path.join(calibration_dir, filename)
+        if os.path.isfile(candidate_path):
+            return candidate_path
+    return ""
+
+
 def load_weighted_compute_calibration(
     *,
     calibration_path: str = "",
     inputgrad_alpha: float = 0.0,
     parambackward_beta: float = 0.0,
+    training_objective: Optional[str] = None,
+    image_backbone: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+    image_size: Optional[int] = None,
+    image_channels: Optional[int] = None,
+    device: Optional[str] = None,
+    device_name: Optional[str] = None,
+    amp_dtype: Optional[str] = None,
+    allow_tf32: Optional[bool] = None,
+    cudnn_benchmark: Optional[bool] = None,
+    score_matching_weight_power: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Resolve weighted-compute calibration from explicit ratios or a JSON payload."""
 
@@ -45,6 +306,13 @@ def load_weighted_compute_calibration(
             "source": "explicit_cli",
             "calibration_path": None,
             "payload": None,
+            "compatibility": {
+                "available": False,
+                "required_match": True,
+                "exact_hardware_match": True,
+                "required_mismatches": [],
+                "advisory_mismatches": [],
+            },
         }
 
     path = str(calibration_path).strip()
@@ -57,6 +325,13 @@ def load_weighted_compute_calibration(
             "source": "unavailable",
             "calibration_path": None,
             "payload": None,
+            "compatibility": {
+                "available": False,
+                "required_match": True,
+                "exact_hardware_match": True,
+                "required_mismatches": [],
+                "advisory_mismatches": [],
+            },
         }
     if not os.path.isfile(path):
         raise FileNotFoundError(f"Weighted-compute calibration file not found: {path}")
@@ -71,6 +346,31 @@ def load_weighted_compute_calibration(
             f"Invalid weighted-compute calibration payload at {path}: "
             "expected positive 'inputgrad_alpha' and 'parambackward_beta'."
         )
+    compatibility = calibration_compatibility_report(
+        payload=payload,
+        training_objective=training_objective,
+        image_backbone=image_backbone,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        image_size=image_size,
+        image_channels=image_channels,
+        device=device,
+        device_name=device_name,
+        amp_dtype=amp_dtype,
+        allow_tf32=allow_tf32,
+        cudnn_benchmark=cudnn_benchmark,
+        score_matching_weight_power=score_matching_weight_power,
+    )
+    if compatibility["available"] and not compatibility["required_match"]:
+        mismatch_parts = [
+            f"{item['field']}: expected={item['expected']} actual={item['actual']}"
+            for item in compatibility["required_mismatches"]
+        ]
+        mismatch_text = "; ".join(mismatch_parts) if mismatch_parts else "unknown mismatch"
+        raise RuntimeError(
+            "Weighted-compute calibration is incompatible with the active workload/runtime: "
+            f"{mismatch_text}. Calibration path: {os.path.abspath(path)}"
+        )
     return {
         "available": True,
         "forward_weight": 1.0,
@@ -79,6 +379,7 @@ def load_weighted_compute_calibration(
         "source": "calibration_json",
         "calibration_path": os.path.abspath(path),
         "payload": payload,
+        "compatibility": compatibility,
     }
 
 
@@ -121,6 +422,51 @@ def weighted_compute_units_from_count_record(
     if n_fwd is None or n_fwd_inputgrad is None or n_fwd_parambackward is None:
         return None
     return weighted_compute_units(
+        n_fwd=float(override_n_fwd) if override_n_fwd is not None else float(n_fwd),
+        n_fwd_inputgrad=float(n_fwd_inputgrad),
+        n_fwd_parambackward=float(n_fwd_parambackward),
+        calibration=calibration,
+    )
+
+
+def predicted_denoiser_wall_clock_sec(
+    *,
+    n_fwd: float,
+    n_fwd_inputgrad: float,
+    n_fwd_parambackward: float,
+    calibration: Dict[str, Any],
+) -> Optional[float]:
+    """Predict denoiser-only wall-clock from calibration timing medians."""
+
+    payload = calibration.get("payload") if isinstance(calibration, dict) else None
+    forward_only_sec = _timing_stat_sec(payload, "forward_only", "median_sec")
+    inputgrad_sec = _timing_stat_sec(payload, "forward_plus_inputgrad", "median_sec")
+    parambackward_sec = _timing_stat_sec(payload, "forward_plus_parambackward", "median_sec")
+    if forward_only_sec is None or inputgrad_sec is None or parambackward_sec is None:
+        return None
+    return (
+        float(n_fwd) * float(forward_only_sec)
+        + float(n_fwd_inputgrad) * float(inputgrad_sec)
+        + float(n_fwd_parambackward) * float(parambackward_sec)
+    )
+
+
+def predicted_denoiser_wall_clock_sec_from_count_record(
+    *,
+    count_record: Dict[str, Any],
+    calibration: Dict[str, Any],
+    override_n_fwd: Optional[float] = None,
+) -> Optional[float]:
+    """Predict denoiser-only wall-clock from a recorded denoiser-op count dict."""
+
+    if not isinstance(count_record, dict):
+        return None
+    n_fwd = _safe_float(count_record.get("n_fwd"))
+    n_fwd_inputgrad = _safe_float(count_record.get("n_fwd_inputgrad"))
+    n_fwd_parambackward = _safe_float(count_record.get("n_fwd_parambackward"))
+    if n_fwd is None or n_fwd_inputgrad is None or n_fwd_parambackward is None:
+        return None
+    return predicted_denoiser_wall_clock_sec(
         n_fwd=float(override_n_fwd) if override_n_fwd is not None else float(n_fwd),
         n_fwd_inputgrad=float(n_fwd_inputgrad),
         n_fwd_parambackward=float(n_fwd_parambackward),

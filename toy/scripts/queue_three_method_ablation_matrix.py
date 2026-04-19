@@ -16,6 +16,7 @@ if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
 
+from toy.compute_accounting import resolve_default_weighted_compute_calibration_path
 from toy.process_title import apply_process_title, build_process_title, child_process_env
 
 
@@ -30,12 +31,6 @@ DEFAULT_FID_REF = os.path.join(
     "simpsons_mnist_rgb",
     "fid_refs",
     "simpsons_mnist_rgb_test_28x28.npz",
-)
-DEFAULT_CALIBRATION = os.path.join(
-    ROOT_DIR,
-    "toy_outputs",
-    "compute_calibration",
-    "simpsons_mnist_rgb_image_conv_edm_b256_h64_cuda.json",
 )
 DEFAULT_WARM05_EXTENDED_OUTDIR = os.path.join(
     ROOT_DIR,
@@ -671,7 +666,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", type=str, default=DEFAULT_TRAIN_ROOT)
     parser.add_argument("--dataset-val-path", type=str, default=DEFAULT_VAL_ROOT)
     parser.add_argument("--fid-ref-path", type=str, default=DEFAULT_FID_REF)
-    parser.add_argument("--weighted-compute-calibration-path", type=str, default=DEFAULT_CALIBRATION)
+    parser.add_argument("--weighted-compute-calibration-path", type=str, default="")
     parser.add_argument("--weighted-inputgrad-alpha", type=float, default=0.0)
     parser.add_argument("--weighted-parambackward-beta", type=float, default=0.0)
     parser.add_argument("--train-accelerator-count", type=int, default=1)
@@ -683,6 +678,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-percent-label", type=str, default="1%")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--eval-samples", type=int, default=2000)
     parser.add_argument("--fid-samples", type=int, default=2000)
     parser.add_argument("--debug-eval-batch", type=int, default=64)
@@ -734,6 +730,17 @@ def _parse_case_ids(args: argparse.Namespace) -> List[str]:
     if unknown:
         raise ValueError(f"Unknown case ids: {unknown}")
     return case_ids
+
+
+def _resolve_queue_calibration_path(args: argparse.Namespace) -> str:
+    return resolve_default_weighted_compute_calibration_path(
+        calibration_path=str(args.weighted_compute_calibration_path).strip(),
+        training_objective=str(getattr(args, "training_objective", "edm")),
+        image_backbone=str(args.image_backbone),
+        batch_size=int(args.batch_size),
+        hidden_dim=int(args.hidden_dim),
+        device=str(args.device),
+    )
 
 
 def _case_prefix(*, base_prefix: str, case_id: str) -> str:
@@ -803,6 +810,8 @@ def _build_collector_cmd(*, args: argparse.Namespace, case_id: str, case_cfg: Di
         str(args.batch_size),
         "--hidden-dim",
         str(args.hidden_dim),
+        "--training-objective",
+        str(args.training_objective),
         "--eval-samples",
         str(args.eval_samples),
         "--fid-samples",
@@ -1240,10 +1249,16 @@ def main() -> None:
     args = parse_args()
     if _APPLIED_PROCESS_TITLE is None:
         apply_process_title(build_process_title("wdiff", "queue", args.prefix))
+    args.weighted_compute_calibration_path = _resolve_queue_calibration_path(args)
     case_ids = _parse_case_ids(args)
     ensure_dir(args.outdir)
     logs_dir = os.path.join(args.outdir, "logs")
     ensure_dir(logs_dir)
+    print(
+        "[queue] weighted_compute_calibration_path="
+        f"{args.weighted_compute_calibration_path or 'unresolved'}",
+        flush=True,
+    )
 
     case_statuses: List[Dict] = []
     case_rows: Dict[str, List[Dict[str, str]]] = {}
@@ -1317,6 +1332,7 @@ def main() -> None:
             "n_steps_path": args.n_steps_path,
             "batch_size": args.batch_size,
             "hidden_dim": args.hidden_dim,
+            "training_objective": args.training_objective,
             "eval_samples": args.eval_samples,
             "fid_samples": args.fid_samples,
             "cdro_step_size": args.cdro_step_size,

@@ -21,6 +21,12 @@ FAMILY_STYLE = {
     "score": {"label": "Score VE", "marker": "^", "linestyle": ":", "order": 2},
 }
 
+BOUNDARY_STYLE = {
+    "shared_edm_warm_start": {"linestyle": ":", "alpha": 0.4, "linewidth": 1.2},
+    "baseline_rf_reflow_start": {"linestyle": "-.", "alpha": 0.5, "linewidth": 1.3},
+    "robust_rf_reflow_start": {"linestyle": "-.", "alpha": 0.5, "linewidth": 1.3},
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -158,15 +164,80 @@ def normalize_row(row: Dict) -> Dict:
         "train_wall_clock_sec",
         "baseline_train_wall_clock_sec_effective",
         "train_gpu_hours",
+        "predicted_denoiser_train_wall_clock_sec",
+        "baseline_predicted_denoiser_wall_clock_sec",
+        "robust_predicted_denoiser_wall_clock_sec",
+        "non_denoiser_train_overhead_wall_clock_sec",
+        "baseline_non_denoiser_overhead_wall_clock_sec",
+        "robust_non_denoiser_overhead_wall_clock_sec",
+        "observed_over_predicted_denoiser_wall_clock_ratio",
         "fid",
         "loss_final",
         "loss_mean_last",
         "fixed_warmup_steps",
+        "shared_edm_warm_start_compute_be",
+        "shared_edm_warm_start_weighted_compute_units",
+        "shared_edm_warm_start_train_wall_clock_sec",
+        "baseline_rf_reflow_start_compute_be",
+        "baseline_rf_reflow_start_weighted_compute_units",
+        "baseline_rf_reflow_start_train_wall_clock_sec",
+        "robust_rf_reflow_start_compute_be",
+        "robust_rf_reflow_start_weighted_compute_units",
+        "robust_rf_reflow_start_train_wall_clock_sec",
     ):
         normalized[key] = _safe_float(row.get(key))
     normalized["fid_eval_selected"] = _safe_bool(row.get("fid_eval_selected"))
     normalized["fid_evaluated"] = _safe_bool(row.get("fid_evaluated"))
+    normalized["shared_edm_warm_start_available"] = _safe_bool(row.get("shared_edm_warm_start_available"))
+    normalized["baseline_rf_reflow_start_available"] = _safe_bool(row.get("baseline_rf_reflow_start_available"))
+    normalized["robust_rf_reflow_start_available"] = _safe_bool(row.get("robust_rf_reflow_start_available"))
+    normalized["weighted_compute_calibration_required_match"] = _safe_bool(
+        row.get("weighted_compute_calibration_required_match")
+    )
+    normalized["weighted_compute_calibration_exact_hardware_match"] = _safe_bool(
+        row.get("weighted_compute_calibration_exact_hardware_match")
+    )
+    normalized["train_accelerator_count"] = _safe_float(row.get("train_accelerator_count"))
     return normalized
+
+
+def _warn_if_mixed_plot_provenance(*, rows: List[Dict], x_key: str, plot_path: str) -> None:
+    if x_key == "train_wall_clock_sec":
+        hardware_signatures = sorted(
+            {
+                (
+                    str(row.get("train_accelerator_kind", "")).strip(),
+                    str(row.get("train_accelerator_name", "")).strip(),
+                    str(row.get("train_accelerator_count", "")).strip(),
+                )
+                for row in rows
+                if str(row.get("train_accelerator_name", "")).strip()
+            }
+        )
+        if len(hardware_signatures) > 1:
+            joined = "; ".join("/".join(signature) for signature in hardware_signatures)
+            print(
+                f"[plot][WARN] mixed accelerator metadata in wall-clock plot {plot_path}: {joined}",
+                flush=True,
+            )
+    if x_key == "weighted_compute_units":
+        calibration_signatures = sorted(
+            {
+                (
+                    str(row.get("weighted_compute_calibration_path", "")).strip(),
+                    str(row.get("weighted_compute_calibration_source", "")).strip(),
+                )
+                for row in rows
+                if str(row.get("weighted_compute_calibration_path", "")).strip()
+                or str(row.get("weighted_compute_calibration_source", "")).strip()
+            }
+        )
+        if len(calibration_signatures) > 1:
+            joined = "; ".join(f"{path or '<none>'} [{source or 'unknown'}]" for path, source in calibration_signatures)
+            print(
+                f"[plot][WARN] mixed weighted-compute calibrations in plot {plot_path}: {joined}",
+                flush=True,
+            )
 
 
 def _series_sort_key(series_key: str, rows: List[Dict]) -> tuple:
@@ -276,8 +347,6 @@ def _draw_phase_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: Lis
         return
     for series_key in series_keys:
         sample = next(row for row in rows if row.get("series_key") == series_key)
-        if sample.get("robust_method") == "baseline":
-            continue
         boundary_x = _phase_boundary_x(rows=rows, series_key=series_key, x_key=x_key)
         if boundary_x is None:
             continue
@@ -289,6 +358,69 @@ def _draw_phase_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: Lis
             alpha=0.45,
             label=f"{sample['series_label']} warmup end",
         )
+
+
+def _boundary_series_field(x_key: str, boundary_name: str) -> Optional[str]:
+    if x_key == "train_wall_clock_sec":
+        suffix = "train_wall_clock_sec"
+    elif x_key == "weighted_compute_units":
+        suffix = "weighted_compute_units"
+    elif x_key == "compute_budget_be":
+        suffix = "compute_be"
+    else:
+        return None
+    return f"{boundary_name}_{suffix}"
+
+
+def _stable_series_boundary_x(*, rows: List[Dict], series_key: str, field_name: str, availability_field: str) -> Optional[float]:
+    values = [
+        float(row[field_name])
+        for row in rows
+        if row.get("series_key") == series_key
+        and _safe_bool(row.get(availability_field))
+        and row.get(field_name) is not None
+    ]
+    if not values:
+        return None
+    min_value = min(values)
+    max_value = max(values)
+    tolerance = max(1e-9, 1e-6 * max(1.0, abs(min_value), abs(max_value)))
+    if abs(max_value - min_value) > tolerance:
+        return None
+    return float(sum(values) / float(len(values)))
+
+
+def _draw_rf_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: List[str]) -> None:
+    boundary_specs = (
+        ("shared_edm_warm_start", "shared_edm_warm_start_available", "warm-start"),
+        ("baseline_rf_reflow_start", "baseline_rf_reflow_start_available", "reflow start"),
+        ("robust_rf_reflow_start", "robust_rf_reflow_start_available", "reflow start"),
+    )
+    for series_key in series_keys:
+        sample = next(row for row in rows if row.get("series_key") == series_key)
+        for boundary_name, availability_field, label_suffix in boundary_specs:
+            if boundary_name == "shared_edm_warm_start" and sample.get("robust_method") != "baseline":
+                continue
+            field_name = _boundary_series_field(x_key, boundary_name)
+            if field_name is None:
+                continue
+            boundary_x = _stable_series_boundary_x(
+                rows=rows,
+                series_key=series_key,
+                field_name=field_name,
+                availability_field=availability_field,
+            )
+            if boundary_x is None:
+                continue
+            style = BOUNDARY_STYLE[boundary_name]
+            ax.axvline(
+                x=boundary_x,
+                color=ROBUST_STYLE[str(sample.get("robust_method"))]["color"],
+                linestyle=style["linestyle"],
+                linewidth=style["linewidth"],
+                alpha=style["alpha"],
+                label=f"{sample['series_label']} {label_suffix}",
+            )
 
 
 def _series_segments(*, rows: List[Dict], series_key: str, x_key: str, y_key: str) -> List[List[tuple]]:
@@ -335,6 +467,7 @@ def make_plot(
     train_percent_label: str,
     dataset_label: str,
 ) -> None:
+    _warn_if_mixed_plot_provenance(rows=rows, x_key=x_key, plot_path=path)
     plt.figure(figsize=(8, 5))
     ax = plt.gca()
     series_keys = _series_keys(rows)
@@ -354,6 +487,7 @@ def make_plot(
                 label=str(sample.get("series_label")) if segment_index == 0 else "_nolegend_",
             )
     _draw_phase_boundaries(ax=ax, rows=rows, x_key=x_key, series_keys=series_keys)
+    _draw_rf_boundaries(ax=ax, rows=rows, x_key=x_key, series_keys=series_keys)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
     ax.set_title(f"{dataset_label} {train_percent_label}: {plot_label} vs {title_suffix}")
@@ -397,6 +531,7 @@ def make_dual_plot(
                     label=str(sample.get("series_label")) if segment_index == 0 else "_nolegend_",
                 )
         _draw_phase_boundaries(ax=ax, rows=rows, x_key=x_key, series_keys=series_keys)
+        _draw_rf_boundaries(ax=ax, rows=rows, x_key=x_key, series_keys=series_keys)
         ax.set_xlabel(x_label)
         ax.set_ylabel(y_label)
         ax.set_title(f"{plot_label} vs {title_suffix}")

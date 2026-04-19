@@ -178,6 +178,13 @@ def resolve_weighted_calibration(args: argparse.Namespace) -> Dict:
         calibration_path=str(args.weighted_compute_calibration_path).strip(),
         inputgrad_alpha=float(args.weighted_inputgrad_alpha),
         parambackward_beta=float(args.weighted_parambackward_beta),
+        training_objective="edm",
+        image_backbone="conv",
+        batch_size=int(args.batch_size),
+        hidden_dim=int(args.hidden_dim),
+        image_size=int(args.image_size),
+        image_channels=int(args.image_channels),
+        device=str(args.device),
     )
 
 
