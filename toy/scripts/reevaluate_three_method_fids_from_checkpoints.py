@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,10 +26,11 @@ from toy.config import ToyConfig  # noqa: E402
 from toy.data_backends.provider import build_dataset_bundle  # noqa: E402
 from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
-from toy.shared.objective import weighted_denoise_loss  # noqa: E402
+from toy.shared.objective import build_rectified_flow_state, weighted_denoise_loss, weighted_rectified_flow_loss  # noqa: E402
 from toy.shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
 from toy.shared.sigma import (  # noqa: E402
+    build_rf_stage_time_quantile_levels,
     build_rf_time_quantile_levels,
     build_sigma_levels,
     build_sigma_levels_from_warmup_quantiles,
@@ -36,6 +38,7 @@ from toy.shared.sigma import (  # noqa: E402
     sample_sigmas_log_normal,
     sample_target_indices,
 )
+from toy.shared.trainer_common import generate_reflow_pairs  # noqa: E402
 from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
 
 
@@ -121,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Re-evaluate existing three-method trajectory checkpoints with in-memory batched FID "
-            "and a clean one-step EDM probe directly from saved checkpoints, then regenerate per-case "
+            "and an objective-aware clean probe directly from saved checkpoints, then regenerate per-case "
             "plots from the refreshed combined CSV."
         )
     )
@@ -284,6 +287,15 @@ def _checkpoint_branch(row: Dict[str, str]) -> str:
 
 def _metrics_fid_key(row: Dict[str, str]) -> str:
     return "baseline_fid" if _is_baseline_style_row(row) else "robust_fid"
+
+
+def _objective_clean_probe_key_from_objective(training_objective: object) -> str:
+    objective = str(training_objective or "").strip().lower()
+    return "rf_clean_probe" if objective == "rf" else "edm_clean_probe"
+
+
+def _objective_clean_probe_key(row: Dict[str, str]) -> str:
+    return _objective_clean_probe_key_from_objective(row.get("training_objective", "edm"))
 
 
 def _exp_name_from_row(prefix: str, row: Dict[str, str], occurrence_index: int) -> str:
@@ -449,8 +461,7 @@ def _load_checkpoint_payload(ckpt_path: str) -> Dict:
     return payload
 
 
-def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
-    payload = _load_checkpoint_payload(ckpt_path)
+def _baseline_state_dict_from_payload(payload: Dict, ckpt_path: str) -> Dict[str, torch.Tensor]:
     if "baseline_state_dict" in payload:
         state_dict = payload["baseline_state_dict"]
     elif "state_dict" in payload:
@@ -465,6 +476,11 @@ def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
     return state_dict
 
 
+def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
+    payload = _load_checkpoint_payload(ckpt_path)
+    return _baseline_state_dict_from_payload(payload, ckpt_path)
+
+
 def _load_robust_state_dict(
     ckpt_path: str,
     method_name: str,
@@ -472,6 +488,16 @@ def _load_robust_state_dict(
     prefer_ema: bool = False,
 ) -> Tuple[Dict[str, torch.Tensor], str]:
     payload = _load_checkpoint_payload(ckpt_path)
+    return _robust_state_dict_from_payload(payload, ckpt_path, method_name, prefer_ema=prefer_ema)
+
+
+def _robust_state_dict_from_payload(
+    payload: Dict,
+    ckpt_path: str,
+    method_name: str,
+    *,
+    prefer_ema: bool = False,
+) -> Tuple[Dict[str, torch.Tensor], str]:
     saved_method = _canonical_robust_method(payload.get("method_name", ""))
     expected_method = _canonical_robust_method(method_name)
     if saved_method and saved_method != expected_method:
@@ -681,16 +707,12 @@ def _get_or_build_context(
     return context
 
 
-def _extract_cached_reeval(metrics_path: str, row: Dict[str, str]) -> Dict[str, object]:
-    payload = _load_json(metrics_path)
-    sample_quality = payload.get("metrics", {}).get("sample_quality_debug", {})
-    objective_debug = payload.get("metrics", {}).get("objective_debug", {})
-    key = _metrics_fid_key(row)
-    fid_value = _safe_float(sample_quality.get(key))
-    if fid_value is None:
-        raise RuntimeError(f"Missing {key} in reevaluated metrics: {metrics_path}")
-
-    probe_summary = objective_debug.get("edm_clean_probe")
+def _extract_probe_metrics_from_summary(
+    objective_debug: Dict[str, object],
+    *,
+    probe_key: str,
+) -> Dict[str, object]:
+    probe_summary = objective_debug.get(probe_key)
     probe_value = None
     probe_images = 0
     probe_seed = None
@@ -700,6 +722,9 @@ def _extract_cached_reeval(metrics_path: str, row: Dict[str, str]) -> Dict[str, 
     probe_evaluated = False
     probe_missing_reason = "missing_from_metrics"
     probe_source = "missing_in_reeval_metrics"
+    probe_stage = ""
+    probe_t_distribution = ""
+    probe_pair_source = ""
     if isinstance(probe_summary, dict):
         probe_value = _safe_float(probe_summary.get("mean"))
         probe_images = _safe_int(probe_summary.get("num_images"), 0)
@@ -710,19 +735,64 @@ def _extract_cached_reeval(metrics_path: str, row: Dict[str, str]) -> Dict[str, 
         probe_missing_reason = str(probe_summary.get("missing_reason", "")).strip()
         probe_evaluated = probe_value is not None
         probe_source = "reevaluated_from_checkpoint" if probe_evaluated else "not_evaluated"
+        probe_stage = str(probe_summary.get("stage_name", ""))
+        probe_t_distribution = str(probe_summary.get("t_distribution", ""))
+        probe_pair_source = str(probe_summary.get("pair_source", ""))
         if not probe_missing_reason and not probe_evaluated:
             probe_missing_reason = "disabled_or_unsupported"
     return {
+        probe_key: probe_value,
+        f"{probe_key}_images": int(probe_images),
+        f"{probe_key}_seed": probe_seed,
+        f"{probe_key}_split": probe_split,
+        f"{probe_key}_batches": int(probe_batches),
+        f"{probe_key}_batch_size": int(probe_batch_size),
+        f"{probe_key}_evaluated": bool(probe_evaluated),
+        f"{probe_key}_missing_reason": str(probe_missing_reason),
+        f"{probe_key}_source": str(probe_source),
+        f"{probe_key}_stage": str(probe_stage),
+        f"{probe_key}_t_distribution": str(probe_t_distribution),
+        f"{probe_key}_pair_source": str(probe_pair_source),
+    }
+
+
+def _extract_cached_reeval(metrics_path: str, row: Dict[str, str]) -> Dict[str, object]:
+    payload = _load_json(metrics_path)
+    sample_quality = payload.get("metrics", {}).get("sample_quality_debug", {})
+    objective_debug = payload.get("metrics", {}).get("objective_debug", {})
+    key = _metrics_fid_key(row)
+    fid_value = _safe_float(sample_quality.get(key))
+    if fid_value is None:
+        raise RuntimeError(f"Missing {key} in reevaluated metrics: {metrics_path}")
+    edm_probe = _extract_probe_metrics_from_summary(objective_debug, probe_key="edm_clean_probe")
+    rf_probe = _extract_probe_metrics_from_summary(objective_debug, probe_key="rf_clean_probe")
+    objective_probe_key = _objective_clean_probe_key(row)
+    objective_probe_value = edm_probe if objective_probe_key == "edm_clean_probe" else rf_probe
+    return {
         "fid": float(fid_value),
-        "edm_clean_probe": probe_value,
-        "edm_clean_probe_images": int(probe_images),
-        "edm_clean_probe_seed": probe_seed,
-        "edm_clean_probe_split": probe_split,
-        "edm_clean_probe_batches": int(probe_batches),
-        "edm_clean_probe_batch_size": int(probe_batch_size),
-        "edm_clean_probe_evaluated": bool(probe_evaluated),
-        "edm_clean_probe_missing_reason": str(probe_missing_reason),
-        "edm_clean_probe_source": str(probe_source),
+        **edm_probe,
+        **rf_probe,
+        "objective_clean_probe": objective_probe_value.get(objective_probe_key),
+        "objective_clean_probe_kind": objective_probe_key,
+        "objective_clean_probe_images": int(objective_probe_value.get(f"{objective_probe_key}_images", 0)),
+        "objective_clean_probe_seed": objective_probe_value.get(f"{objective_probe_key}_seed"),
+        "objective_clean_probe_split": str(objective_probe_value.get(f"{objective_probe_key}_split", "")),
+        "objective_clean_probe_batches": int(objective_probe_value.get(f"{objective_probe_key}_batches", 0)),
+        "objective_clean_probe_batch_size": int(objective_probe_value.get(f"{objective_probe_key}_batch_size", 0)),
+        "objective_clean_probe_evaluated": bool(
+            objective_probe_value.get(f"{objective_probe_key}_evaluated", False)
+        ),
+        "objective_clean_probe_missing_reason": str(
+            objective_probe_value.get(f"{objective_probe_key}_missing_reason", "")
+        ),
+        "objective_clean_probe_source": str(objective_probe_value.get(f"{objective_probe_key}_source", "")),
+        "objective_clean_probe_stage": str(objective_probe_value.get(f"{objective_probe_key}_stage", "")),
+        "objective_clean_probe_t_distribution": str(
+            objective_probe_value.get(f"{objective_probe_key}_t_distribution", "")
+        ),
+        "objective_clean_probe_pair_source": str(
+            objective_probe_value.get(f"{objective_probe_key}_pair_source", "")
+        ),
     }
 
 
@@ -771,6 +841,10 @@ def _cached_reeval_matches_request(
         and str(config.get("edm_clean_probe_split", "")) == expected_probe_split
         and _safe_int(config.get("edm_clean_probe_batches"), -1) == expected_probe_batches
         and _safe_int(config.get("edm_clean_probe_batch_size"), -1) == expected_probe_batch_size
+        and _safe_bool(config.get("rf_clean_probe_enabled"), default=False) == expected_probe_enabled
+        and str(config.get("rf_clean_probe_split", "")) == expected_probe_split
+        and _safe_int(config.get("rf_clean_probe_batches"), -1) == expected_probe_batches
+        and _safe_int(config.get("rf_clean_probe_batch_size"), -1) == expected_probe_batch_size
         and _safe_int(sample_quality.get("fid_samples"), -1) == expected_fid_samples
         and _safe_int(sample_quality.get("fid_batch_size"), -1) == expected_fid_batch_size
         and _safe_bool(flow_debug.get("stochastic_cdro_eval"), default=False) == expected_stochastic_cdro_eval
@@ -825,10 +899,57 @@ def _edm_probe_sigma_batch(
     return sigma_levels[indices]
 
 
-def _sample_edm_probe_batch(dataset, split: str, batch_size: int) -> torch.Tensor:
+def _sample_clean_probe_batch(dataset, split: str, batch_size: int) -> torch.Tensor:
     if str(split).strip().lower() == "val":
         return dataset.sample_val_batch(int(batch_size))
     return dataset.sample_train_batch(int(batch_size))
+
+
+def _sample_edm_probe_batch(dataset, split: str, batch_size: int) -> torch.Tensor:
+    return _sample_clean_probe_batch(dataset, split, batch_size)
+
+
+def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, object]:
+    history = payload.get("history_robust", {})
+    if not isinstance(history, dict):
+        history = {}
+    trainer_state = payload.get("trainer_state", {})
+    if not isinstance(trainer_state, dict):
+        trainer_state = {}
+    completed_steps = _safe_int(payload.get("completed_steps", trainer_state.get("completed_steps", 0)), 0)
+    stage1_steps = _safe_int(history.get("rf_stage1_steps"), 0)
+    reflow_steps = _safe_int(history.get("rf_reflow_steps"), 0)
+    stage_name = "rf_reflow" if reflow_steps > 0 and completed_steps > stage1_steps else "rf_stage1"
+    distribution_key = f"{stage_name}_t_distribution_resolved"
+    t_distribution = str(history.get(distribution_key, "")).strip()
+    if not t_distribution:
+        t_distribution = (
+            "uniform"
+            if stage_name == "rf_stage1"
+            else str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped"))
+        )
+    teacher_state_dict = trainer_state.get("rf_reflow_teacher_state_dict")
+    if not isinstance(teacher_state_dict, dict):
+        teacher_state_dict = None
+    return {
+        "stage_name": stage_name,
+        "completed_steps": int(completed_steps),
+        "stage1_steps": int(stage1_steps),
+        "reflow_steps": int(reflow_steps),
+        "t_distribution": str(t_distribution),
+        "teacher_state_dict": teacher_state_dict,
+    }
+
+
+def _rf_probe_sigma_batch(
+    *,
+    sigma_levels: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    if sigma_levels.ndim != 1:
+        raise ValueError(f"Expected rank-1 RF probe sigma levels, got shape={tuple(sigma_levels.shape)}")
+    indices = sample_target_indices(int(batch_size), sigma_levels)
+    return sigma_levels[indices]
 
 
 @torch.no_grad()
@@ -910,6 +1031,129 @@ def _compute_edm_clean_probe_for_model(
     return summary
 
 
+@torch.no_grad()
+def _compute_rf_clean_probe_for_model(
+    *,
+    denoiser: torch.nn.Module,
+    ctx: EvalContext,
+    split: str,
+    num_batches: int,
+    batch_size: int,
+    probe_seed: int,
+    probe_spec: Dict[str, object],
+    log_handle: Optional[TextIO] = None,
+) -> Dict[str, object]:
+    stage_name = str(probe_spec.get("stage_name", "rf_stage1")).strip() or "rf_stage1"
+    t_distribution = str(probe_spec.get("t_distribution", "")).strip() or (
+        "uniform" if stage_name == "rf_stage1" else str(getattr(ctx.cfg, "rf_reflow_t_distribution", "u_shaped"))
+    )
+    teacher_state_dict = probe_spec.get("teacher_state_dict")
+    summary: Dict[str, object] = {
+        "enabled": True,
+        "supported": True,
+        "split": str(split),
+        "num_batches": max(int(num_batches), 0),
+        "batch_size": max(int(batch_size), 0),
+        "num_images": 0,
+        "seed": int(probe_seed),
+        "missing_reason": "",
+        "mean": None,
+        "std": None,
+        "min": None,
+        "max": None,
+        "final": None,
+        "mean_last": None,
+        "num_values": 0,
+        "stage_name": stage_name,
+        "t_distribution": t_distribution,
+        "pair_source": "",
+    }
+    if str(getattr(ctx.cfg, "training_objective", "edm")).strip().lower() != "rf":
+        summary["supported"] = False
+        summary["missing_reason"] = "unsupported_training_objective_non_rf"
+        return summary
+    if int(num_batches) <= 0 or int(batch_size) <= 0:
+        summary["supported"] = False
+        summary["missing_reason"] = "non_positive_probe_budget"
+        return summary
+
+    denoiser.eval()
+    set_seed(int(probe_seed))
+    probe_sigma_levels = build_rf_stage_time_quantile_levels(
+        float(ctx.cfg.sigma_max),
+        int(ctx.cfg.n_steps_path),
+        ctx.device,
+        stage_name=stage_name,
+        reflow_distribution=str(getattr(ctx.cfg, "rf_reflow_t_distribution", "u_shaped")),
+    ).to(dtype=ctx.sigma_levels.dtype)
+    sigma_max_value = max(float(ctx.cfg.sigma_max), 1e-8)
+    teacher_model = None
+    if stage_name == "rf_reflow" and isinstance(teacher_state_dict, dict):
+        teacher_model = copy.deepcopy(denoiser).to(device=ctx.device)
+        teacher_model.load_state_dict(teacher_state_dict, strict=True)
+        teacher_model.eval()
+        summary["pair_source"] = "teacher_reflow_pairs"
+    elif stage_name == "rf_reflow":
+        summary["pair_source"] = "straight_clean_pairs_fallback"
+    else:
+        summary["pair_source"] = "straight_clean_pairs"
+
+    losses: List[float] = []
+    total_images = 0
+    t_start = time.perf_counter()
+    for batch_idx in range(int(num_batches)):
+        x0 = _sample_clean_probe_batch(ctx.dataset, split, int(batch_size))
+        if x0.device != ctx.device:
+            x0 = x0.to(device=ctx.device)
+        x0 = x0.to(dtype=probe_sigma_levels.dtype)
+        if teacher_model is not None:
+            x_left, x_right = generate_reflow_pairs(
+                teacher_model,
+                ctx.sigma_levels,
+                x0,
+                sample_terminal_batch_fn=ctx.dataset.sample_terminal_batch,
+            )
+        else:
+            x_left = ctx.dataset.sample_terminal_batch(int(x0.shape[0]), 1.0)
+            if x_left.device != ctx.device:
+                x_left = x_left.to(device=ctx.device)
+            x_left = x_left.to(dtype=x0.dtype)
+            x_right = x0
+        sigma = _rf_probe_sigma_batch(
+            sigma_levels=probe_sigma_levels,
+            batch_size=int(x0.shape[0]),
+        )
+        t = (sigma / sigma_max_value).clamp(0.0, 1.0)
+        x_t = build_rectified_flow_state(x_left, x_right, t)
+        with autocast_context(ctx.device, ctx.amp_dtype):
+            loss = weighted_rectified_flow_loss(
+                denoiser,
+                x_t,
+                x_right,
+                sigma,
+                sigma_max_value,
+                x_left=x_left,
+                x_right=x_right,
+                loss_kind=str(getattr(ctx.cfg, "rf_loss", "mse")),
+                pseudo_huber_delta=float(getattr(ctx.cfg, "rf_pseudo_huber_delta", 0.1)),
+            )
+        loss_value = float(loss.item())
+        losses.append(loss_value)
+        total_images += int(x0.shape[0])
+        if log_handle is not None:
+            elapsed = time.perf_counter() - t_start
+            log_handle.write(
+                f"[rf-clean-probe] progress batch={batch_idx + 1}/{int(num_batches)} "
+                f"images={total_images} stage={stage_name} pair_source={summary['pair_source']} "
+                f"loss={loss_value:.6f} elapsed_sec={elapsed:.2f}\n"
+            )
+            log_handle.flush()
+
+    summary.update(_summarize_probe_values(losses))
+    summary["num_images"] = int(total_images)
+    return summary
+
+
 def _write_metrics_payload(
     *,
     path: str,
@@ -924,6 +1168,8 @@ def _write_metrics_payload(
     fid_reused: bool,
     edm_clean_probe: Dict[str, object],
     edm_clean_probe_runtime_sec: float,
+    rf_clean_probe: Dict[str, object],
+    rf_clean_probe_runtime_sec: float,
 ) -> None:
     branch = _checkpoint_branch(row)
     sample_quality = {
@@ -972,6 +1218,10 @@ def _write_metrics_payload(
             "edm_clean_probe_split": str(edm_clean_probe.get("split", "")),
             "edm_clean_probe_batches": int(edm_clean_probe.get("num_batches", 0) or 0),
             "edm_clean_probe_batch_size": int(edm_clean_probe.get("batch_size", 0) or 0),
+            "rf_clean_probe_enabled": bool(rf_clean_probe.get("enabled", False)),
+            "rf_clean_probe_split": str(rf_clean_probe.get("split", "")),
+            "rf_clean_probe_batches": int(rf_clean_probe.get("num_batches", 0) or 0),
+            "rf_clean_probe_batch_size": int(rf_clean_probe.get("batch_size", 0) or 0),
         },
         "row": {
             "method": str(row.get("method", "")),
@@ -991,17 +1241,20 @@ def _write_metrics_payload(
                 "direct_checkpoint_eval": True,
                 "fid_reused": bool(fid_reused),
                 "edm_clean_probe_enabled": bool(edm_clean_probe.get("enabled", False)),
+                "rf_clean_probe_enabled": bool(rf_clean_probe.get("enabled", False)),
                 "checkpoint_branch": branch,
                 "checkpoint_state_variant": str(checkpoint_state_variant),
                 "stochastic_cdro_eval": bool(_is_stochastic_cdro_eval(ctx.cfg, str(row.get("method", "")))),
             },
             "objective_debug": {
                 "edm_clean_probe": edm_clean_probe,
+                "rf_clean_probe": rf_clean_probe,
             },
         },
         "runtime_sec": {
             "fid_total": float(runtime_sec),
             "edm_clean_probe_total": float(edm_clean_probe_runtime_sec),
+            "rf_clean_probe_total": float(rf_clean_probe_runtime_sec),
         },
     }
     with open(path, "w", encoding="utf-8") as handle:
@@ -1048,15 +1301,17 @@ def _evaluate_checkpoint_metrics(
         )
         log_handle.write(
             "[fid-only] legacy eval-samples argument is ignored in direct FID mode; "
-            "edm_clean_probe uses its own fixed evaluation budget.\n"
+            "checkpoint clean probes use their own fixed evaluation budget.\n"
         )
         log_handle.flush()
 
+        payload = _load_checkpoint_payload(checkpoint_path)
         checkpoint_state_variant = "baseline_eval_state_dict"
         if branch == "baseline":
-            state_dict = _load_baseline_state_dict(checkpoint_path)
+            state_dict = _baseline_state_dict_from_payload(payload, checkpoint_path)
         else:
-            state_dict, checkpoint_state_variant = _load_robust_state_dict(
+            state_dict, checkpoint_state_variant = _robust_state_dict_from_payload(
+                payload,
                 checkpoint_path,
                 str(row.get("method_version_used", row.get("method", ""))),
                 prefer_ema=bool(getattr(ctx.cfg, "use_ema_eval", False)),
@@ -1068,6 +1323,7 @@ def _evaluate_checkpoint_metrics(
 
         probe_seed = int(metrics_eval_seed + 1)
         edm_clean_probe_runtime_sec = 0.0
+        rf_clean_probe_runtime_sec = 0.0
         if bool(args.disable_edm_clean_probe):
             edm_clean_probe = {
                 "enabled": False,
@@ -1113,6 +1369,56 @@ def _evaluate_checkpoint_metrics(
             )
             log_handle.flush()
 
+        if bool(args.disable_edm_clean_probe):
+            rf_clean_probe = {
+                "enabled": False,
+                "supported": False,
+                "split": str(args.edm_clean_probe_split),
+                "num_batches": int(max(args.edm_clean_probe_batches, 0)),
+                "batch_size": int(max(args.edm_clean_probe_batch_size, 0)),
+                "num_images": 0,
+                "seed": int(probe_seed),
+                "missing_reason": "disabled_by_flag",
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "final": None,
+                "mean_last": None,
+                "num_values": 0,
+                "stage_name": "",
+                "t_distribution": "",
+                "pair_source": "",
+            }
+        else:
+            rf_probe_spec = _rf_probe_spec_from_payload(payload, cfg=ctx.cfg)
+            log_handle.write(
+                f"[rf-clean-probe] split={args.edm_clean_probe_split} "
+                f"batches={int(max(args.edm_clean_probe_batches, 0))} "
+                f"batch_size={int(max(args.edm_clean_probe_batch_size, 0))} "
+                f"seed={probe_seed} stage={rf_probe_spec.get('stage_name', '')}\n"
+            )
+            log_handle.flush()
+            t_probe_start = time.perf_counter()
+            rf_clean_probe = _compute_rf_clean_probe_for_model(
+                denoiser=model,
+                ctx=ctx,
+                split=str(args.edm_clean_probe_split),
+                num_batches=max(int(args.edm_clean_probe_batches), 0),
+                batch_size=max(int(args.edm_clean_probe_batch_size), 0),
+                probe_seed=probe_seed,
+                probe_spec=rf_probe_spec,
+                log_handle=log_handle,
+            )
+            rf_clean_probe_runtime_sec = float(time.perf_counter() - t_probe_start)
+            log_handle.write(
+                "[rf-clean-probe] done "
+                f"mean={rf_clean_probe.get('mean')} "
+                f"runtime_sec={rf_clean_probe_runtime_sec:.2f} "
+                f"missing_reason={rf_clean_probe.get('missing_reason', '')}\n"
+            )
+            log_handle.flush()
+
         if existing_fid_value is None:
             set_seed(metrics_eval_seed)
             t_start = time.perf_counter()
@@ -1154,6 +1460,8 @@ def _evaluate_checkpoint_metrics(
         fid_reused=fid_reused,
         edm_clean_probe=edm_clean_probe,
         edm_clean_probe_runtime_sec=edm_clean_probe_runtime_sec,
+        rf_clean_probe=rf_clean_probe,
+        rf_clean_probe_runtime_sec=rf_clean_probe_runtime_sec,
     )
     return _extract_cached_reeval(metrics_path, row)
 
@@ -1194,7 +1502,15 @@ def _row_matches_filters(args: argparse.Namespace, row: Dict[str, str], methods_
     if bool(args.respect_fid_selection) and not _safe_bool(row.get("fid_eval_selected"), default=True):
         return False
     if bool(args.only_missing_fid) and _safe_float(row.get("fid")) is not None:
-        return False
+        objective_probe_key = _objective_clean_probe_key(row)
+        objective_probe_present = (
+            _safe_float(row.get(objective_probe_key)) is not None
+            or _safe_bool(row.get(f"{objective_probe_key}_evaluated"), default=False)
+            or _safe_float(row.get("objective_clean_probe")) is not None
+            or _safe_bool(row.get("objective_clean_probe_evaluated"), default=False)
+        )
+        if objective_probe_present:
+            return False
     return True
 
 
@@ -1264,11 +1580,12 @@ def main() -> None:
                 cfg=request_cfg,
             ):
                 existing_cached = None
+            objective_probe_key = _objective_clean_probe_key(row)
             probe_needed = bool(
                 not args.disable_edm_clean_probe
                 and (
                     existing_cached is None
-                    or not bool(existing_cached.get("edm_clean_probe_evaluated", False))
+                    or not bool(existing_cached.get(f"{objective_probe_key}_evaluated", False))
                 )
             )
             if bool(args.skip_existing) and existing_cached is not None:
@@ -1305,6 +1622,35 @@ def main() -> None:
                 "edm_clean_probe_evaluated": bool(cached_metrics["edm_clean_probe_evaluated"]),
                 "edm_clean_probe_missing_reason": str(cached_metrics["edm_clean_probe_missing_reason"]),
                 "edm_clean_probe_source": str(cached_metrics["edm_clean_probe_source"]),
+                "rf_clean_probe": cached_metrics["rf_clean_probe"],
+                "rf_clean_probe_images": int(cached_metrics["rf_clean_probe_images"]),
+                "rf_clean_probe_seed": cached_metrics["rf_clean_probe_seed"],
+                "rf_clean_probe_split": str(cached_metrics["rf_clean_probe_split"]),
+                "rf_clean_probe_batches": int(cached_metrics["rf_clean_probe_batches"]),
+                "rf_clean_probe_batch_size": int(cached_metrics["rf_clean_probe_batch_size"]),
+                "rf_clean_probe_stage": str(cached_metrics["rf_clean_probe_stage"]),
+                "rf_clean_probe_t_distribution": str(cached_metrics["rf_clean_probe_t_distribution"]),
+                "rf_clean_probe_pair_source": str(cached_metrics["rf_clean_probe_pair_source"]),
+                "rf_clean_probe_evaluated": bool(cached_metrics["rf_clean_probe_evaluated"]),
+                "rf_clean_probe_missing_reason": str(cached_metrics["rf_clean_probe_missing_reason"]),
+                "rf_clean_probe_source": str(cached_metrics["rf_clean_probe_source"]),
+                "objective_clean_probe": cached_metrics["objective_clean_probe"],
+                "objective_clean_probe_kind": str(cached_metrics["objective_clean_probe_kind"]),
+                "objective_clean_probe_images": int(cached_metrics["objective_clean_probe_images"]),
+                "objective_clean_probe_seed": cached_metrics["objective_clean_probe_seed"],
+                "objective_clean_probe_split": str(cached_metrics["objective_clean_probe_split"]),
+                "objective_clean_probe_batches": int(cached_metrics["objective_clean_probe_batches"]),
+                "objective_clean_probe_batch_size": int(cached_metrics["objective_clean_probe_batch_size"]),
+                "objective_clean_probe_stage": str(cached_metrics["objective_clean_probe_stage"]),
+                "objective_clean_probe_t_distribution": str(
+                    cached_metrics["objective_clean_probe_t_distribution"]
+                ),
+                "objective_clean_probe_pair_source": str(cached_metrics["objective_clean_probe_pair_source"]),
+                "objective_clean_probe_evaluated": bool(cached_metrics["objective_clean_probe_evaluated"]),
+                "objective_clean_probe_missing_reason": str(
+                    cached_metrics["objective_clean_probe_missing_reason"]
+                ),
+                "objective_clean_probe_source": str(cached_metrics["objective_clean_probe_source"]),
             }
             cache[cache_key] = cached
 
@@ -1316,7 +1662,7 @@ def main() -> None:
         updated["reeval_exp_name"] = str(cached["reeval_exp_name"])
         updated["reeval_fid_samples"] = str(int(args.fid_samples))
         updated["reeval_fid_batch_size"] = str(max(int(args.fid_batch_size), 1))
-        updated["reeval_mode"] = "direct_fid_and_edm_clean_probe_in_memory"
+        updated["reeval_mode"] = "direct_fid_and_objective_clean_probe_in_memory"
         updated["fid_evaluated"] = True
         updated["fid_missing_reason"] = ""
         updated["fid_source"] = "reevaluated_from_checkpoint"
@@ -1329,6 +1675,31 @@ def main() -> None:
         updated["edm_clean_probe_batch_size"] = int(cached["edm_clean_probe_batch_size"])
         updated["edm_clean_probe_images"] = int(cached["edm_clean_probe_images"])
         updated["edm_clean_probe_seed"] = cached["edm_clean_probe_seed"]
+        updated["rf_clean_probe"] = cached["rf_clean_probe"]
+        updated["rf_clean_probe_evaluated"] = bool(cached["rf_clean_probe_evaluated"])
+        updated["rf_clean_probe_missing_reason"] = str(cached["rf_clean_probe_missing_reason"])
+        updated["rf_clean_probe_source"] = str(cached["rf_clean_probe_source"])
+        updated["rf_clean_probe_split"] = str(cached["rf_clean_probe_split"])
+        updated["rf_clean_probe_batches"] = int(cached["rf_clean_probe_batches"])
+        updated["rf_clean_probe_batch_size"] = int(cached["rf_clean_probe_batch_size"])
+        updated["rf_clean_probe_images"] = int(cached["rf_clean_probe_images"])
+        updated["rf_clean_probe_seed"] = cached["rf_clean_probe_seed"]
+        updated["rf_clean_probe_stage"] = str(cached["rf_clean_probe_stage"])
+        updated["rf_clean_probe_t_distribution"] = str(cached["rf_clean_probe_t_distribution"])
+        updated["rf_clean_probe_pair_source"] = str(cached["rf_clean_probe_pair_source"])
+        updated["objective_clean_probe"] = cached["objective_clean_probe"]
+        updated["objective_clean_probe_kind"] = str(cached["objective_clean_probe_kind"])
+        updated["objective_clean_probe_evaluated"] = bool(cached["objective_clean_probe_evaluated"])
+        updated["objective_clean_probe_missing_reason"] = str(cached["objective_clean_probe_missing_reason"])
+        updated["objective_clean_probe_source"] = str(cached["objective_clean_probe_source"])
+        updated["objective_clean_probe_split"] = str(cached["objective_clean_probe_split"])
+        updated["objective_clean_probe_batches"] = int(cached["objective_clean_probe_batches"])
+        updated["objective_clean_probe_batch_size"] = int(cached["objective_clean_probe_batch_size"])
+        updated["objective_clean_probe_images"] = int(cached["objective_clean_probe_images"])
+        updated["objective_clean_probe_seed"] = cached["objective_clean_probe_seed"]
+        updated["objective_clean_probe_stage"] = str(cached["objective_clean_probe_stage"])
+        updated["objective_clean_probe_t_distribution"] = str(cached["objective_clean_probe_t_distribution"])
+        updated["objective_clean_probe_pair_source"] = str(cached["objective_clean_probe_pair_source"])
         reevaluated_rows.append(updated)
 
     combined_out = os.path.join(args.outdir, f"{args.prefix}_all_methods_raw_seed_rows.csv")
@@ -1349,13 +1720,17 @@ def main() -> None:
         "combined_csv_out": combined_out,
         "fid_samples": int(args.fid_samples),
         "fid_batch_size": max(int(args.fid_batch_size), 1),
-        "reeval_mode": "direct_fid_and_edm_clean_probe_in_memory",
+        "reeval_mode": "direct_fid_and_objective_clean_probe_in_memory",
         "device": str(device),
         "fid_ref_path": args.fid_ref_path,
         "edm_clean_probe_enabled": bool(not args.disable_edm_clean_probe),
         "edm_clean_probe_split": str(args.edm_clean_probe_split),
         "edm_clean_probe_batches": int(max(args.edm_clean_probe_batches, 0)),
         "edm_clean_probe_batch_size": int(max(args.edm_clean_probe_batch_size, 0)),
+        "rf_clean_probe_enabled": bool(not args.disable_edm_clean_probe),
+        "rf_clean_probe_split": str(args.edm_clean_probe_split),
+        "rf_clean_probe_batches": int(max(args.edm_clean_probe_batches, 0)),
+        "rf_clean_probe_batch_size": int(max(args.edm_clean_probe_batch_size, 0)),
         "methods_filter": None if methods_filter is None else sorted(methods_filter),
         "respect_fid_selection": bool(args.respect_fid_selection),
         "only_missing_fid": bool(args.only_missing_fid),
@@ -1373,7 +1748,7 @@ def main() -> None:
         f"[reeval] eligible_rows={len(eligible_rows)} unique_reevaluations={len(cache)} "
         f"fid_samples={int(args.fid_samples)} "
         f"fid_batch_size={max(int(args.fid_batch_size), 1)} "
-        f"edm_clean_probe={'off' if bool(args.disable_edm_clean_probe) else 'on'}",
+        f"objective_clean_probe={'off' if bool(args.disable_edm_clean_probe) else 'on'}",
         flush=True,
     )
 

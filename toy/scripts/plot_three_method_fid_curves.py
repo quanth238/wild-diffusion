@@ -42,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", type=str, required=True)
     parser.add_argument("--train-percent-label", type=str, default="1%")
     parser.add_argument("--dataset-label", type=str, default="Simpsons-MNIST RGB")
+    parser.add_argument("--loss-metric-key", type=str, default="objective_clean_probe")
+    parser.add_argument("--loss-metric-label", type=str, default="")
+    parser.add_argument("--loss-metric-path-stem", type=str, default="")
     return parser.parse_args()
 
 
@@ -174,6 +177,9 @@ def normalize_row(row: Dict) -> Dict:
         "fid",
         "loss_final",
         "loss_mean_last",
+        "edm_clean_probe",
+        "rf_clean_probe",
+        "objective_clean_probe",
         "fixed_warmup_steps",
         "shared_edm_warm_start_compute_be",
         "shared_edm_warm_start_weighted_compute_units",
@@ -199,6 +205,39 @@ def normalize_row(row: Dict) -> Dict:
     )
     normalized["train_accelerator_count"] = _safe_float(row.get("train_accelerator_count"))
     return normalized
+
+
+def _default_loss_metric_label(metric_key: str) -> str:
+    key = str(metric_key or "").strip()
+    if key == "loss_mean_last":
+        return "Loss (mean last)"
+    if key == "edm_clean_probe":
+        return "EDM clean probe"
+    if key == "rf_clean_probe":
+        return "RF clean probe"
+    if key == "objective_clean_probe":
+        return "Objective clean probe"
+    return key.replace("_", " ").strip().title() or "Metric"
+
+
+def _metric_has_any_data(rows: List[Dict], metric_key: str) -> bool:
+    key = str(metric_key or "").strip()
+    if not key:
+        return False
+    return any(_row_has_metric(row, key) for row in rows)
+
+
+def _resolve_loss_metric(rows: List[Dict], requested_key: str) -> str:
+    key = str(requested_key or "").strip() or "objective_clean_probe"
+    if _metric_has_any_data(rows, key):
+        return key
+    if key != "loss_mean_last" and _metric_has_any_data(rows, "loss_mean_last"):
+        print(
+            f"[plot][WARN] metric '{key}' missing in all rows; falling back to 'loss_mean_last'",
+            flush=True,
+        )
+        return "loss_mean_last"
+    return key
 
 
 def _warn_if_mixed_plot_provenance(*, rows: List[Dict], x_key: str, plot_path: str) -> None:
@@ -575,17 +614,25 @@ def main() -> None:
             cdro_compare_csv=cdro_compare_csv_arg,
         )
     )
+    loss_metric_key = _resolve_loss_metric(
+        rows,
+        str(getattr(args, "loss_metric_key", "objective_clean_probe")).strip() or "objective_clean_probe",
+    )
+    loss_metric_label = str(getattr(args, "loss_metric_label", "")).strip() or _default_loss_metric_label(
+        loss_metric_key
+    )
+    loss_metric_path_stem = str(getattr(args, "loss_metric_path_stem", "")).strip() or loss_metric_key
     combined_csv = os.path.join(args.outdir, f"{args.prefix}_three_method_compare.csv")
     summary_json = os.path.join(args.outdir, f"{args.prefix}_three_method_compare_summary.json")
     plot_wall_clock = os.path.join(args.outdir, f"{args.prefix}_fid_vs_train_wall_clock.png")
     plot_weighted = os.path.join(args.outdir, f"{args.prefix}_fid_vs_weighted_compute.png")
     plot_legacy = os.path.join(args.outdir, f"{args.prefix}_fid_vs_batch_equiv.png")
     plot_dual = os.path.join(args.outdir, f"{args.prefix}_fid_vs_wall_clock_and_weighted_compute.png")
-    plot_loss_wall_clock = os.path.join(args.outdir, f"{args.prefix}_loss_mean_last_vs_train_wall_clock.png")
-    plot_loss_weighted = os.path.join(args.outdir, f"{args.prefix}_loss_mean_last_vs_weighted_compute.png")
+    plot_loss_wall_clock = os.path.join(args.outdir, f"{args.prefix}_{loss_metric_path_stem}_vs_train_wall_clock.png")
+    plot_loss_weighted = os.path.join(args.outdir, f"{args.prefix}_{loss_metric_path_stem}_vs_weighted_compute.png")
     plot_loss_dual = os.path.join(
         args.outdir,
-        f"{args.prefix}_loss_mean_last_vs_wall_clock_and_weighted_compute.png",
+        f"{args.prefix}_{loss_metric_path_stem}_vs_wall_clock_and_weighted_compute.png",
     )
 
     write_csv(combined_csv, rows)
@@ -639,9 +686,9 @@ def main() -> None:
         rows=rows,
         x_key="train_wall_clock_sec",
         x_label="Train Wall-Clock (sec)",
-        y_key="loss_mean_last",
-        y_label="Loss (mean last)",
-        plot_label="Loss (mean last)",
+        y_key=loss_metric_key,
+        y_label=loss_metric_label,
+        plot_label=loss_metric_label,
         title_suffix="Train Wall-Clock",
         train_percent_label=str(args.train_percent_label),
         dataset_label=str(args.dataset_label),
@@ -651,9 +698,9 @@ def main() -> None:
         rows=rows,
         x_key="weighted_compute_units",
         x_label="Weighted Compute Units",
-        y_key="loss_mean_last",
-        y_label="Loss (mean last)",
-        plot_label="Loss (mean last)",
+        y_key=loss_metric_key,
+        y_label=loss_metric_label,
+        plot_label=loss_metric_label,
         title_suffix="Weighted Compute",
         train_percent_label=str(args.train_percent_label),
         dataset_label=str(args.dataset_label),
@@ -661,9 +708,9 @@ def main() -> None:
     make_dual_plot(
         path=plot_loss_dual,
         rows=rows,
-        y_key="loss_mean_last",
-        y_label="Loss (mean last)",
-        plot_label="Loss (mean last)",
+        y_key=loss_metric_key,
+        y_label=loss_metric_label,
+        plot_label=loss_metric_label,
         train_percent_label=str(args.train_percent_label),
         dataset_label=str(args.dataset_label),
     )
@@ -689,9 +736,19 @@ def main() -> None:
                 "Color encodes the robustifier family (Baseline / Wild-Diffusion / CDRO); "
                 "line style and marker encode the backbone family (EDM / RF / Score VE)."
             ),
-            "loss_metric_warning": (
+            "secondary_metric_warning": (
                 "Baseline uses the backbone-native baseline loss, while robust methods use robust outer losses. "
                 "Loss plots are optimization diagnostics, not a primary cross-method fairness metric."
+                if loss_metric_key == "loss_mean_last"
+                else (
+                    "EDM clean probe is a checkpoint-time evaluation diagnostic; it is only defined for EDM-family rows."
+                    if loss_metric_key == "edm_clean_probe"
+                    else (
+                        "RF clean probe is a checkpoint-time evaluation diagnostic; it is only defined for RF-family rows."
+                        if loss_metric_key == "rf_clean_probe"
+                        else "Objective clean probe is a checkpoint-time evaluation diagnostic that selects the native checkpoint probe for each backbone family."
+                    )
+                )
             ),
         },
         "plot_paths": {
@@ -699,9 +756,9 @@ def main() -> None:
             "weighted_compute_units": plot_weighted,
             "wall_clock_and_weighted_compute": plot_dual,
             "batch_equiv_denoiser_evals": plot_legacy,
-            "loss_mean_last_train_wall_clock_sec": plot_loss_wall_clock,
-            "loss_mean_last_weighted_compute_units": plot_loss_weighted,
-            "loss_mean_last_wall_clock_and_weighted_compute": plot_loss_dual,
+            f"{loss_metric_path_stem}_train_wall_clock_sec": plot_loss_wall_clock,
+            f"{loss_metric_path_stem}_weighted_compute_units": plot_loss_weighted,
+            f"{loss_metric_path_stem}_wall_clock_and_weighted_compute": plot_loss_dual,
         },
         "combined_csv": combined_csv,
     }

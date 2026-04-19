@@ -109,7 +109,9 @@ Reevaluate saved checkpoint FIDs:
 python toy/scripts/reevaluate_three_method_fids_from_checkpoints.py ...
 ```
 
-For RF checkpoints this reevaluates FID directly; the optional `edm_clean_probe` remains EDM-only.
+For RF checkpoints this reevaluates FID directly and now records `rf_clean_probe`.
+The legacy `edm_clean_probe` remains EDM-only, while `objective_clean_probe`
+selects the native checkpoint probe for each family.
 
 ## Working Rules
 

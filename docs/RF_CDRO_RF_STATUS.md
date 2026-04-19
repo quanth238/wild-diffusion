@@ -100,6 +100,9 @@ Checkpoint note:
 
 - `toy/scripts/reevaluate_three_method_fids_from_checkpoints.py` can reevaluate FIDs
   for RF checkpoints.
-- The extra `edm_clean_probe` is EDM-only and is reported unsupported for RF checkpoints.
+- The reevaluator now records `rf_clean_probe` for RF checkpoints and keeps
+  `edm_clean_probe` as unsupported there.
+- `objective_clean_probe` is the generic row field that selects `edm_clean_probe`
+  for EDM-family checkpoints and `rf_clean_probe` for RF-family checkpoints.
 
 Use `metrics.json` artifacts under `toy_outputs/` as the authoritative record of exact run settings.
