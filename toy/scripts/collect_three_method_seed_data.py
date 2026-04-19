@@ -3168,7 +3168,7 @@ def main() -> None:
     if not wdro_enabled:
         print(
             "[collect-weighted] skip wdro for training_objective=rf "
-            "(Wild-Diffusion-RF is optional and not implemented in this milestone)",
+            "(direct Wild-Diffusion-RF runs exist, but shared-grid collector support is still deferred)",
             flush=True,
         )
     elif reused_wdro_raw_csv:
@@ -3647,6 +3647,9 @@ def main() -> None:
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
             "wdro_enabled": bool(wdro_enabled),
             "wdro_optional_for_rf_first_milestone": bool(str(args.training_objective).strip().lower() == "rf"),
+            "wdro_shared_grid_deferred_for_rf": bool(
+                str(args.training_objective).strip().lower() == "rf" and not reused_wdro_raw_csv
+            ),
             "robust_warmup_mode": str(args.robust_warmup_mode).strip().lower(),
             "shared_baseline_warm_start_enabled": bool(shared_baseline_warm_start_enabled),
             "shared_robust_fixed_warmup_steps": (

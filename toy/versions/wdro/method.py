@@ -4,8 +4,8 @@ from .trainer import train_trajectory_robust_wdro
 NAME = "wdro"
 IMPLEMENTED = True
 DESCRIPTION = (
-    "Paper-style WDRO training with a clean warmup stage followed by periodic "
-    "dataset augmentation using worst-case samples."
+    "Paper-style WDRO training with periodic dataset augmentation using worst-case "
+    "samples; RF mode starts from the shared EDM warm start and runs RF stage-1 plus reflow."
 )
 
 

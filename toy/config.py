@@ -88,7 +88,7 @@ class ToyConfig:
     rf_reflow_t_distribution: str = "u_shaped"  # u_shaped|uniform
     rf_loss: str = "pseudo_huber"  # pseudo_huber|mse
     rf_pseudo_huber_delta: float = 0.1
-    rf_edm_init_ckpt_path: str = ""
+    rf_edm_init_ckpt_path: str = ""  # required shared EDM warm-start for RF / CDRO-RF / Wild-Diffusion-RF
     rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise
 
     # Data.

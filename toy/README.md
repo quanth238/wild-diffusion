@@ -9,9 +9,13 @@ Current default lane: CDRO-EDM on the Simpsons-MNIST RGB 5% split, seed 0, batch
 Recent capability note:
 
 - The toy stack now also supports RF-family experiments alongside EDM-family ones.
-- Public comparison naming should read: `Baseline EDM`, `Wild-Diffusion`, `CDRO-EDM`, `RF`, `CDRO-RF`.
+- Public comparison naming should read: `Baseline EDM`, `Wild-Diffusion`, `CDRO-EDM`, `RF`, `CDRO-RF`, `Wild-Diffusion-RF`.
 - In plots/presentation, the historically named `wdro` method should display as `Wild-Diffusion`.
-- `Wild-Diffusion-RF` is still intentionally deferred.
+- All RF-family runs now require the shared EDM warm-start checkpoint via `rf_edm_init_ckpt_path`.
+- Public clean `RF` means the strong two-stage RF baseline (`rf_stage1` + `rf_reflow`), and that remains the default RF baseline mode.
+- Direct `method_version=wdro --training-objective rf` runs are now the canonical `Wild-Diffusion-RF` path, resuming RF robust training from the shared EDM checkpoint. `wdro_warmup_fraction` is ignored there.
+- Direct `WDRO-EDM` / `CDRO-EDM` runs should likewise start from an explicit shared EDM baseline checkpoint via `baseline_ckpt_path`; later continuation knots should use `robust_resume_ckpt_path`.
+- Shared-grid collector support for `Wild-Diffusion-RF` is still deferred; use direct `toy/run_toy.py` runs.
 
 Important caveat:
 
@@ -98,6 +102,14 @@ Run the generic image wrapper with an explicit method choice:
 ```bash
 METHOD_VERSION=cdro toy/scripts/run_image_once.sh
 ```
+
+Reevaluate saved checkpoint FIDs:
+
+```bash
+python toy/scripts/reevaluate_three_method_fids_from_checkpoints.py ...
+```
+
+For RF checkpoints this reevaluates FID directly; the optional `edm_clean_probe` remains EDM-only.
 
 ## Working Rules
 

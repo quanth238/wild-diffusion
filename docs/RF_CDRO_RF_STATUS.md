@@ -7,7 +7,7 @@ This note is the shortest current description of the toy-side RF additions.
 - Use `RF` for the public clean rectified-flow baseline.
 - Use `CDRO-RF` for the robust RF method.
 - Use `Wild-Diffusion` in plots/presentation for the historically named `wdro` method.
-- `Wild-Diffusion-RF` is not implemented for the current milestone.
+- Use `Wild-Diffusion-RF` for `method_version=wdro --training-objective rf`.
 
 ## Clean RF Baseline
 
@@ -23,7 +23,7 @@ Implementation notes:
 - Stage-1 timestep law is uniform in continuous `t`.
 - Reflow-stage timestep law is controlled by `rf_reflow_t_distribution` and currently defaults to `u_shaped`.
 - EMA is kept in both stages.
-- Optional EDM warm start is exposed through `rf_edm_init_ckpt_path`.
+- The shared EDM warm start is required through `rf_edm_init_ckpt_path`.
 
 ## CDRO-RF
 
@@ -47,6 +47,31 @@ Current staged pair law:
 1. robust stage-1 uses standard RF pairs `(z, x0)`
 2. robust reflow stage uses frozen one-round reflow pairs `(z, x_hat_teacher(z))`
 
+`CDRO-RF` also requires the shared EDM warm-start checkpoint and skips the toy-side
+baseline warmup phase entirely.
+
+## Wild-Diffusion-RF
+
+`Wild-Diffusion-RF` keeps the existing WDRO shell but swaps the continuation loss
+to RF after the shared EDM warm start.
+
+Current direct-run behavior:
+
+1. robust RF stage-1 rebuilds the WDRO augmented pool with worst-case samples and
+   trains on RF pairs `(z, x_adv)`
+2. robust RF reflow freezes the stage-1 teacher and trains on one-round reflow pairs
+   `(z, x_hat_teacher(z))`
+
+Implementation notes:
+
+- `method_version=wdro --training-objective rf` is the direct `Wild-Diffusion-RF` path.
+- The shared EDM warm start is required through `rf_edm_init_ckpt_path`.
+- The shared EDM checkpoint is treated as the warmup prefix, so the in-run WDRO-RF
+  budget resumes from that checkpoint and goes straight into RF robust continuation.
+- `wdro_warmup_fraction` is ignored for the direct `Wild-Diffusion-RF` path.
+- Shared-grid collector support is still deferred; direct `toy/run_toy.py` runs are
+  the supported path today.
+
 ## Time-Law Matching
 
 CDRO-RF rollout grids are stage-matched to the clean RF timestep law:
@@ -67,8 +92,14 @@ sampling, evaluation, and frozen-teacher reflow pair generation.
 
 ## What Is Still Deferred
 
-- `Wild-Diffusion-RF`
+- shared-grid collector / checkpointed sweep support for `Wild-Diffusion-RF`
 - broader paper-facing writeups outside the toy stack
 - any claim that docs are the full source of truth for experiment settings
+
+Checkpoint note:
+
+- `toy/scripts/reevaluate_three_method_fids_from_checkpoints.py` can reevaluate FIDs
+  for RF checkpoints.
+- The extra `edm_clean_probe` is EDM-only and is reported unsupported for RF checkpoints.
 
 Use `metrics.json` artifacts under `toy_outputs/` as the authoritative record of exact run settings.

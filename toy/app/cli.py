@@ -14,6 +14,9 @@ from ..versions.registry import SUPPORTED_METHOD_VERSIONS
 def _validate_config(cfg: ToyConfig) -> None:
     """Fail-fast validation for impossible or degenerate training settings."""
 
+    method_version = str(cfg.method_version).strip().lower()
+    training_objective = str(cfg.training_objective).strip().lower()
+
     if cfg.method_version not in SUPPORTED_METHOD_VERSIONS:
         raise ValueError(
             f"--method-version must be one of {SUPPORTED_METHOD_VERSIONS}, got {cfg.method_version}"
@@ -108,6 +111,38 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--rf-pseudo-huber-delta must be > 0, got {cfg.rf_pseudo_huber_delta}"
         )
+    if training_objective == "rf" and not str(cfg.rf_edm_init_ckpt_path).strip():
+        raise ValueError(
+            "--rf-edm-init-ckpt-path is required for RF runs so RF, CDRO-RF, and Wild-RF all share "
+            "the same EDM warm-start checkpoint."
+        )
+    if (
+        training_objective == "rf"
+        and method_version == "clean"
+        and not bool(cfg.baseline_only)
+    ):
+        raise ValueError(
+            "RF with method_version='clean' is only supported through the shared strong baseline path. "
+            "Pass --baseline-only for the public RF baseline, or choose a robust RF method."
+        )
+    if (
+        training_objective == "edm"
+        and method_version in ("wdro", "cdro")
+        and not bool(cfg.baseline_only)
+        and not str(cfg.robust_resume_ckpt_path).strip()
+    ):
+        if not bool(cfg.baseline_ckpt_enabled):
+            raise ValueError(
+                "Direct robust EDM runs must start from an explicit shared baseline checkpoint. "
+                "Pass --baseline-ckpt-path for the shared EDM warmup artifact, or resume from "
+                "--robust-resume-ckpt-path instead of disabling baseline checkpoint loading."
+            )
+        if not str(cfg.baseline_ckpt_path).strip():
+            raise ValueError(
+                "Direct WDRO-EDM / CDRO-EDM runs must use an explicit shared baseline checkpoint. "
+                "Pass --baseline-ckpt-path for the shared EDM warmup artifact, or use "
+                "--robust-resume-ckpt-path for later checkpoints along the same method path."
+            )
     if str(cfg.rf_cdro_pair_source).lower() not in ("auto", "reflow", "data_noise"):
         raise ValueError(
             "--rf-cdro-pair-source must be one of ('auto', 'reflow', 'data_noise'), got "

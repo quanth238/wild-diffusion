@@ -268,6 +268,32 @@ def _is_cdro_rf_port(cfg, method_name: str) -> bool:
     )
 
 
+def _is_wdro_rf_port(cfg, method_name: str) -> bool:
+    """Return whether the active run is the direct Wild-RF configuration."""
+
+    return (
+        str(method_name).strip().lower() == "wdro"
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+    )
+
+
+def _is_shared_warm_start_robust_rf_port(cfg, method_name: str) -> bool:
+    """Return whether the active run skips toy baseline warmup and starts from shared EDM weights."""
+
+    return _is_cdro_rf_port(cfg, method_name)
+
+
+def _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name: str) -> bool:
+    """Return whether the run should begin from a named shared EDM baseline checkpoint."""
+
+    return (
+        str(method_name).strip().lower() in ("wdro", "cdro")
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() == "edm"
+        and not bool(getattr(cfg, "baseline_only", False))
+        and not str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
+    )
+
+
 def _resolve_cdro_attack_num_steps(cfg) -> tuple[int, str]:
     """Resolve CDRO attack steps with legacy `inner_steps` fallback."""
 
@@ -384,7 +410,7 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dic
     objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
     ckpt_path = str(getattr(cfg, "rf_edm_init_ckpt_path", "")).strip()
     report: Dict[str, Any] = {
-        "enabled": bool(objective == "rf" and ckpt_path),
+        "enabled": bool(objective == "rf"),
         "path": ckpt_path,
         "source_state_key": None,
         "baseline": None,
@@ -403,8 +429,13 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dic
             "weighted_compute_units": None,
         },
     }
-    if objective != "rf" or not ckpt_path:
+    if objective != "rf":
         return report
+    if not ckpt_path:
+        raise RuntimeError(
+            "RF runs require a shared EDM warm-start checkpoint. "
+            "Set --rf-edm-init-ckpt-path to the shared EDM warm-start artifact."
+        )
     abs_path = os.path.abspath(ckpt_path)
     if not os.path.isfile(abs_path):
         raise FileNotFoundError(f"RF EDM init checkpoint not found: {abs_path}")
@@ -1373,25 +1404,34 @@ def _resolve_phase_steps(
         baseline_steps = max(0, min(baseline_steps, total_steps))
         robust_steps = max(total_steps - baseline_steps, 0)
     elif str(method_name).lower() == "wdro":
-        split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
-        if baseline_steps_override > 0:
-            baseline_steps = int(cfg.baseline_steps_override)
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            baseline_steps = 0
+            robust_steps = total_steps
+            split_mode = "wdro_rf_shared_edm_resume"
+            wdro_warmup_compute_fraction = 0.0
+            wdro_warmup_weighted_compute_fraction = 0.0 if weighted_calibration is not None else None
+            wdro_robust_step_batch_equiv = None
+            wdro_robust_step_weighted_units = None
         else:
-            baseline_steps = int(total_steps * float(cfg.wdro_warmup_fraction))
-        baseline_steps = max(0, min(baseline_steps, total_steps))
-        robust_steps = max(total_steps - baseline_steps, 0)
-        wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
-            cfg,
-            train_pool_size=train_pool_size,
-        )
-        if weighted_calibration is not None:
-            wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
-                _estimate_wdro_warmup_weighted_compute_fraction(
-                    cfg,
-                    train_pool_size=train_pool_size,
-                    calibration=weighted_calibration,
-                )
+            split_mode = "wdro_baseline_steps_override" if baseline_steps_override > 0 else "wdro_paper_style"
+            if baseline_steps_override > 0:
+                baseline_steps = int(cfg.baseline_steps_override)
+            else:
+                baseline_steps = int(total_steps * float(cfg.wdro_warmup_fraction))
+            baseline_steps = max(0, min(baseline_steps, total_steps))
+            robust_steps = max(total_steps - baseline_steps, 0)
+            wdro_warmup_compute_fraction, wdro_robust_step_batch_equiv = _estimate_wdro_warmup_compute_fraction(
+                cfg,
+                train_pool_size=train_pool_size,
             )
+            if weighted_calibration is not None:
+                wdro_warmup_weighted_compute_fraction, wdro_robust_step_weighted_units = (
+                    _estimate_wdro_warmup_weighted_compute_fraction(
+                        cfg,
+                        train_pool_size=train_pool_size,
+                        calibration=weighted_calibration,
+                    )
+                )
     elif str(method_name).lower() == "cdro":
         cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
         cdro_attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
@@ -1834,7 +1874,7 @@ def _run_robust_phase(
             elif method_name in ("clean", "wdro", "cdro"):
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["ema_state_dict"] = trainer_state_in.get("ema_state_dict")
-                if method_name == "cdro":
+                if method_name in ("wdro", "cdro"):
                     trainer_kwargs["rf_reflow_teacher_state_dict"] = trainer_state_in.get("rf_reflow_teacher_state_dict")
             else:
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
@@ -1969,6 +2009,15 @@ def run_experiment(cfg) -> dict:
     method = resolve_method_module(cfg.method_version)
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
     is_cdro_rf = _is_cdro_rf_port(cfg, method_name)
+    is_shared_warm_start_robust_rf = _is_shared_warm_start_robust_rf_port(cfg, method_name)
+    if _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name):
+        baseline_ckpt_path_explicit = str(getattr(cfg, "baseline_ckpt_path", "")).strip()
+        if not baseline_ckpt_path_explicit:
+            raise RuntimeError(
+                "Direct robust EDM runs must start from an explicit shared baseline checkpoint. "
+                "Set --baseline-ckpt-path to the shared EDM warmup artifact, or resume from "
+                "--robust-resume-ckpt-path for later checkpoints."
+            )
     rollout_kwargs = _method_rollout_kwargs(cfg, method)
     if not getattr(method, "IMPLEMENTED", True):
         raise NotImplementedError(
@@ -2185,7 +2234,7 @@ def run_experiment(cfg) -> dict:
         json.dumps(baseline_signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     baseline_ckpt_path = _resolve_baseline_ckpt_path(cfg, baseline_signature)
-    baseline_ckpt_enabled = bool(getattr(cfg, "baseline_ckpt_enabled", True)) and not is_cdro_rf
+    baseline_ckpt_enabled = bool(getattr(cfg, "baseline_ckpt_enabled", True)) and not is_shared_warm_start_robust_rf
     baseline_ckpt_force_retrain = bool(getattr(cfg, "baseline_ckpt_force_retrain", False))
     baseline_ckpt_strict_meta = bool(getattr(cfg, "baseline_ckpt_strict_meta", True))
     baseline_ckpt_loaded = False
@@ -2314,10 +2363,11 @@ def run_experiment(cfg) -> dict:
         }
         baseline_gate["eval_seed"] = int(gate_eval_seed)
         baseline_gate["eval_seed_scoped"] = False
-    elif is_cdro_rf and baseline_steps_for_phase <= 0:
+    elif is_shared_warm_start_robust_rf and baseline_steps_for_phase <= 0:
         baseline_gate = {
             "passed": True,
-            "skipped_for_cdro_rf_warm_start": True,
+            "skipped_for_rf_robust_warm_start": True,
+            "rf_robust_warm_start_method": str(method_name),
             "checks": [],
             "failed_checks": [],
         }
