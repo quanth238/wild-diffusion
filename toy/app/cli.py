@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 from typing import Optional, Sequence
 
 from ..config import ToyConfig
@@ -116,15 +117,36 @@ def _validate_config(cfg: ToyConfig) -> None:
             "--rf-edm-init-ckpt-path is required for RF runs so RF, CDRO-RF, and Wild-RF all share "
             "the same EDM warm-start checkpoint."
         )
+    if training_objective == "rf":
+        explicit_baseline_ckpt = str(getattr(cfg, "baseline_ckpt_path", "")).strip()
+        robust_resume_ckpt = str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
+        if explicit_baseline_ckpt and not robust_resume_ckpt:
+            baseline_ckpt_abs = os.path.normpath(os.path.abspath(explicit_baseline_ckpt))
+            rf_init_ckpt_abs = os.path.normpath(os.path.abspath(str(cfg.rf_edm_init_ckpt_path).strip()))
+            if os.path.isfile(baseline_ckpt_abs) and baseline_ckpt_abs != rf_init_ckpt_abs:
+                raise ValueError(
+                    "RF shared-branch identity mismatch: when RF loads an explicit existing "
+                    "--baseline-ckpt-path, it must be the same exact artifact as "
+                    "--rf-edm-init-ckpt-path so clean RF, CDRO-RF, and Wild-RF all branch from "
+                    "the EDM family's shared checkpoint."
+                )
     if (
         training_objective == "rf"
         and method_version == "clean"
         and not bool(cfg.baseline_only)
     ):
-        raise ValueError(
-            "RF with method_version='clean' is only supported through the shared strong baseline path. "
-            "Pass --baseline-only for the public RF baseline, or choose a robust RF method."
+        has_shared_rf_continuation_lineage = bool(
+            int(getattr(cfg, "baseline_steps_override", 0)) > 0
+            or str(getattr(cfg, "baseline_ckpt_path", "")).strip()
+            or str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
         )
+        if not has_shared_rf_continuation_lineage:
+            raise ValueError(
+                "RF with method_version='clean' is only supported through the public strong baseline path "
+                "or an explicit shared-checkpoint continuation path. Pass --baseline-only for the public RF "
+                "baseline, or provide shared RF continuation lineage via --baseline-ckpt-path, "
+                "--robust-resume-ckpt-path, or --baseline-steps-override."
+            )
     if (
         training_objective == "edm"
         and method_version in ("wdro", "cdro")

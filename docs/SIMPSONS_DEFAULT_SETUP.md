@@ -4,7 +4,7 @@ This is the active Simpsons-MNIST RGB default for CDRO-EDM work in this repo.
 
 ## Locked Default
 
-- Label: `simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw100_cw000`
+- Label: `simpsons5_cdro_400k_warmup20_rho0p001_n032_i1_aw100_cw000`
 - Method: `method_version=cdro`
 - Training objective: `training_objective=edm`
 - Dataset: Simpsons-MNIST RGB, 5% train subset
@@ -18,9 +18,9 @@ This is the active Simpsons-MNIST RGB default for CDRO-EDM work in this repo.
 - CDRO path steps: `cdro_n_steps_path=32`
 - CDRO ladder: `cdro_edm_ladder_mode=stochastic_stratified_quantile`, sampled per example
 - CDRO step size: `cdro_step_size=0.02`
-- CDRO budget: `cdro_total_budget_rho=32.0`
+- CDRO budget: `cdro_total_budget_rho=0.001`
 
-`rho=32` is the current default/provisional anchor. Keep rho easy to override, because `rho=64` is the next comparison target:
+`rho=0.001` is the current default/provisional anchor. Keep rho easy to override for follow-up comparisons:
 
 ```bash
 --cdro-total-budget-rho 64
@@ -77,7 +77,7 @@ For direct `toy/run_toy.py` runs, `toy/config.py` now defaults to this CDRO imag
 - `outer_attack_weight=1.0`
 - `outer_clean_weight=0.0`
 - `cdro_step_size=0.02`
-- `cdro_total_budget_rho=32.0`
+- `cdro_total_budget_rho=0.001`
 - `cdro_time_horizon=1.0`
 - `cdro_warmup_fraction=0.2`
 - `cdro_edm_ladder_mode=stochastic_stratified_quantile`
@@ -106,7 +106,8 @@ The collector saves dense checkpoints on the shared grid, then fills selected FI
 
 ## Active Artifact Pointers
 
-- Current rho=32 anchor: `toy_outputs/simpsons5_cdro_400k_warmup20_rho32_n032_cw0_20260414/`
+- Existing rho=0.001 artifacts: `toy_outputs/simpsons50_cdro_400k_warmup20_rho0p001_n032_cw0_aw100_perex_default/050pct/`
+- Existing shared-checkpoint rho=0.001 artifacts: `toy_outputs/simpsons100_cdro_400k_warmup20_rho0p001_n032_cw0_aw100_perex_sharedckpt/100pct/`
 - Rho=64 comparison run area: `toy_outputs/simpsons5_cdro_400k_warmup20_rho64_n032_cw0_20260414/`
 - Earlier nrho sweep reference: `toy_outputs/simpsons5_cdro_400k_warmup20_nrho_20260413/`
 
@@ -137,8 +138,8 @@ Run the locked 5% three-method family with explicit knobs:
 
 ```bash
 python toy/scripts/collect_three_method_seed_data.py \
-  --outdir toy_outputs/simpsons5_cdro_400k_warmup20_rho32_n032_cw0_default \
-  --prefix simpsons5_cdro_400k_warmup20_rho32_n032_i1_aw100_cw000_default \
+  --outdir toy_outputs/simpsons5_cdro_400k_warmup20_rho0p001_n032_cw0_default \
+  --prefix simpsons5_cdro_400k_warmup20_rho0p001_n032_i1_aw100_cw000_default \
   --seeds 0 \
   --device cuda \
   --amp-dtype auto \
@@ -179,7 +180,7 @@ python toy/scripts/collect_three_method_seed_data.py \
   --outer-attack-weight 1.0 \
   --outer-clean-weight 0.0 \
   --cdro-step-size 0.02 \
-  --cdro-total-budget-rho 32.0 \
+  --cdro-total-budget-rho 0.001 \
   --cdro-time-horizon 1.0 \
   --cdro-edm-ladder-mode stochastic_stratified_quantile \
   --cdro-warmup-fraction 0.2 \

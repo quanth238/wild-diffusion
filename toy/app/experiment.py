@@ -277,10 +277,24 @@ def _is_wdro_rf_port(cfg, method_name: str) -> bool:
     )
 
 
+def _is_clean_rf_shared_warm_start_port(cfg, method_name: str) -> bool:
+    """Return whether clean RF is running as shared-EDM continuation instead of public baseline-only RF."""
+
+    return (
+        str(method_name).strip().lower() == "clean"
+        and str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+        and not bool(getattr(cfg, "baseline_only", False))
+    )
+
+
 def _is_shared_warm_start_robust_rf_port(cfg, method_name: str) -> bool:
     """Return whether the active run skips toy baseline warmup and starts from shared EDM weights."""
 
-    return _is_cdro_rf_port(cfg, method_name)
+    return (
+        _is_clean_rf_shared_warm_start_port(cfg, method_name)
+        or _is_cdro_rf_port(cfg, method_name)
+        or _is_wdro_rf_port(cfg, method_name)
+    )
 
 
 def _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name: str) -> bool:
@@ -292,6 +306,53 @@ def _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name: str) -> bool:
         and not bool(getattr(cfg, "baseline_only", False))
         and not str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
     )
+
+
+def _normalize_checkpoint_identity_path(path: str) -> Optional[str]:
+    """Return a normalized absolute path string for checkpoint identity checks."""
+
+    text = str(path).strip()
+    if not text:
+        return None
+    return os.path.normpath(os.path.abspath(text))
+
+
+def _resolve_shared_edm_branch_checkpoint(cfg, method_name: str) -> Dict[str, Any]:
+    """Resolve the explicit shared EDM branch checkpoint for lineage and identity checks."""
+
+    training_objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
+    rf_init_ckpt_path = _normalize_checkpoint_identity_path(getattr(cfg, "rf_edm_init_ckpt_path", ""))
+    baseline_ckpt_path = _normalize_checkpoint_identity_path(getattr(cfg, "baseline_ckpt_path", ""))
+    robust_resume_ckpt_path = str(getattr(cfg, "robust_resume_ckpt_path", "")).strip()
+    info = {
+        "path": None,
+        "source": "unavailable",
+        "rf_edm_init_ckpt_path": rf_init_ckpt_path,
+        "baseline_ckpt_path": baseline_ckpt_path,
+        "identity_enforced": False,
+    }
+    if training_objective == "rf":
+        if baseline_ckpt_path and not robust_resume_ckpt_path and os.path.isfile(baseline_ckpt_path):
+            if rf_init_ckpt_path and baseline_ckpt_path != rf_init_ckpt_path:
+                raise RuntimeError(
+                    "RF shared-branch identity mismatch at runtime: "
+                    f"--baseline-ckpt-path={baseline_ckpt_path} does not match "
+                    f"--rf-edm-init-ckpt-path={rf_init_ckpt_path}. "
+                    "RF family runs must branch from the same shared EDM checkpoint artifact."
+                )
+            info["path"] = baseline_ckpt_path
+            info["source"] = "explicit_existing_baseline_ckpt_path"
+            info["identity_enforced"] = True
+            return info
+        if rf_init_ckpt_path:
+            info["path"] = rf_init_ckpt_path
+            info["source"] = "rf_edm_init_ckpt_path"
+        return info
+    if _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name) and baseline_ckpt_path:
+        info["path"] = baseline_ckpt_path
+        info["source"] = "baseline_ckpt_path"
+        info["identity_enforced"] = True
+    return info
 
 
 def _resolve_cdro_attack_num_steps(cfg) -> tuple[int, str]:
@@ -1380,6 +1441,7 @@ def _resolve_phase_steps(
     wdro_warmup_weighted_compute_fraction = None
     wdro_robust_step_weighted_units = None
     cdro_robust_step_weighted_units = None
+    shared_edm_prefix_steps = 0
 
     if bool(getattr(cfg, "baseline_only", False)):
         return {
@@ -1387,6 +1449,7 @@ def _resolve_phase_steps(
             "baseline_steps": int(total_steps),
             "robust_steps": 0,
             "split_mode": "baseline_only_full_budget",
+            "shared_edm_prefix_steps": 0,
             "wdro_warmup_compute_fraction": None,
             "wdro_warmup_weighted_compute_fraction": None,
             "wdro_robust_step_batch_equiv": None,
@@ -1396,18 +1459,33 @@ def _resolve_phase_steps(
         }
 
     if str(method_name).lower() == "clean":
-        split_mode = "clean_baseline_steps_override" if baseline_steps_override > 0 else "clean_full_budget_continuation"
-        if baseline_steps_override > 0:
-            baseline_steps = int(cfg.baseline_steps_override)
-        else:
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            shared_edm_prefix_steps = int(cfg.baseline_steps_override) if baseline_steps_override > 0 else 0
             baseline_steps = 0
-        baseline_steps = max(0, min(baseline_steps, total_steps))
-        robust_steps = max(total_steps - baseline_steps, 0)
+            robust_steps = max(total_steps - int(shared_edm_prefix_steps), 0)
+            split_mode = (
+                "clean_rf_shared_edm_prefix_override"
+                if shared_edm_prefix_steps > 0
+                else "clean_rf_full_budget_continuation"
+            )
+        else:
+            split_mode = "clean_baseline_steps_override" if baseline_steps_override > 0 else "clean_full_budget_continuation"
+            if baseline_steps_override > 0:
+                baseline_steps = int(cfg.baseline_steps_override)
+            else:
+                baseline_steps = 0
+            baseline_steps = max(0, min(baseline_steps, total_steps))
+            robust_steps = max(total_steps - baseline_steps, 0)
     elif str(method_name).lower() == "wdro":
         if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            shared_edm_prefix_steps = int(cfg.baseline_steps_override) if baseline_steps_override > 0 else 0
             baseline_steps = 0
-            robust_steps = total_steps
-            split_mode = "wdro_rf_shared_edm_resume"
+            robust_steps = max(total_steps - int(shared_edm_prefix_steps), 0)
+            split_mode = (
+                "wdro_rf_shared_edm_prefix_override"
+                if shared_edm_prefix_steps > 0
+                else "wdro_rf_shared_edm_resume"
+            )
             wdro_warmup_compute_fraction = 0.0
             wdro_warmup_weighted_compute_fraction = 0.0 if weighted_calibration is not None else None
             wdro_robust_step_batch_equiv = None
@@ -1436,9 +1514,14 @@ def _resolve_phase_steps(
         cdro_robust_step_batch_equiv = _estimate_cdro_robust_step_batch_equiv(cfg)
         cdro_attack_num_steps, _ = _resolve_cdro_attack_num_steps(cfg)
         if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+            shared_edm_prefix_steps = int(cfg.baseline_steps_override) if baseline_steps_override > 0 else 0
             baseline_steps = 0
-            robust_steps = total_steps
-            split_mode = "cdro_rf_shared_edm_warm_start"
+            robust_steps = max(total_steps - int(shared_edm_prefix_steps), 0)
+            split_mode = (
+                "cdro_rf_shared_edm_prefix_override"
+                if shared_edm_prefix_steps > 0
+                else "cdro_rf_shared_edm_warm_start"
+            )
         else:
             split_mode = "cdro_baseline_steps_override" if baseline_steps_override > 0 else "cdro_fixed_fraction_warmup"
             if baseline_steps_override > 0:
@@ -1497,6 +1580,7 @@ def _resolve_phase_steps(
         "baseline_steps": int(baseline_steps),
         "robust_steps": int(robust_steps),
         "split_mode": split_mode,
+        "shared_edm_prefix_steps": int(shared_edm_prefix_steps),
         "wdro_warmup_compute_fraction": (
             None if wdro_warmup_compute_fraction is None else float(wdro_warmup_compute_fraction)
         ),
@@ -1874,7 +1958,10 @@ def _run_robust_phase(
             elif method_name in ("clean", "wdro", "cdro"):
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
                 trainer_kwargs["ema_state_dict"] = trainer_state_in.get("ema_state_dict")
-                if method_name in ("wdro", "cdro"):
+                if method_name in ("clean", "wdro", "cdro") and (
+                    method_name != "clean"
+                    or str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+                ):
                     trainer_kwargs["rf_reflow_teacher_state_dict"] = trainer_state_in.get("rf_reflow_teacher_state_dict")
             else:
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
@@ -1884,9 +1971,13 @@ def _run_robust_phase(
         if return_trainer_state and method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
             trainer_kwargs["return_state"] = True
         if baseline_handoff_state is not None and method_name in ("clean", "wdro", "cdro"):
-            trainer_kwargs["optimizer_theta_state"] = baseline_handoff_state.get("optimizer_theta_state")
-            trainer_kwargs["ema_state_dict"] = baseline_handoff_state.get("ema_state_dict")
-            if method_name == "clean":
+            if not (
+                method_name == "clean"
+                and str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+            ):
+                trainer_kwargs["optimizer_theta_state"] = baseline_handoff_state.get("optimizer_theta_state")
+                trainer_kwargs["ema_state_dict"] = baseline_handoff_state.get("ema_state_dict")
+            if method_name == "clean" and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf":
                 trainer_kwargs["start_step"] = int(baseline_handoff_state.get("step", 0) or 0)
 
     attack_training_executed = True
@@ -2010,6 +2101,7 @@ def run_experiment(cfg) -> dict:
     method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
     is_cdro_rf = _is_cdro_rf_port(cfg, method_name)
     is_shared_warm_start_robust_rf = _is_shared_warm_start_robust_rf_port(cfg, method_name)
+    shared_edm_branch_ckpt = _resolve_shared_edm_branch_checkpoint(cfg, method_name)
     if _requires_explicit_shared_edm_baseline_ckpt(cfg, method_name):
         baseline_ckpt_path_explicit = str(getattr(cfg, "baseline_ckpt_path", "")).strip()
         if not baseline_ckpt_path_explicit:
@@ -2086,6 +2178,14 @@ def run_experiment(cfg) -> dict:
         f"method_version={cfg.method_version}",
         flush=True,
     )
+    if shared_edm_branch_ckpt.get("path"):
+        print(
+            "[info] shared_edm_branch "
+            f"path={shared_edm_branch_ckpt['path']} "
+            f"source={shared_edm_branch_ckpt['source']} "
+            f"identity_enforced={bool(shared_edm_branch_ckpt.get('identity_enforced', False))}",
+            flush=True,
+        )
     gate_eval_seed = int(cfg.seed + cfg.eval_seed_offset_gate)
     metrics_eval_seed = int(cfg.seed + cfg.eval_seed_offset_metrics)
     print(
@@ -2999,6 +3099,7 @@ def run_experiment(cfg) -> dict:
             "baseline_phase_steps": int(baseline_steps_for_phase),
             "robust_phase_steps": int(robust_steps_for_phase),
             "robust_phase_steps_completed": int(actual_robust_steps_completed),
+            "shared_edm_prefix_steps": int(phase_steps.get("shared_edm_prefix_steps", 0) or 0),
             "wdro_reference_warmup_compute_fraction": phase_steps.get("wdro_warmup_compute_fraction"),
             "wdro_reference_warmup_weighted_compute_fraction": phase_steps.get(
                 "wdro_warmup_weighted_compute_fraction"
@@ -3025,6 +3126,11 @@ def run_experiment(cfg) -> dict:
             ),
             "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
             "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
+            "shared_edm_branch_ckpt_path": shared_edm_branch_ckpt.get("path"),
+            "shared_edm_branch_ckpt_source": str(shared_edm_branch_ckpt.get("source", "unavailable")),
+            "shared_edm_branch_identity_enforced": bool(
+                shared_edm_branch_ckpt.get("identity_enforced", False)
+            ),
             "rf_edm_init": rf_edm_init_report,
             "rf_stage_boundaries": {
                 "shared_edm_warm_start": (

@@ -114,7 +114,7 @@ class ToyConfig:
     lambda_energy: float = 0.2
     # CDRO Route-A options (beta-space greedy attack with sigma-time local caps).
     cdro_step_size: float = 0.02
-    cdro_total_budget_rho: float = 32.0
+    cdro_total_budget_rho: float = 0.001
     cdro_time_horizon: float = 1.0  # Total span of the sigma-induced auxiliary clock.
     cdro_edm_ladder_mode: str = "stochastic_stratified_quantile"  # deterministic_midpoint_quantile|stochastic_stratified_quantile
     cdro_per_example_sigma_ladders: bool = True

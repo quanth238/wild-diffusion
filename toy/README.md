@@ -4,7 +4,7 @@ This package is the canonical toy-side implementation in this repo.
 
 The current active workflow is Simpsons-MNIST RGB with `method_version=cdro`.
 
-Current default lane: CDRO-EDM on the Simpsons-MNIST RGB 5% split, seed 0, batch size 256, hidden dim 64, official EMA, warmup fraction 0.2, `inner_steps=1`, `outer_attack_weight=0.3`, `outer_clean_weight=0.0`, `cdro_n_steps_path=32`, stochastic stratified quantile ladder, `cdro_step_size=0.02`, and `cdro_total_budget_rho=32.0`. Keep rho explicit when testing the pending rho=64 branch.
+Current default lane: CDRO-EDM on the Simpsons-MNIST RGB 5% split, seed 0, batch size 256, hidden dim 64, official EMA, warmup fraction 0.2, `inner_steps=1`, `outer_attack_weight=0.3`, `outer_clean_weight=0.0`, `cdro_n_steps_path=32`, stochastic stratified quantile ladder, `cdro_step_size=0.02`, and `cdro_total_budget_rho=0.001`. Keep rho explicit when testing follow-up branches.
 
 Recent capability note:
 
