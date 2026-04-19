@@ -58,6 +58,35 @@ def _safe_float(value):
         return None
 
 
+def _load_posthoc_probe_from_row(row: Dict[str, str]) -> Tuple[float, str] | None:
+    direct_loss = _safe_float(row.get("loss_comparable_final"))
+    direct_key = str(row.get("loss_comparable_key", "")).strip()
+    if direct_loss is not None:
+        return float(direct_loss), (direct_key or "loss_comparable_final")
+
+    probe_loss = _safe_float(row.get("loss_probe_clean"))
+    probe_key = str(row.get("loss_probe_metric_key", "")).strip()
+    if probe_loss is not None:
+        return float(probe_loss), (probe_key or "checkpoint_clean_edm_probe")
+
+    result_json = str(row.get("loss_probe_result_json", "")).strip()
+    if not result_json:
+        return None
+    result_path = Path(result_json).resolve()
+    if not result_path.is_file():
+        return None
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    payload_loss = _safe_float(payload.get("loss_probe_clean"))
+    if payload_loss is None:
+        return None
+    payload_key = str(payload.get("metric_name", "")).strip()
+    return float(payload_loss), (payload_key or "checkpoint_clean_edm_probe")
+
+
 def _extract_loss_mean_any(payload: Dict, *keys: str) -> Tuple[float, str]:
     for key in keys:
         value = payload.get(key, {})
@@ -105,13 +134,11 @@ def build_rows(manifest_rows: List[Dict[str, str]]) -> List[Dict[str, object]]:
         if row.get("robust_method") not in STYLE:
             continue
         robust_method = str(row["robust_method"])
-        direct_loss = _safe_float(row.get("loss_comparable_final"))
-        direct_key = str(row.get("loss_comparable_key", "")).strip()
         run_dir = Path(str(row["run_dir"])).resolve()
-        if direct_loss is not None:
+        probe = _load_posthoc_probe_from_row(row)
+        if probe is not None:
             matched_kimg = float(row["step"])
-            loss_value = float(direct_loss)
-            loss_metric_key = direct_key or "loss_comparable_final"
+            loss_value, loss_metric_key = probe
         else:
             stats_path = run_dir / "stats.jsonl"
             cache_key = (stats_path, robust_method)
@@ -182,8 +209,14 @@ def plot_zoom(rows: List[Dict[str, object]], *, out_png: Path, dataset_label: st
                 metric_keys = {str(row.get("loss_metric_key", "")) for row in method_rows}
                 if metric_keys == {"checkpoint_clean_edm_probe"}:
                     label = "CDRO EDM"
+                elif metric_keys == {"loss_comparable_final"}:
+                    label = "CDRO EDM"
                 elif metric_keys == {"CDRO/edm_clean_probe"}:
                     label = "CDRO EDM (inline clean probe)"
+                elif metric_keys.issubset({"checkpoint_clean_edm_probe", "loss_comparable_final"}):
+                    label = "CDRO EDM"
+                elif metric_keys.issubset({"checkpoint_clean_edm_probe", "loss_comparable_final", "CDRO/edm_clean_probe"}):
+                    label = "CDRO EDM (mixed posthoc/inline)"
                 elif metric_keys.issubset({"Loss", "Loss/loss"}):
                     label = "CDRO EDM (outer)"
                 elif len(metric_keys) > 1:
