@@ -10,6 +10,7 @@ from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser
 from ...models import set_requires_grad
 from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import build_rectified_flow_state, compute_training_loss
+from ...shared.rf_stage import resolve_rf_stage_steps
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import resolve_rf_stage_t_distribution, sample_target_indices, sample_target_indices_log_normal
 from ...shared.trainer_common import generate_reflow_pairs
@@ -35,13 +36,11 @@ def _is_rf_objective(cfg) -> bool:
     return str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
 
 
-def _resolve_rf_stage_steps(total_steps: int, stage1_fraction: float) -> tuple[int, int]:
-    total_steps = max(int(total_steps), 0)
-    if total_steps <= 1:
-        return total_steps, 0
-    stage1_steps = int(round(float(total_steps) * float(stage1_fraction)))
-    stage1_steps = max(1, min(stage1_steps, total_steps - 1))
-    return stage1_steps, total_steps - stage1_steps
+def _resolve_rf_stage_planning_total_steps(cfg) -> int:
+    override = int(getattr(cfg, "rf_continuation_total_steps_override", 0) or 0)
+    if override > 0:
+        return int(override)
+    return int(cfg.steps)
 
 
 def _sample_rf_t(
@@ -232,9 +231,11 @@ def _train_trajectory_robust_wdro_rf(
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
     ema_model = init_ema_model(denoiser, cfg, ema_state_dict=ema_state_dict)
 
-    stage1_steps, reflow_steps = _resolve_rf_stage_steps(
-        int(cfg.steps),
+    rf_stage_planning_total_steps = _resolve_rf_stage_planning_total_steps(cfg)
+    stage1_steps, reflow_steps = resolve_rf_stage_steps(
+        int(rf_stage_planning_total_steps),
         float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+        reflow_start_step=int(getattr(cfg, "rf_reflow_start_step", 0) or 0),
     )
     rf_stage1_t_distribution = resolve_rf_stage_t_distribution(
         "rf_stage1",
@@ -246,6 +247,7 @@ def _train_trajectory_robust_wdro_rf(
     )
     history["rf_stage1_steps"] = int(stage1_steps)
     history["rf_reflow_steps"] = int(reflow_steps)
+    history["rf_stage_planning_total_steps"] = int(rf_stage_planning_total_steps)
     history["rf_stage1_t_distribution_resolved"] = str(rf_stage1_t_distribution)
     history["rf_reflow_t_distribution_resolved"] = str(rf_reflow_t_distribution)
     history["rf_eval_t_distribution_resolved"] = str(

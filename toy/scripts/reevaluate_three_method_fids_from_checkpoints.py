@@ -34,6 +34,8 @@ from toy.shared.sigma import (  # noqa: E402
     build_rf_time_quantile_levels,
     build_sigma_levels,
     build_sigma_levels_from_warmup_quantiles,
+    resolve_rf_eval_n_steps_path,
+    resolve_rf_teacher_n_steps_path,
     sample_log_sigma_stratified_quantile_ladder,
     sample_sigmas_log_normal,
     sample_target_indices,
@@ -99,7 +101,7 @@ def _build_eval_sigma_levels(cfg: ToyConfig, *, device: torch.device, method_nam
     if str(cfg.training_objective).strip().lower() == "rf":
         return build_rf_time_quantile_levels(
             float(cfg.sigma_max),
-            int(cfg.n_steps_path),
+            int(resolve_rf_eval_n_steps_path(cfg)),
             device=device,
             distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
@@ -170,6 +172,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--edm-clean-probe-batches", type=int, default=DEFAULT_EDM_CLEAN_PROBE_BATCHES)
     parser.add_argument("--edm-clean-probe-batch-size", type=int, default=256)
     parser.add_argument("--n-steps-path-default", type=int, default=32)
+    parser.add_argument("--rf-teacher-n-steps-path-default", type=int, default=ToyConfig.rf_teacher_n_steps_path)
+    parser.add_argument("--rf-eval-n-steps-path-default", type=int, default=ToyConfig.rf_eval_n_steps_path)
     parser.add_argument("--cdro-eval-stochastic-ladders", action="store_true")
     parser.add_argument("--respect-row-n-steps-path", action="store_true")
     parser.add_argument("--sigma-min", type=float, default=0.002)
@@ -294,8 +298,26 @@ def _objective_clean_probe_key_from_objective(training_objective: object) -> str
     return "rf_clean_probe" if objective == "rf" else "edm_clean_probe"
 
 
+def _is_shared_edm_warmup_row_for_rf(row: Dict[str, str]) -> bool:
+    training_objective = str(row.get("training_objective", "")).strip().lower()
+    row_origin = str(row.get("row_origin", "")).strip().lower()
+    if training_objective != "rf" or row_origin != "trajectory_warmup_phase":
+        return False
+    explicit_source_objective = str(row.get("shared_warmup_checkpoint_source_training_objective", "")).strip().lower()
+    explicit_eval_objective = str(row.get("shared_warmup_checkpoint_eval_training_objective", "")).strip().lower()
+    if explicit_source_objective == "edm" or explicit_eval_objective == "edm":
+        return True
+    return _safe_bool(row.get("warmup_only"), default=False)
+
+
+def _effective_eval_training_objective_from_row(row: Dict[str, str]) -> str:
+    if _is_shared_edm_warmup_row_for_rf(row):
+        return "edm"
+    return str(row.get("training_objective", "edm"))
+
+
 def _objective_clean_probe_key(row: Dict[str, str]) -> str:
-    return _objective_clean_probe_key_from_objective(row.get("training_objective", "edm"))
+    return _objective_clean_probe_key_from_objective(_effective_eval_training_objective_from_row(row))
 
 
 def _exp_name_from_row(prefix: str, row: Dict[str, str], occurrence_index: int) -> str:
@@ -539,6 +561,8 @@ def _base_cfg_from_args(args: argparse.Namespace) -> ToyConfig:
     cfg.eval_samples = int(args.eval_samples)
     cfg.fid_samples = int(args.fid_samples)
     cfg.n_steps_path = int(args.n_steps_path_default)
+    cfg.rf_teacher_n_steps_path = int(args.rf_teacher_n_steps_path_default)
+    cfg.rf_eval_n_steps_path = int(args.rf_eval_n_steps_path_default)
     cfg.cdro_eval_stochastic_ladders = bool(args.cdro_eval_stochastic_ladders)
     cfg.sigma_min = float(args.sigma_min)
     cfg.sigma_max = float(args.sigma_max)
@@ -578,10 +602,12 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "p_std",
         "rf_baseline_mode",
         "rf_cdro_pair_source",
+        "rf_eval_n_steps_path",
         "rf_loss",
         "rf_pseudo_huber_delta",
         "rf_reflow_t_distribution",
         "rf_stage1_fraction",
+        "rf_teacher_n_steps_path",
         "sigma_data",
         "sigma_max",
         "sigma_min",
@@ -606,10 +632,15 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
             _apply_cfg_overrides(cfg, source_cfg)
     if not bool(args.respect_row_n_steps_path):
         cfg.n_steps_path = int(args.n_steps_path_default)
-    if row.get("training_objective"):
-        cfg.training_objective = str(row.get("training_objective"))
+    effective_training_objective = _effective_eval_training_objective_from_row(row)
+    if effective_training_objective:
+        cfg.training_objective = str(effective_training_objective)
     if bool(args.respect_row_n_steps_path) and row.get("n_steps_path"):
         cfg.n_steps_path = _safe_int(row.get("n_steps_path"), cfg.n_steps_path)
+    if row.get("rf_teacher_n_steps_path"):
+        cfg.rf_teacher_n_steps_path = _safe_int(row.get("rf_teacher_n_steps_path"), cfg.rf_teacher_n_steps_path)
+    if row.get("rf_eval_n_steps_path"):
+        cfg.rf_eval_n_steps_path = _safe_int(row.get("rf_eval_n_steps_path"), cfg.rf_eval_n_steps_path)
     if row.get("sigma_min"):
         sigma_min = _safe_float(row.get("sigma_min"))
         if sigma_min is not None:
@@ -646,6 +677,8 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str)
         bool(cfg.limited_data_enabled),
         int(cfg.hidden_dim),
         int(cfg.n_steps_path),
+        int(resolve_rf_teacher_n_steps_path(cfg)),
+        int(resolve_rf_eval_n_steps_path(cfg)),
         float(cfg.sigma_min),
         float(cfg.sigma_max),
         float(getattr(cfg, "p_mean", -1.2)),
@@ -828,20 +861,31 @@ def _cached_reeval_matches_request(
 
     expected_stochastic_cdro_eval = _is_stochastic_cdro_eval(cfg, str(row.get("method", "")))
     expected_probe_enabled = not bool(args.disable_edm_clean_probe)
+    expected_rf_probe_enabled = expected_probe_enabled and not _is_shared_edm_warmup_row_for_rf(row)
     expected_n_steps_path = int(cfg.n_steps_path)
+    expected_rf_eval_n_steps_path = (
+        int(resolve_rf_eval_n_steps_path(cfg))
+        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+        else int(cfg.n_steps_path)
+    )
     expected_fid_samples = int(args.fid_samples)
     expected_fid_batch_size = max(int(args.fid_batch_size), 1)
     expected_probe_split = str(args.edm_clean_probe_split)
     expected_probe_batches = int(max(args.edm_clean_probe_batches, 0))
     expected_probe_batch_size = int(max(args.edm_clean_probe_batch_size, 0))
 
+    actual_rf_eval_n_steps_path = _safe_int(config.get("rf_eval_n_steps_path"), _safe_int(config.get("n_steps_path"), -1))
+    if actual_rf_eval_n_steps_path <= 0:
+        actual_rf_eval_n_steps_path = _safe_int(config.get("n_steps_path"), -1)
+
     return (
         _safe_int(config.get("n_steps_path"), -1) == expected_n_steps_path
+        and actual_rf_eval_n_steps_path == expected_rf_eval_n_steps_path
         and _safe_bool(config.get("edm_clean_probe_enabled"), default=False) == expected_probe_enabled
         and str(config.get("edm_clean_probe_split", "")) == expected_probe_split
         and _safe_int(config.get("edm_clean_probe_batches"), -1) == expected_probe_batches
         and _safe_int(config.get("edm_clean_probe_batch_size"), -1) == expected_probe_batch_size
-        and _safe_bool(config.get("rf_clean_probe_enabled"), default=False) == expected_probe_enabled
+        and _safe_bool(config.get("rf_clean_probe_enabled"), default=False) == expected_rf_probe_enabled
         and str(config.get("rf_clean_probe_split", "")) == expected_probe_split
         and _safe_int(config.get("rf_clean_probe_batches"), -1) == expected_probe_batches
         and _safe_int(config.get("rf_clean_probe_batch_size"), -1) == expected_probe_batch_size
@@ -1201,6 +1245,8 @@ def _write_metrics_payload(
             "hidden_dim": int(ctx.cfg.hidden_dim),
             "image_backbone": str(getattr(ctx.cfg, "image_backbone", ToyConfig.image_backbone)),
             "n_steps_path": int(ctx.cfg.n_steps_path),
+            "rf_teacher_n_steps_path": int(resolve_rf_teacher_n_steps_path(ctx.cfg)),
+            "rf_eval_n_steps_path": int(resolve_rf_eval_n_steps_path(ctx.cfg)),
             "sigma_min": float(ctx.cfg.sigma_min),
             "sigma_max": float(ctx.cfg.sigma_max),
             "sigma_data": float(ctx.cfg.sigma_data),
@@ -1369,7 +1415,28 @@ def _evaluate_checkpoint_metrics(
             )
             log_handle.flush()
 
-        if bool(args.disable_edm_clean_probe):
+        if _is_shared_edm_warmup_row_for_rf(row):
+            rf_clean_probe = {
+                "enabled": False,
+                "supported": False,
+                "split": str(args.edm_clean_probe_split),
+                "num_batches": int(max(args.edm_clean_probe_batches, 0)),
+                "batch_size": int(max(args.edm_clean_probe_batch_size, 0)),
+                "num_images": 0,
+                "seed": int(probe_seed),
+                "missing_reason": "shared_edm_warmup_checkpoint",
+                "mean": None,
+                "std": None,
+                "min": None,
+                "max": None,
+                "final": None,
+                "mean_last": None,
+                "num_values": 0,
+                "stage_name": "",
+                "t_distribution": "",
+                "pair_source": "",
+            }
+        elif bool(args.disable_edm_clean_probe):
             rf_clean_probe = {
                 "enabled": False,
                 "supported": False,

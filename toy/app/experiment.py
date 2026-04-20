@@ -38,6 +38,8 @@ from ..shared.sigma import (
     build_sigma_levels,
     build_sigma_levels_from_warmup_quantiles,
     resolve_rf_stage_t_distribution,
+    resolve_rf_eval_n_steps_path,
+    resolve_rf_teacher_n_steps_path,
     sample_log_sigma_stratified_quantile_ladder,
     sample_target_indices,
 )
@@ -136,12 +138,27 @@ def _build_family_sigma_levels(cfg, device: torch.device) -> torch.Tensor:
     if objective == "rf":
         return build_rf_stage_time_quantile_levels(
             float(getattr(cfg, "sigma_max", 1.0)),
-            int(getattr(cfg, "n_steps_path", 1)),
+            int(resolve_rf_teacher_n_steps_path(cfg)),
             device=device,
             stage_name="rf_reflow",
             reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
     return build_sigma_levels(cfg.sigma_min, cfg.sigma_max, cfg.n_steps_path, device=device)
+
+
+def _build_rf_eval_sigma_levels(
+    cfg,
+    *,
+    device: torch.device,
+    stage_name: str,
+) -> torch.Tensor:
+    return build_rf_stage_time_quantile_levels(
+        float(getattr(cfg, "sigma_max", 1.0)),
+        int(resolve_rf_eval_n_steps_path(cfg)),
+        device=device,
+        stage_name=str(stage_name),
+        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+    )
 
 
 def _use_stochastic_cdro_eval_ladders(cfg, method_name: str) -> bool:
@@ -1298,6 +1315,10 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
                 "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
                 "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
                 "rf_edm_init_ckpt_path": str(getattr(cfg, "rf_edm_init_ckpt_path", "")),
+                "rf_teacher_n_steps_path": int(getattr(cfg, "rf_teacher_n_steps_path", 0) or 0),
+                "rf_eval_n_steps_path": int(getattr(cfg, "rf_eval_n_steps_path", 0) or 0),
+                "rf_teacher_n_steps_path_resolved": int(resolve_rf_teacher_n_steps_path(cfg)),
+                "rf_eval_n_steps_path_resolved": int(resolve_rf_eval_n_steps_path(cfg)),
                 "rf_ema_forced_for_strong_baseline": bool(
                     str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower() == "strong"
                 ),
@@ -1766,6 +1787,7 @@ def _save_robust_resume_checkpoint(
     rng_state: Dict[str, Any],
     runtime_sec: Dict[str, Any],
     run_wall_start: str,
+    shared_edm_branch_ckpt_path: Optional[str] = None,
 ) -> None:
     """Persist robust training state so later runs can continue from this point."""
 
@@ -1786,6 +1808,8 @@ def _save_robust_resume_checkpoint(
         "control_state_dict": control.state_dict(),
         "trainer_state": trainer_state,
         "rng_state": rng_state,
+        "rf_continuation_total_steps_override": int(getattr(cfg, "rf_continuation_total_steps_override", 0) or 0),
+        "shared_edm_branch_ckpt_path": _normalize_checkpoint_identity_path(shared_edm_branch_ckpt_path),
         "cumulative_runtime": {
             "baseline_phase": float(runtime_sec.get("baseline_phase", 0.0)),
             "baseline_train": float(runtime_sec.get("baseline_train", 0.0)),
@@ -2235,10 +2259,12 @@ def run_experiment(cfg) -> dict:
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
+    objective_is_rf = str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
     baseline_sigma_levels = _build_family_sigma_levels(cfg, device)
     sigma_levels = baseline_sigma_levels
+    eval_sigma_levels = baseline_sigma_levels
     if method_name == "cdro":
-        if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
+        if objective_is_rf:
             sigma_levels = build_rf_stage_time_quantile_levels(
                 float(cfg.sigma_max),
                 int(cfg.n_steps_path),
@@ -2255,6 +2281,15 @@ def run_experiment(cfg) -> dict:
                 p_mean=cfg.p_mean,
                 p_std=cfg.p_std,
             )
+    if objective_is_rf:
+        eval_stage_name = str(rf_cdro_eval_stage or "rf_reflow") if method_name == "cdro" else "rf_reflow"
+        eval_sigma_levels = _build_rf_eval_sigma_levels(
+            cfg,
+            device=device,
+            stage_name=eval_stage_name,
+        )
+    else:
+        eval_sigma_levels = sigma_levels
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -2360,6 +2395,35 @@ def run_experiment(cfg) -> dict:
             ckpt_path=robust_resume_path,
             method_name=str(getattr(method, "NAME", cfg.method_version)).lower(),
         )
+        resume_shared_branch_ckpt_path = _normalize_checkpoint_identity_path(
+            robust_resume_payload.get("shared_edm_branch_ckpt_path", "")
+        )
+        current_rf_init_ckpt_path = _normalize_checkpoint_identity_path(getattr(cfg, "rf_edm_init_ckpt_path", ""))
+        if (
+            str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+            and resume_shared_branch_ckpt_path
+        ):
+            if current_rf_init_ckpt_path and resume_shared_branch_ckpt_path != current_rf_init_ckpt_path:
+                raise RuntimeError(
+                    "RF shared-branch identity mismatch at runtime: "
+                    f"--robust-resume-ckpt-path={robust_resume_path} was saved from "
+                    f"{resume_shared_branch_ckpt_path}, but the current "
+                    f"--rf-edm-init-ckpt-path={current_rf_init_ckpt_path}."
+                )
+            shared_edm_branch_ckpt["path"] = resume_shared_branch_ckpt_path
+            shared_edm_branch_ckpt["source"] = "robust_resume_shared_edm_branch_ckpt_path"
+            shared_edm_branch_ckpt["identity_enforced"] = True
+        resume_rf_total_steps_override = int(robust_resume_payload.get("rf_continuation_total_steps_override", 0) or 0)
+        if (
+            str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+            and int(getattr(cfg, "rf_continuation_total_steps_override", 0) or 0) <= 0
+            and resume_rf_total_steps_override > 0
+        ):
+            cfg.rf_continuation_total_steps_override = int(resume_rf_total_steps_override)
+            cfg_robust = replace(
+                cfg_robust,
+                rf_continuation_total_steps_override=int(resume_rf_total_steps_override),
+            )
         baseline_state_dict = robust_resume_payload.get("baseline_state_dict")
         if isinstance(baseline_state_dict, dict):
             baseline.load_state_dict(baseline_state_dict, strict=True)
@@ -2684,7 +2748,7 @@ def run_experiment(cfg) -> dict:
             cfg=cfg,
             dataset=dataset,
             batch_size=int(cfg.eval_samples),
-            sigma_levels=sigma_levels,
+            sigma_levels=eval_sigma_levels,
         )
     shared_gen_reverse_noise = None
     if cfg.eval_use_shared_reverse_noise:
@@ -2694,10 +2758,10 @@ def run_experiment(cfg) -> dict:
                 cfg=cfg,
                 dataset=dataset,
                 batch_size=int(cfg.eval_samples),
-                sigma_levels=sigma_levels,
+                sigma_levels=eval_sigma_levels,
             )
         shared_gen_reverse_noise = torch.randn(
-            (sigma_levels.numel(), noise_ref.shape[0], *noise_ref.shape[1:]),
+            (eval_sigma_levels.numel(), noise_ref.shape[0], *noise_ref.shape[1:]),
             device=noise_ref.device,
             dtype=noise_ref.dtype,
         )
@@ -2712,13 +2776,13 @@ def run_experiment(cfg) -> dict:
             cur = min(eval_chunk_size, remaining)
             eval_chunk_sizes.append(int(cur))
             remaining -= cur
-        eval_sigma_levels_batches = [_sample_cdro_eval_sigma_levels(cfg, sigma_levels) for _ in eval_chunk_sizes]
+        eval_sigma_levels_batches = [_sample_cdro_eval_sigma_levels(cfg, eval_sigma_levels) for _ in eval_chunk_sizes]
     eval_objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
     baseline_gen_np = tensor_to_numpy(
         _sample_eval_generated_x0(
             denoiser=baseline_eval,
             cfg=cfg,
-            sigma_levels=sigma_levels,
+            sigma_levels=eval_sigma_levels,
             device=device,
             amp_dtype=amp_dtype,
             dataset=dataset,
@@ -2733,7 +2797,7 @@ def run_experiment(cfg) -> dict:
         _sample_eval_generated_x0(
             denoiser=robust,
             cfg=cfg,
-            sigma_levels=sigma_levels,
+            sigma_levels=eval_sigma_levels,
             device=device,
             amp_dtype=amp_dtype,
             dataset=dataset,
@@ -3126,6 +3190,17 @@ def run_experiment(cfg) -> dict:
             ),
             "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
             "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
+            "rf_continuation_total_steps_override": int(
+                getattr(cfg, "rf_continuation_total_steps_override", 0) or 0
+            ),
+            "rf_teacher_n_steps_path": int(getattr(cfg, "rf_teacher_n_steps_path", 0) or 0),
+            "rf_eval_n_steps_path": int(getattr(cfg, "rf_eval_n_steps_path", 0) or 0),
+            "rf_teacher_n_steps_path_resolved": (
+                int(resolve_rf_teacher_n_steps_path(cfg)) if objective_is_rf else 0
+            ),
+            "rf_eval_n_steps_path_resolved": (
+                int(resolve_rf_eval_n_steps_path(cfg)) if objective_is_rf else 0
+            ),
             "shared_edm_branch_ckpt_path": shared_edm_branch_ckpt.get("path"),
             "shared_edm_branch_ckpt_source": str(shared_edm_branch_ckpt.get("source", "unavailable")),
             "shared_edm_branch_identity_enforced": bool(
@@ -3941,6 +4016,7 @@ def run_experiment(cfg) -> dict:
             rng_state=resume_rng_state,
             runtime_sec=runtime_sec,
             run_wall_start=run_wall_start,
+            shared_edm_branch_ckpt_path=shared_edm_branch_ckpt.get("path"),
         )
 
     log_metrics(

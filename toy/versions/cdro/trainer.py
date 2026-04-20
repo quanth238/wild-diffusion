@@ -8,11 +8,13 @@ from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser
 from ...models import set_requires_grad
 from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
+from ...shared.rf_stage import resolve_rf_cdro_stage_steps
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.trainer_common import generate_reflow_pairs
 from ...shared.sigma import (
     build_rf_stage_time_quantile_levels,
     resolve_rf_stage_t_distribution,
+    resolve_rf_teacher_n_steps_path,
     sample_log_sigma_stratified_quantile_ladder,
     sample_log_sigma_stratified_quantile_ladder_batch,
     sample_rf_stage_time_stratified_levels_batch,
@@ -127,18 +129,11 @@ def _resolve_rf_cdro_pair_source(cfg) -> str:
     return mode
 
 
-def _resolve_rf_cdro_stage_steps(total_steps: int, stage1_fraction: float, pair_source: str) -> tuple[int, int]:
-    total_steps = max(int(total_steps), 0)
-    mode = str(pair_source).strip().lower()
-    if mode == "data_noise":
-        return total_steps, 0
-    if mode == "reflow":
-        return 0, total_steps
-    if total_steps <= 1:
-        return total_steps, 0
-    stage1_steps = int(round(float(total_steps) * float(stage1_fraction)))
-    stage1_steps = max(1, min(stage1_steps, total_steps - 1))
-    return stage1_steps, total_steps - stage1_steps
+def _resolve_rf_stage_planning_total_steps(cfg) -> int:
+    override = int(getattr(cfg, "rf_continuation_total_steps_override", 0) or 0)
+    if override > 0:
+        return int(override)
+    return int(cfg.steps)
 
 
 def _build_rf_cdro_stage_grid_info(
@@ -157,7 +152,7 @@ def _build_rf_cdro_stage_grid_info(
     )
     sigma_levels = build_rf_stage_time_quantile_levels(
         float(getattr(cfg, "sigma_max", 1.0)),
-        int(getattr(cfg, "n_steps_path", 1)),
+        int(resolve_rf_teacher_n_steps_path(cfg)),
         device=device,
         stage_name=stage_name,
         reflow_distribution=distribution,
@@ -200,7 +195,7 @@ def _sample_rf_cdro_stage_grid_info(
     if bool(getattr(cfg, "cdro_per_example_sigma_ladders", True)):
         sigma_levels = sample_rf_stage_time_stratified_levels_batch(
             float(getattr(cfg, "sigma_max", 1.0)),
-            int(getattr(cfg, "n_steps_path", 1)),
+            int(resolve_rf_teacher_n_steps_path(cfg)),
             device=device,
             batch_size=int(batch_size),
             stage_name=stage_name,
@@ -210,7 +205,7 @@ def _sample_rf_cdro_stage_grid_info(
     else:
         sigma_levels = sample_rf_stage_time_stratified_levels(
             float(getattr(cfg, "sigma_max", 1.0)),
-            int(getattr(cfg, "n_steps_path", 1)),
+            int(resolve_rf_teacher_n_steps_path(cfg)),
             device=device,
             stage_name=stage_name,
             reflow_distribution=distribution,
@@ -558,6 +553,7 @@ def train_trajectory_robust_cdro(
     rf_stage1_steps = 0
     rf_reflow_steps = 0
     rf_stage_grids = {}
+    rf_teacher_sigma_levels = None
     transition_deltas = build_transition_deltas_for_objective(
         cfg=cfg,
         sigma_levels=sigma_levels,
@@ -570,10 +566,12 @@ def train_trajectory_robust_cdro(
         time_horizon=time_horizon,
     ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
     if _is_rf_objective(cfg):
-        rf_stage1_steps, rf_reflow_steps = _resolve_rf_cdro_stage_steps(
-            int(cfg.steps),
+        rf_stage_planning_total_steps = _resolve_rf_stage_planning_total_steps(cfg)
+        rf_stage1_steps, rf_reflow_steps = resolve_rf_cdro_stage_steps(
+            int(rf_stage_planning_total_steps),
             float(getattr(cfg, "rf_stage1_fraction", 0.5)),
             rf_pair_source,
+            reflow_start_step=int(getattr(cfg, "rf_reflow_start_step", 0) or 0),
         )
         rf_stage_grids = {
             "rf_stage1": _build_rf_cdro_stage_grid_info(
@@ -591,6 +589,13 @@ def train_trajectory_robust_cdro(
                 stage_name="rf_reflow",
             ),
         }
+        rf_teacher_sigma_levels = build_rf_stage_time_quantile_levels(
+            float(getattr(cfg, "sigma_max", 1.0)),
+            int(resolve_rf_teacher_n_steps_path(cfg)),
+            device=sigma_levels.device,
+            stage_name="rf_reflow",
+            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
         rf_eval_stage = "rf_reflow" if int(rf_reflow_steps) > 0 else "rf_stage1"
         transition_deltas = rf_stage_grids[rf_eval_stage]["transition_deltas"]
         radius_by_step = rf_stage_grids[rf_eval_stage]["radius_by_step"]
@@ -598,6 +603,7 @@ def train_trajectory_robust_cdro(
         history["transition_deltas_reference"] = _snapshot_tensor_values(transition_deltas)
         history["rf_stage1_steps"] = int(rf_stage1_steps)
         history["rf_reflow_steps"] = int(rf_reflow_steps)
+        history["rf_stage_planning_total_steps"] = int(rf_stage_planning_total_steps)
         history.setdefault("rf_stage", [])
         history.setdefault("rf_t_distribution", [])
         history["rf_stage1_t_distribution_resolved"] = str(rf_stage_grids["rf_stage1"]["distribution"])
@@ -666,11 +672,11 @@ def train_trajectory_robust_cdro(
                     history.setdefault("rf_reflow_teacher_refresh_step", int(step - 1))
                 rf_pair_left, x0 = generate_reflow_pairs(
                     rf_pair_teacher,
-                    rf_stage_grids["rf_reflow"]["sigma_levels"],
+                    rf_teacher_sigma_levels,
                     x_data,
                     sample_terminal_batch_fn=None,
                 )
-                reflow_pair_fwd_units = float(max(int(rf_stage_grids["rf_reflow"]["sigma_levels"].numel()) - 1, 0))
+                reflow_pair_fwd_units = float(max(int(rf_teacher_sigma_levels.numel()) - 1, 0))
                 current_rf_stage = "rf_reflow"
             stage_grid = _sample_rf_cdro_stage_grid_info(
                 cfg,

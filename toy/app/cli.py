@@ -9,6 +9,7 @@ from ..mainline_baseline import (
     resolve_baseline_train_batch_gpu,
     validate_mainline_baseline_request,
 )
+from ..shared.sigma import resolve_rf_teacher_n_steps_path
 from ..versions.registry import SUPPORTED_METHOD_VERSIONS
 
 
@@ -81,6 +82,26 @@ def _validate_config(cfg: ToyConfig) -> None:
         )
     if cfg.baseline_steps_override < 0:
         raise ValueError(f"--baseline-steps-override must be >= 0, got {cfg.baseline_steps_override}")
+    if int(getattr(cfg, "rf_continuation_total_steps_override", 0)) < 0:
+        raise ValueError(
+            "--rf-continuation-total-steps-override must be >= 0, got "
+            f"{cfg.rf_continuation_total_steps_override}"
+        )
+    if int(getattr(cfg, "rf_reflow_start_step", 0)) < 0:
+        raise ValueError(
+            "--rf-reflow-start-step must be >= 0, got "
+            f"{cfg.rf_reflow_start_step}"
+        )
+    if int(getattr(cfg, "rf_teacher_n_steps_path", 0)) < 0:
+        raise ValueError(
+            "--rf-teacher-n-steps-path must be >= 0, got "
+            f"{cfg.rf_teacher_n_steps_path}"
+        )
+    if int(getattr(cfg, "rf_eval_n_steps_path", 0)) < 0:
+        raise ValueError(
+            "--rf-eval-n-steps-path must be >= 0, got "
+            f"{cfg.rf_eval_n_steps_path}"
+        )
     if cfg.inner_steps < 0:
         raise ValueError(f"--inner-steps must be >= 0, got {cfg.inner_steps}")
     if cfg.attack_num_steps is not None and int(cfg.attack_num_steps) not in (1, 2):
@@ -405,6 +426,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["strong", "plain"],
     )
     parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
+    parser.add_argument("--rf-reflow-start-step", type=int, default=ToyConfig.rf_reflow_start_step)
     parser.add_argument(
         "--rf-reflow-t-distribution",
         type=str,
@@ -415,11 +437,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=ToyConfig.rf_pseudo_huber_delta)
     parser.add_argument("--rf-edm-init-ckpt-path", type=str, default=ToyConfig.rf_edm_init_ckpt_path)
     parser.add_argument(
+        "--rf-continuation-total-steps-override",
+        type=int,
+        default=ToyConfig.rf_continuation_total_steps_override,
+    )
+    parser.add_argument(
         "--rf-cdro-pair-source",
         type=str,
         default=ToyConfig.rf_cdro_pair_source,
         choices=["auto", "reflow", "data_noise"],
     )
+    parser.add_argument("--rf-teacher-n-steps-path", type=int, default=ToyConfig.rf_teacher_n_steps_path)
+    parser.add_argument("--rf-eval-n-steps-path", type=int, default=ToyConfig.rf_eval_n_steps_path)
 
     parser.add_argument("--n-modes", type=int, default=ToyConfig.n_modes)
     parser.add_argument("--mode-radius", type=float, default=ToyConfig.mode_radius)
@@ -612,6 +641,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.wild_fixed_noise_inner = False
     if collapse_v_l2_tol_legacy is not None:
         cfg.collapse_delta_ratio_tol = float(collapse_v_l2_tol_legacy)
+    if str(cfg.training_objective).strip().lower() == "rf":
+        cfg.n_steps_path = int(resolve_rf_teacher_n_steps_path(cfg))
     if cfg.use_log_normal_sigma_sampling and cfg.auto_log_normal_params:
         log_min = math.log(cfg.sigma_min)
         log_max = math.log(cfg.sigma_max)

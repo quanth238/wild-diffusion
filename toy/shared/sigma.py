@@ -179,6 +179,24 @@ def resolve_rf_stage_t_distribution(
     )
 
 
+def resolve_rf_teacher_n_steps_path(cfg) -> int:
+    """Resolve the shared RF teacher/reflow grid step count."""
+
+    override = int(getattr(cfg, "rf_teacher_n_steps_path", 0) or 0)
+    if override > 0:
+        return override
+    return max(int(getattr(cfg, "n_steps_path", 1)), 1)
+
+
+def resolve_rf_eval_n_steps_path(cfg) -> int:
+    """Resolve the shared RF evaluation/FID grid step count."""
+
+    override = int(getattr(cfg, "rf_eval_n_steps_path", 0) or 0)
+    if override > 0:
+        return override
+    return resolve_rf_teacher_n_steps_path(cfg)
+
+
 def build_rf_stage_time_quantile_levels(
     sigma_max: float,
     n_steps: int,

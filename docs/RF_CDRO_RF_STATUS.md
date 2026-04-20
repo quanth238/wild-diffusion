@@ -24,6 +24,8 @@ Implementation notes:
 - Reflow-stage timestep law is controlled by `rf_reflow_t_distribution` and currently defaults to `u_shaped`.
 - EMA is kept in both stages.
 - The shared EDM warm start is required through `rf_edm_init_ckpt_path`.
+- The shared RF family reflow/teacher grid now defaults to `rf_teacher_n_steps_path=40`.
+- The shared RF family eval/FID grid now defaults to `rf_eval_n_steps_path=9`.
 
 ## CDRO-RF
 
@@ -89,6 +91,12 @@ stage-matched RF time law:
 
 Deterministic right-endpoint RF grids remain only as solver/reference grids for
 sampling, evaluation, and frozen-teacher reflow pair generation.
+
+Default RF-family step split:
+
+- shared RF teacher / reflow grid: `40`
+- shared RF eval / FID grid: `9`
+- CDRO-RF internal controlled rollout grid: `32`
 
 ## What Is Still Deferred
 
