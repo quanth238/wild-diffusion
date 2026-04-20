@@ -44,7 +44,6 @@ from ..shared.sigma import (
     sample_target_indices,
 )
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
-from ..shared.rf_stage import resolve_rf_cdro_stage_steps, resolve_rf_stage_steps
 from ..model_backends.provider import build_model_bundle
 from .utils import (
     compute_terminal_match_stats,
@@ -391,23 +390,8 @@ def _resolve_cdro_attack_num_steps(cfg) -> tuple[int, str]:
 def _resolve_rf_eval_stage(cfg, total_steps: int, *, method_name: str) -> str:
     """Resolve which RF stage law should drive final family evaluation grids."""
 
-    reflow_start_step = int(getattr(cfg, "rf_reflow_start_step", 0) or 0)
-    if str(method_name).strip().lower() == "cdro":
-        pair_source = _resolve_rf_cdro_pair_source(cfg)
-        stage1_steps, reflow_steps = resolve_rf_cdro_stage_steps(
-            int(total_steps),
-            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
-            pair_source,
-            reflow_start_step=reflow_start_step,
-        )
-    else:
-        stage1_steps, reflow_steps = resolve_rf_stage_steps(
-            int(total_steps),
-            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
-            reflow_start_step=reflow_start_step,
-        )
-    del stage1_steps
-    return "rf_reflow" if int(reflow_steps) > 0 else "rf_stage1"
+    del cfg, total_steps, method_name
+    return "rf_reflow"
 
 
 def _checkpoint_state_dict_for_rf_init(payload: Any) -> tuple[Dict[str, torch.Tensor], str]:
@@ -492,7 +476,11 @@ def _warm_start_rf_model_from_state_dict(model, source_state_dict: Dict[str, tor
     }
 
 
-def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dict[str, Any]) -> Dict[str, Any]:
+def _maybe_initialize_rf_from_edm_checkpoint(
+    cfg,
+    model_bundle,
+    calibration: Dict[str, Any],
+) -> tuple[Dict[str, Any], Optional[Dict[str, torch.Tensor]]]:
     """Initialize RF models from an EDM checkpoint when requested."""
 
     objective = str(getattr(cfg, "training_objective", "edm")).strip().lower()
@@ -518,7 +506,7 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dic
         },
     }
     if objective != "rf":
-        return report
+        return report, None
     if not ckpt_path:
         raise RuntimeError(
             "RF runs require a shared EDM warm-start checkpoint. "
@@ -542,7 +530,62 @@ def _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, calibration: Dic
         raise RuntimeError(
             f"RF EDM init checkpoint did not transfer any compatible baseline weights: {abs_path}"
         )
-    return report
+    return report, source_state
+
+
+def _load_teacher_model_state_dict(
+    model,
+    source_state_dict: Dict[str, torch.Tensor],
+) -> None:
+    source = _normalize_source_state_dict(source_state_dict)
+    target = model.state_dict()
+    updated: Dict[str, torch.Tensor] = {}
+    missing = []
+    mismatched = []
+    for target_key, target_tensor in target.items():
+        source_tensor = source.get(target_key)
+        if source_tensor is None:
+            missing.append(target_key)
+            continue
+        if tuple(source_tensor.shape) != tuple(target_tensor.shape):
+            mismatched.append(
+                {
+                    "target_key": target_key,
+                    "target_shape": list(target_tensor.shape),
+                    "source_shape": list(source_tensor.shape),
+                }
+            )
+            continue
+        updated[target_key] = source_tensor.to(device=target_tensor.device, dtype=target_tensor.dtype)
+    if missing or mismatched:
+        preview = []
+        if missing:
+            preview.append(f"missing={missing[:8]}")
+        if mismatched:
+            preview.append(f"mismatched={mismatched[:4]}")
+        raise RuntimeError(
+            "RF shared EDM teacher checkpoint did not match the EDM teacher architecture. "
+            + " ".join(preview)
+        )
+    model.load_state_dict(updated, strict=True)
+
+
+def _build_rf_teacher_model_from_edm_source_state(
+    *,
+    cfg,
+    dataset: DatasetBundle,
+    sigma_data: float,
+    device: torch.device,
+    source_state_dict: Dict[str, torch.Tensor],
+):
+    teacher_cfg = replace(cfg, training_objective="edm")
+    teacher_bundle = build_model_bundle(teacher_cfg, dataset, sigma_data=float(sigma_data), device=device)
+    teacher = teacher_bundle.baseline
+    _load_teacher_model_state_dict(teacher, source_state_dict)
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+    return teacher
 
 
 def _load_json_if_exists(path: str) -> Optional[Dict[str, Any]]:
@@ -1320,7 +1363,6 @@ def _build_baseline_signature(cfg, dataset: DatasetBundle, model_bundle, sigma_l
         signature.update(
             {
                 "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
-                "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
                 "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
                 "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
                 "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
@@ -1941,6 +1983,8 @@ def _run_robust_phase(
     method,
     robust_resume_payload: Optional[Dict[str, Any]] = None,
     baseline_handoff_state: Optional[Dict[str, Any]] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
     return_trainer_state: bool = False,
 ):
     """Execute or skip robust training depending on baseline-only mode and gate status."""
@@ -1996,7 +2040,10 @@ def _run_robust_phase(
                     method_name != "clean"
                     or str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
                 ):
-                    trainer_kwargs["rf_reflow_teacher_state_dict"] = trainer_state_in.get("rf_reflow_teacher_state_dict")
+                    trainer_kwargs["rf_reflow_teacher_state_dict"] = (
+                        trainer_state_in.get("rf_reflow_teacher_state_dict")
+                        or trainer_state_in.get("rf_teacher_state_dict")
+                    )
             else:
                 trainer_kwargs["optimizer_theta_state"] = trainer_state_in.get("optimizer_theta_state")
         else:
@@ -2013,6 +2060,13 @@ def _run_robust_phase(
                 trainer_kwargs["ema_state_dict"] = baseline_handoff_state.get("ema_state_dict")
             if method_name == "clean" and str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf":
                 trainer_kwargs["start_step"] = int(baseline_handoff_state.get("step", 0) or 0)
+    if (
+        str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+        and method_name in ("clean", "wdro", "cdro")
+        and rf_teacher_model is not None
+    ):
+        trainer_kwargs["rf_teacher_model"] = rf_teacher_model
+        trainer_kwargs["rf_teacher_sigma_levels"] = rf_teacher_sigma_levels
 
     attack_training_executed = True
     train_result = method.train_trajectory_robust(
@@ -2323,7 +2377,11 @@ def run_experiment(cfg) -> dict:
     baseline = model_bundle.baseline
     robust = model_bundle.robust
     control = model_bundle.control
-    rf_edm_init_report = _maybe_initialize_rf_from_edm_checkpoint(cfg, model_bundle, weighted_calibration)
+    rf_edm_init_report, rf_edm_init_source_state = _maybe_initialize_rf_from_edm_checkpoint(
+        cfg,
+        model_bundle,
+        weighted_calibration,
+    )
     if is_cdro_rf and not rf_edm_init_report.get("enabled"):
         raise RuntimeError(
             "CDRO-RF requires a shared EDM warm-start checkpoint. "
@@ -2353,6 +2411,22 @@ def run_experiment(cfg) -> dict:
                 "absolute RF wall-clock / weighted-compute plots will be incomplete.",
                 flush=True,
             )
+    rf_teacher_model = None
+    rf_teacher_sigma_levels = None
+    if objective_is_rf and rf_edm_init_source_state is not None:
+        rf_teacher_model = _build_rf_teacher_model_from_edm_source_state(
+            cfg=cfg,
+            dataset=dataset,
+            sigma_data=float(cfg.sigma_data),
+            device=device,
+            source_state_dict=rf_edm_init_source_state,
+        )
+        rf_teacher_sigma_levels = build_sigma_levels(
+            float(cfg.sigma_min),
+            float(cfg.sigma_max),
+            int(resolve_rf_teacher_n_steps_path(cfg)),
+            device=device,
+        )
 
     check_report = {}
     if cfg.run_checks:
@@ -2484,6 +2558,8 @@ def run_experiment(cfg) -> dict:
                     sample_train_batch_fn=dataset.sample_train_batch,
                     sample_population_batch_fn=dataset.sample_population_batch,
                     sample_terminal_batch_fn=dataset.sample_terminal_batch,
+                    rf_teacher_model=rf_teacher_model,
+                    rf_teacher_sigma_levels=rf_teacher_sigma_levels,
                 )
             runtime_sec["baseline_train"] += float(time.perf_counter() - t_phase)
             if baseline_ckpt_enabled:
@@ -2587,6 +2663,8 @@ def run_experiment(cfg) -> dict:
         method=method,
         robust_resume_payload=robust_resume_payload,
         baseline_handoff_state=baseline_handoff_state,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
         return_trainer_state=bool(robust_save_path),
     )
     runtime_sec["robust_phase"] = float(time.perf_counter() - t_phase)
@@ -3191,7 +3269,6 @@ def run_experiment(cfg) -> dict:
             "training_objective": str(getattr(cfg, "training_objective", "edm")),
             "score_matching_weight_power": float(getattr(cfg, "score_matching_weight_power", 2.0)),
             "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
-            "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
             "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
             "rf_cdro_rollout_grid_mode": (
                 "stochastic_stratified"
@@ -3239,7 +3316,7 @@ def run_experiment(cfg) -> dict:
             "rf_cdro_pair_source": str(getattr(cfg, "rf_cdro_pair_source", "auto")),
             "rf_cdro_stage1_t_distribution": rf_cdro_stage1_t_distribution,
             "rf_cdro_reflow_t_distribution": rf_cdro_reflow_t_distribution,
-            "rf_cdro_eval_stage": rf_cdro_eval_stage,
+            "rf_cdro_eval_stage": str(rf_eval_stage or ""),
             "rf_cdro_eval_t_distribution": rf_cdro_eval_t_distribution,
             "rf_cdro_time_grid_distribution": rf_cdro_eval_t_distribution,
             "wild_update_interval": int(getattr(cfg, "wild_update_interval", 0)),

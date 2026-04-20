@@ -122,8 +122,8 @@ def _resolve_attack_num_steps(cfg) -> tuple[int, str]:
 
 def _resolve_rf_cdro_pair_source(cfg) -> str:
     mode = str(getattr(cfg, "rf_cdro_pair_source", "auto")).strip().lower()
-    if mode == "auto":
-        return "staged"
+    if mode in ("auto", "staged"):
+        return "reflow"
     if mode not in ("reflow", "data_noise"):
         raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
     return mode
@@ -441,6 +441,8 @@ def train_trajectory_robust_cdro(
     optimizer_theta_state: Optional[dict] = None,
     ema_state_dict: Optional[dict] = None,
     rf_reflow_teacher_state_dict: Optional[dict] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
     return_state: bool = False,
 ):
     """Route-A CDRO training with u-space local caps and greedy denoiser-dependent attacks."""
@@ -543,7 +545,9 @@ def train_trajectory_robust_cdro(
     use_stochastic_edm_ladders = bool(
         not _is_rf_objective(cfg) and cdro_edm_ladder_mode == STOCHASTIC_STRATIFIED_QUANTILE_LADDER
     )
-    history["rf_pair_source_resolved"] = rf_pair_source
+    history["rf_pair_source_resolved"] = (
+        "shared_edm_teacher_reflow" if (_is_rf_objective(cfg) and rf_pair_source != "data_noise") else rf_pair_source
+    )
     history["attack_num_steps_resolved"] = int(attack_num_steps)
     history["attack_num_steps_source"] = str(attack_num_steps_source)
     history["control_u_radius"] = float((total_budget / time_horizon) ** 0.5 if time_horizon > 0.0 else 0.0)
@@ -553,7 +557,7 @@ def train_trajectory_robust_cdro(
     rf_stage1_steps = 0
     rf_reflow_steps = 0
     rf_stage_grids = {}
-    rf_teacher_sigma_levels = None
+    teacher_pair_sigma_levels = None
     transition_deltas = build_transition_deltas_for_objective(
         cfg=cfg,
         sigma_levels=sigma_levels,
@@ -569,9 +573,8 @@ def train_trajectory_robust_cdro(
         rf_stage_planning_total_steps = _resolve_rf_stage_planning_total_steps(cfg)
         rf_stage1_steps, rf_reflow_steps = resolve_rf_cdro_stage_steps(
             int(rf_stage_planning_total_steps),
-            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+            0.0,
             rf_pair_source,
-            reflow_start_step=int(getattr(cfg, "rf_reflow_start_step", 0) or 0),
         )
         rf_stage_grids = {
             "rf_stage1": _build_rf_cdro_stage_grid_info(
@@ -589,13 +592,17 @@ def train_trajectory_robust_cdro(
                 stage_name="rf_reflow",
             ),
         }
-        rf_teacher_sigma_levels = build_rf_stage_time_quantile_levels(
-            float(getattr(cfg, "sigma_max", 1.0)),
-            int(resolve_rf_teacher_n_steps_path(cfg)),
-            device=sigma_levels.device,
-            stage_name="rf_reflow",
-            reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-        ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
+        teacher_pair_sigma_levels = (
+            rf_teacher_sigma_levels.to(device=sigma_levels.device, dtype=sigma_levels.dtype)
+            if rf_teacher_sigma_levels is not None
+            else build_rf_stage_time_quantile_levels(
+                float(getattr(cfg, "sigma_max", 1.0)),
+                int(resolve_rf_teacher_n_steps_path(cfg)),
+                device=sigma_levels.device,
+                stage_name="rf_reflow",
+                reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+            ).to(device=sigma_levels.device, dtype=sigma_levels.dtype)
+        )
         rf_eval_stage = "rf_reflow" if int(rf_reflow_steps) > 0 else "rf_stage1"
         transition_deltas = rf_stage_grids[rf_eval_stage]["transition_deltas"]
         radius_by_step = rf_stage_grids[rf_eval_stage]["radius_by_step"]
@@ -606,18 +613,26 @@ def train_trajectory_robust_cdro(
         history["rf_stage_planning_total_steps"] = int(rf_stage_planning_total_steps)
         history.setdefault("rf_stage", [])
         history.setdefault("rf_t_distribution", [])
-        history["rf_stage1_t_distribution_resolved"] = str(rf_stage_grids["rf_stage1"]["distribution"])
+        history["rf_stage1_t_distribution_resolved"] = ""
         history["rf_reflow_t_distribution_resolved"] = str(rf_stage_grids["rf_reflow"]["distribution"])
         history["rf_eval_t_distribution_resolved"] = str(rf_stage_grids[rf_eval_stage]["distribution"])
         history["rf_stage_transition_deltas"] = {
             stage_name: [float(v.item()) for v in stage_info["transition_deltas"].detach().cpu()]
             for stage_name, stage_info in rf_stage_grids.items()
         }
-        if rf_reflow_teacher_state_dict is not None:
+        history["rf_teacher_pair_n_steps_path_resolved"] = int(
+            max(int(teacher_pair_sigma_levels.numel()) - 1, 0)
+        )
+        if rf_teacher_model is not None:
+            rf_pair_teacher = rf_teacher_model.eval()
+            set_requires_grad(rf_pair_teacher, False)
+        elif rf_reflow_teacher_state_dict is not None:
             rf_pair_teacher = copy.deepcopy(denoiser).eval()
             rf_pair_teacher.load_state_dict(rf_reflow_teacher_state_dict, strict=True)
             set_requires_grad(rf_pair_teacher, False)
-            history.setdefault("rf_reflow_teacher_refresh_step", int(rf_stage1_steps))
+        if rf_pair_teacher is not None:
+            history.setdefault("rf_reflow_teacher_refresh_step", 0)
+            history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
     else:
         if use_stochastic_edm_ladders:
             history["transition_deltas"] = []
@@ -672,11 +687,11 @@ def train_trajectory_robust_cdro(
                     history.setdefault("rf_reflow_teacher_refresh_step", int(step - 1))
                 rf_pair_left, x0 = generate_reflow_pairs(
                     rf_pair_teacher,
-                    rf_teacher_sigma_levels,
+                    teacher_pair_sigma_levels,
                     x_data,
                     sample_terminal_batch_fn=None,
                 )
-                reflow_pair_fwd_units = float(max(int(rf_teacher_sigma_levels.numel()) - 1, 0))
+                reflow_pair_fwd_units = float(max(int(teacher_pair_sigma_levels.numel()) - 1, 0))
                 current_rf_stage = "rf_reflow"
             stage_grid = _sample_rf_cdro_stage_grid_info(
                 cfg,
@@ -1063,8 +1078,15 @@ def train_trajectory_robust_cdro(
             "completed_steps": int(cfg.steps),
             "optimizer_theta_state": optimizer_theta.state_dict(),
             "ema_state_dict": None if ema_model is None else copy.deepcopy(ema_model.state_dict()),
-            "rf_reflow_teacher_state_dict": (
-                None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict())
+            "rf_teacher_state_dict": None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict()),
+            "rf_teacher_training_objective": (
+                "rf"
+                if rf_pair_teacher is None
+                else (
+                    "rf"
+                    if str(getattr(rf_pair_teacher, "generative_family", "")).lower() == "rectified_flow"
+                    else "edm"
+                )
             ),
             "resume_robust_state_dict": resume_robust_state_dict,
         }

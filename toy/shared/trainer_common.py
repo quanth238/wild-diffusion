@@ -9,9 +9,16 @@ from ..compute_accounting import append_denoiser_op_count_step, ensure_denoiser_
 from .ema import init_ema_model, update_ema_model
 from ..shared.runtime import autocast_context, resolve_amp_dtype
 from ..utils import has_nan_or_inf, scalarize
-from .objective import build_rectified_flow_state, build_training_state, compute_training_loss, weighted_denoise_loss
+from .objective import (
+    build_rectified_flow_state,
+    build_training_state,
+    compute_training_loss,
+    terminal_prior_scale_from_family,
+    weighted_denoise_loss,
+)
 from .reverse import (
     generated_data_path_index_from_denoiser,
+    reverse_paths_from_terminal,
     sample_rectified_flow_paths_from_source,
     sample_reverse_paths,
 )
@@ -41,11 +48,8 @@ def _rf_ema_cfg(cfg):
 
 def _resolve_rf_stage_steps(total_steps: int, stage1_fraction: float) -> tuple[int, int]:
     total_steps = max(int(total_steps), 0)
-    if total_steps <= 1:
-        return total_steps, 0
-    stage1_steps = int(round(float(total_steps) * float(stage1_fraction)))
-    stage1_steps = max(1, min(stage1_steps, total_steps - 1))
-    return stage1_steps, total_steps - stage1_steps
+    del stage1_fraction
+    return 0, total_steps
 
 
 def _sample_rf_t(
@@ -82,6 +86,27 @@ def _sample_terminal_like(
     )
 
 
+def _sample_teacher_terminal_like(
+    teacher,
+    x_template: torch.Tensor,
+    sigma_levels: torch.Tensor,
+    *,
+    sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
+) -> tuple[torch.Tensor, float]:
+    terminal_scale = terminal_prior_scale_from_family(
+        getattr(teacher, "generative_family", ""),
+        float(sigma_levels[-1].item()),
+    )
+    if sample_terminal_batch_fn is None:
+        x_terminal = torch.randn_like(x_template) * float(terminal_scale)
+    else:
+        x_terminal = sample_terminal_batch_fn(x_template.shape[0], float(terminal_scale)).to(
+            device=x_template.device,
+            dtype=x_template.dtype,
+        )
+    return x_terminal, float(max(float(terminal_scale), 1e-8))
+
+
 @torch.no_grad()
 def generate_reflow_pairs(
     teacher,
@@ -90,20 +115,42 @@ def generate_reflow_pairs(
     *,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate one-round reflow pairs `(x_left, x_right)` from a frozen RF teacher."""
+    """Generate one-round reflow pairs `(x_left, x_right)` from a frozen teacher."""
 
-    z = _sample_terminal_like(x_template, sample_terminal_batch_fn=sample_terminal_batch_fn)
     was_training = teacher.training
     teacher.eval()
-    paths = sample_rectified_flow_paths_from_source(
-        denoiser=teacher,
-        x_source=z,
-        sigma_levels=sigma_levels,
-    )
-    if was_training:
-        teacher.train()
-    x_generated = paths[:, -1].detach()
-    return z.detach(), x_generated
+    try:
+        teacher_family = str(getattr(teacher, "generative_family", "")).strip().lower()
+        if teacher_family == "rectified_flow":
+            x_left = _sample_terminal_like(
+                x_template,
+                sample_terminal_batch_fn=sample_terminal_batch_fn,
+            )
+            paths = sample_rectified_flow_paths_from_source(
+                denoiser=teacher,
+                x_source=x_left,
+                sigma_levels=sigma_levels,
+            )
+        else:
+            x_terminal, terminal_scale = _sample_teacher_terminal_like(
+                teacher,
+                x_template,
+                sigma_levels,
+                sample_terminal_batch_fn=sample_terminal_batch_fn,
+            )
+            paths = reverse_paths_from_terminal(
+                denoiser=teacher,
+                x_terminal=x_terminal,
+                sigma_levels=sigma_levels,
+                stochastic=False,
+            )
+            x_left = x_terminal / float(terminal_scale)
+        generated_idx = generated_data_path_index_from_denoiser(teacher)
+        x_generated = paths[:, generated_idx].detach()
+    finally:
+        if was_training:
+            teacher.train()
+    return x_left.detach(), x_generated
 
 
 def _train_rf_pair_stage(
@@ -127,6 +174,7 @@ def _train_rf_pair_stage(
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
     reflow_teacher=None,
+    reflow_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ):
     """Train one RF stage on explicit straight-path pairs."""
 
@@ -145,13 +193,14 @@ def _train_rf_pair_stage(
             x_left = _sample_terminal_like(x_template, sample_terminal_batch_fn=sample_terminal_batch_fn)
             reflow_fwd_units = 0.0
         else:
+            teacher_sigma_levels = reflow_teacher_sigma_levels if reflow_teacher_sigma_levels is not None else sigma_levels
             x_left, x_right = generate_reflow_pairs(
                 reflow_teacher,
-                sigma_levels,
+                teacher_sigma_levels,
                 x_template,
                 sample_terminal_batch_fn=sample_terminal_batch_fn,
             )
-            reflow_fwd_units = float(max(int(sigma_levels.numel()) - 1, 0))
+            reflow_fwd_units = float(max(int(teacher_sigma_levels.numel()) - 1, 0))
 
         t = _sample_rf_t(
             int(x_template.shape[0]),
@@ -216,8 +265,10 @@ def _train_strong_rf_baseline(
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ):
-    """Train the public RF baseline as 1-RF pretraining plus one reflow round."""
+    """Train the public RF baseline as one explicit teacher-pair reflow round."""
 
     history = {
         "loss": [],
@@ -231,48 +282,24 @@ def _train_strong_rf_baseline(
     sigma_counts = torch.zeros(sigma_levels.numel() - 1, device=sigma_levels.device, dtype=torch.long)
     amp_dtype = resolve_amp_dtype(sigma_levels.device, getattr(cfg, "amp_dtype", "auto"))
     ema_cfg = _rf_ema_cfg(cfg)
-    stage1_steps, reflow_steps = _resolve_rf_stage_steps(
-        int(cfg.steps),
-        float(getattr(cfg, "rf_stage1_fraction", 0.5)),
-    )
-    rf_stage1_t_distribution = resolve_rf_stage_t_distribution(
-        "rf_stage1",
-        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-    )
+    stage1_steps = 0
+    reflow_steps = max(int(cfg.steps), 0)
     rf_reflow_t_distribution = resolve_rf_stage_t_distribution(
         "rf_reflow",
         reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
     )
+    history["rf_stage1_steps"] = int(stage1_steps)
+    history["rf_reflow_steps"] = int(reflow_steps)
+    history["rf_stage1_t_distribution_resolved"] = ""
+    history["rf_reflow_t_distribution_resolved"] = str(rf_reflow_t_distribution)
+    history["rf_eval_t_distribution_resolved"] = str(rf_reflow_t_distribution)
+    history["rf_pair_source_resolved"] = "shared_edm_teacher_reflow"
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
     ema_model = init_ema_model(denoiser, ema_cfg)
-    ema_model = _train_rf_pair_stage(
-        denoiser=denoiser,
-        optimizer=optimizer,
-        ema_model=ema_model,
-        ema_cfg=ema_cfg,
-        centers=centers,
-        sigma_levels=sigma_levels,
-        cfg=cfg,
-        history=history,
-        sigma_counts=sigma_counts,
-        amp_dtype=amp_dtype,
-        stage_name="rf_stage1",
-        num_steps=stage1_steps,
-        global_step_offset=0,
-        t_distribution=rf_stage1_t_distribution,
-        train_pool=train_pool,
-        sample_train_batch_fn=sample_train_batch_fn,
-        sample_population_batch_fn=sample_population_batch_fn,
-        sample_terminal_batch_fn=sample_terminal_batch_fn,
-        reflow_teacher=None,
-    )
-
+    reflow_teacher = rf_teacher_model if rf_teacher_model is not None else copy.deepcopy(ema_model if ema_model is not None else denoiser).eval()
+    teacher_sigma_levels = rf_teacher_sigma_levels if rf_teacher_sigma_levels is not None else sigma_levels
     if reflow_steps > 0:
-        reflow_teacher = ema_model if ema_model is not None else copy.deepcopy(denoiser).eval()
-        denoiser.load_state_dict(reflow_teacher.state_dict(), strict=True)
-        optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
-        ema_model = init_ema_model(denoiser, ema_cfg)
         ema_model = _train_rf_pair_stage(
             denoiser=denoiser,
             optimizer=optimizer,
@@ -286,19 +313,20 @@ def _train_strong_rf_baseline(
             amp_dtype=amp_dtype,
             stage_name="rf_reflow",
             num_steps=reflow_steps,
-            global_step_offset=stage1_steps,
+            global_step_offset=0,
             t_distribution=rf_reflow_t_distribution,
             train_pool=train_pool,
             sample_train_batch_fn=sample_train_batch_fn,
             sample_population_batch_fn=sample_population_batch_fn,
             sample_terminal_batch_fn=sample_terminal_batch_fn,
             reflow_teacher=reflow_teacher,
+            reflow_teacher_sigma_levels=teacher_sigma_levels,
         )
 
     history["sigma_counts"] = [int(v) for v in sigma_counts.detach().cpu().tolist()]
-    history["rf_stage1_steps"] = int(stage1_steps)
-    history["rf_reflow_steps"] = int(reflow_steps)
     history["rf_public_baseline"] = "RF"
+    history["rf_teacher_family_resolved"] = str(getattr(reflow_teacher, "generative_family", ""))
+    history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
     eval_model = ema_model if ema_model is not None else denoiser
     return history, eval_model
 
@@ -312,6 +340,8 @@ def train_baseline(
     sample_train_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_population_batch_fn: Optional[Callable[[int], torch.Tensor]] = None,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ):
     """Train baseline model theta under the configured generative objective."""
 
@@ -325,6 +355,8 @@ def train_baseline(
             sample_train_batch_fn=sample_train_batch_fn,
             sample_population_batch_fn=sample_population_batch_fn,
             sample_terminal_batch_fn=sample_terminal_batch_fn,
+            rf_teacher_model=rf_teacher_model,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels,
         )
 
     optimizer = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)

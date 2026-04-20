@@ -972,9 +972,12 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
             if stage_name == "rf_stage1"
             else str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped"))
         )
-    teacher_state_dict = trainer_state.get("rf_reflow_teacher_state_dict")
+    teacher_state_dict = trainer_state.get("rf_teacher_state_dict")
+    if not isinstance(teacher_state_dict, dict):
+        teacher_state_dict = trainer_state.get("rf_reflow_teacher_state_dict")
     if not isinstance(teacher_state_dict, dict):
         teacher_state_dict = None
+    teacher_training_objective = str(trainer_state.get("rf_teacher_training_objective", "")).strip().lower()
     return {
         "stage_name": stage_name,
         "completed_steps": int(completed_steps),
@@ -982,7 +985,54 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
         "reflow_steps": int(reflow_steps),
         "t_distribution": str(t_distribution),
         "teacher_state_dict": teacher_state_dict,
+        "teacher_training_objective": teacher_training_objective,
     }
+
+
+def _infer_rf_probe_teacher_training_objective(
+    *,
+    explicit_training_objective: object,
+    teacher_state_dict: Optional[Dict[str, object]],
+) -> str:
+    explicit = str(explicit_training_objective or "").strip().lower()
+    if explicit in {"edm", "rf", "score"}:
+        return explicit
+    if isinstance(teacher_state_dict, dict):
+        keys = [str(key) for key in teacher_state_dict.keys()]
+        if any("noise_mlp" in key for key in keys):
+            return "edm"
+        if any("time_mlp" in key for key in keys):
+            return "rf"
+    return "rf"
+
+
+def _build_rf_probe_teacher(
+    *,
+    ctx: EvalContext,
+    teacher_state_dict: Dict[str, object],
+    teacher_training_objective: str,
+) -> Tuple[torch.nn.Module, torch.Tensor]:
+    teacher_cfg = copy.deepcopy(ctx.cfg)
+    teacher_cfg.training_objective = str(teacher_training_objective).strip().lower() or "rf"
+    teacher_bundle = build_model_bundle(teacher_cfg, ctx.dataset, float(ctx.cfg.sigma_data), ctx.device)
+    teacher_model = teacher_bundle.baseline.to(device=ctx.device)
+    teacher_model.load_state_dict(teacher_state_dict, strict=True)
+    teacher_model.eval()
+    if str(teacher_cfg.training_objective).strip().lower() == "rf":
+        teacher_sigma_levels = build_rf_time_quantile_levels(
+            float(teacher_cfg.sigma_max),
+            int(resolve_rf_teacher_n_steps_path(teacher_cfg)),
+            device=ctx.device,
+            distribution=str(getattr(teacher_cfg, "rf_reflow_t_distribution", "u_shaped")),
+        )
+    else:
+        teacher_sigma_levels = build_sigma_levels(
+            float(teacher_cfg.sigma_min),
+            float(teacher_cfg.sigma_max),
+            int(resolve_rf_teacher_n_steps_path(teacher_cfg)),
+            device=ctx.device,
+        )
+    return teacher_model, teacher_sigma_levels.to(dtype=ctx.sigma_levels.dtype)
 
 
 def _rf_probe_sigma_batch(
@@ -1092,6 +1142,10 @@ def _compute_rf_clean_probe_for_model(
         "uniform" if stage_name == "rf_stage1" else str(getattr(ctx.cfg, "rf_reflow_t_distribution", "u_shaped"))
     )
     teacher_state_dict = probe_spec.get("teacher_state_dict")
+    teacher_training_objective = _infer_rf_probe_teacher_training_objective(
+        explicit_training_objective=probe_spec.get("teacher_training_objective"),
+        teacher_state_dict=teacher_state_dict if isinstance(teacher_state_dict, dict) else None,
+    )
     summary: Dict[str, object] = {
         "enabled": True,
         "supported": True,
@@ -1111,6 +1165,7 @@ def _compute_rf_clean_probe_for_model(
         "stage_name": stage_name,
         "t_distribution": t_distribution,
         "pair_source": "",
+        "teacher_training_objective": teacher_training_objective,
     }
     if str(getattr(ctx.cfg, "training_objective", "edm")).strip().lower() != "rf":
         summary["supported"] = False
@@ -1132,10 +1187,13 @@ def _compute_rf_clean_probe_for_model(
     ).to(dtype=ctx.sigma_levels.dtype)
     sigma_max_value = max(float(ctx.cfg.sigma_max), 1e-8)
     teacher_model = None
+    teacher_sigma_levels = ctx.sigma_levels
     if stage_name == "rf_reflow" and isinstance(teacher_state_dict, dict):
-        teacher_model = copy.deepcopy(denoiser).to(device=ctx.device)
-        teacher_model.load_state_dict(teacher_state_dict, strict=True)
-        teacher_model.eval()
+        teacher_model, teacher_sigma_levels = _build_rf_probe_teacher(
+            ctx=ctx,
+            teacher_state_dict=teacher_state_dict,
+            teacher_training_objective=teacher_training_objective,
+        )
         summary["pair_source"] = "teacher_reflow_pairs"
     elif stage_name == "rf_reflow":
         summary["pair_source"] = "straight_clean_pairs_fallback"
@@ -1153,7 +1211,7 @@ def _compute_rf_clean_probe_for_model(
         if teacher_model is not None:
             x_left, x_right = generate_reflow_pairs(
                 teacher_model,
-                ctx.sigma_levels,
+                teacher_sigma_levels,
                 x0,
                 sample_terminal_batch_fn=ctx.dataset.sample_terminal_batch,
             )

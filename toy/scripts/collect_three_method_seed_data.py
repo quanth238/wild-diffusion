@@ -24,13 +24,11 @@ from toy.compute_accounting import (  # noqa: E402
     resolve_default_weighted_compute_calibration_path,
     solve_warmup_steps_for_target_compute_fraction,
     wdro_robust_step_weighted_compute_units,
+    weighted_compute_units,
 )
 from toy.config import ToyConfig  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
 from toy.shared.ema import append_ema_cli_args, ema_config_dict  # noqa: E402
-from toy.shared.rf_stage import resolve_rf_cdro_stage_steps, resolve_rf_stage_steps  # noqa: E402
-
-
 _APPLIED_PROCESS_TITLE = apply_process_title()
 
 
@@ -232,8 +230,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-train-backend", type=str, default="toy", choices=["toy", "mainline"])
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong", "plain"])
-    parser.add_argument("--rf-stage1-fraction", type=float, default=0.5)
-    parser.add_argument("--rf-reflow-start-step", type=int, default=ToyConfig.rf_reflow_start_step)
     parser.add_argument("--rf-reflow-t-distribution", type=str, default="u_shaped", choices=["u_shaped", "uniform"])
     parser.add_argument("--rf-loss", type=str, default="pseudo_huber", choices=["pseudo_huber", "mse"])
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=0.1)
@@ -301,7 +297,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outer-attack-weight", type=float, default=1.0)
     parser.add_argument("--outer-clean-weight", type=float, default=0.0)
     parser.add_argument("--cdro-step-size", type=float, default=0.02)
-    parser.add_argument("--cdro-total-budget-rho", type=float, default=32.0)
+    parser.add_argument("--cdro-total-budget-rho", type=float, default=ToyConfig.cdro_total_budget_rho)
     parser.add_argument("--cdro-time-horizon", type=float, default=1.0)
     parser.add_argument(
         "--cdro-edm-ladder-mode",
@@ -348,10 +344,6 @@ def _append_rf_cli_args(
         [
             "--rf-baseline-mode",
             str(args.rf_baseline_mode),
-            "--rf-stage1-fraction",
-            str(args.rf_stage1_fraction),
-            "--rf-reflow-start-step",
-            str(args.rf_reflow_start_step),
             "--rf-reflow-t-distribution",
             str(args.rf_reflow_t_distribution),
             "--rf-loss",
@@ -1092,14 +1084,15 @@ def _rf_boundary_fields(*, flow: Dict) -> Dict:
     boundaries = flow.get("rf_stage_boundaries", {})
     if not isinstance(boundaries, dict):
         boundaries = {}
+    objective_is_rf = str(flow.get("training_objective", "")).strip().lower() == "rf"
 
     def _boundary_dict(key: str) -> Dict:
         value = boundaries.get(key, {})
         return value if isinstance(value, dict) else {}
 
     shared = _boundary_dict("shared_edm_warm_start")
-    baseline_reflow = _boundary_dict("baseline_reflow_start")
-    robust_reflow = _boundary_dict("robust_reflow_start")
+    baseline_reflow = {} if objective_is_rf else _boundary_dict("baseline_reflow_start")
+    robust_reflow = {} if objective_is_rf else _boundary_dict("robust_reflow_start")
     return {
         "shared_edm_warm_start_available": bool(shared.get("available", False)),
         "shared_edm_warm_start_compute_be": _optional_float(shared.get("batch_equiv_denoiser_evals_total")),
@@ -1345,6 +1338,16 @@ def _baseline_step_weighted_units(calibration: Dict) -> float:
 
 
 def _wdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibration: Dict) -> float:
+    if str(getattr(args, "training_objective", "edm")).strip().lower() == "rf":
+        units = weighted_compute_units(
+            n_fwd=float(_rf_reflow_extra_forward_units(_effective_rf_teacher_n_steps_path(args))),
+            n_fwd_inputgrad=float(max(0.0, min(float(args.wdro_adv_prob), 1.0)) * max(int(args.wdro_attack_steps), 0)),
+            n_fwd_parambackward=1.0,
+            calibration=calibration,
+        )
+        if units is None:
+            raise RuntimeError("Missing weighted-compute calibration for WDRO-RF robust steps.")
+        return float(units)
     units = wdro_robust_step_weighted_compute_units(
         batch_size=int(args.batch_size),
         train_pool_size=int(args.image_train_size),
@@ -1397,56 +1400,15 @@ def _cdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
 
 def _resolve_rf_cdro_pair_source(args: argparse.Namespace) -> str:
     mode = str(getattr(args, "rf_cdro_pair_source", "auto")).strip().lower()
-    if mode == "auto":
-        return "staged"
+    if mode in ("auto", "staged"):
+        return "reflow"
     if mode not in ("reflow", "data_noise"):
         raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
     return mode
 
 
 def _rf_reflow_extra_forward_units(n_steps_path: int) -> float:
-    return float(max(int(n_steps_path) - 1, 0))
-
-
-def _rf_stage_progress(
-    *,
-    continuation_steps: int,
-    planned_continuation_steps: int,
-    stage1_fraction: float,
-    reflow_start_step: int,
-) -> Tuple[int, int]:
-    completed_continuation_steps = max(int(continuation_steps), 0)
-    planned_continuation_steps_value = max(int(planned_continuation_steps), 0)
-    stage1_steps_planned, _ = resolve_rf_stage_steps(
-        planned_continuation_steps_value,
-        float(stage1_fraction),
-        reflow_start_step=int(reflow_start_step),
-    )
-    stage1_steps_completed = min(completed_continuation_steps, int(stage1_steps_planned))
-    reflow_steps_completed = max(completed_continuation_steps - int(stage1_steps_planned), 0)
-    return int(stage1_steps_completed), int(reflow_steps_completed)
-
-
-def _rf_cdro_stage_progress(
-    *,
-    continuation_steps: int,
-    planned_continuation_steps: int,
-    stage1_fraction: float,
-    pair_source: str,
-    reflow_start_step: int,
-) -> Tuple[int, int]:
-    completed_continuation_steps = max(int(continuation_steps), 0)
-    planned_continuation_steps_value = max(int(planned_continuation_steps), 0)
-    stage1_steps_planned, _ = resolve_rf_cdro_stage_steps(
-        planned_continuation_steps_value,
-        float(stage1_fraction),
-        str(pair_source),
-        reflow_start_step=int(reflow_start_step),
-    )
-    stage1_steps_completed = min(completed_continuation_steps, int(stage1_steps_planned))
-    reflow_steps_completed = max(completed_continuation_steps - int(stage1_steps_planned), 0)
-    return int(stage1_steps_completed), int(reflow_steps_completed)
-
+    return float(max(int(n_steps_path), 0))
 
 def _clean_rf_continuation_weighted_units(
     *,
@@ -1458,18 +1420,11 @@ def _clean_rf_continuation_weighted_units(
     continuation_steps_value = max(int(continuation_steps), 0)
     if continuation_steps_value <= 0:
         return 0.0
-    stage1_steps, reflow_steps = _rf_stage_progress(
-        continuation_steps=int(continuation_steps_value),
-        planned_continuation_steps=int(planned_continuation_steps),
-        stage1_fraction=float(args.rf_stage1_fraction),
-        reflow_start_step=int(getattr(args, "rf_reflow_start_step", 0) or 0),
-    )
+    del planned_continuation_steps
     reflow_step_weighted_units = float(baseline_step_weighted_units) + _rf_reflow_extra_forward_units(
         _effective_rf_teacher_n_steps_path(args)
     )
-    return float(stage1_steps) * float(baseline_step_weighted_units) + float(reflow_steps) * float(
-        reflow_step_weighted_units
-    )
+    return float(continuation_steps_value) * float(reflow_step_weighted_units)
 
 
 def _wdro_rf_continuation_weighted_units(
@@ -1482,18 +1437,11 @@ def _wdro_rf_continuation_weighted_units(
     continuation_steps_value = max(int(continuation_steps), 0)
     if continuation_steps_value <= 0:
         return 0.0
-    stage1_steps, reflow_steps = _rf_stage_progress(
-        continuation_steps=int(continuation_steps_value),
-        planned_continuation_steps=int(planned_continuation_steps),
-        stage1_fraction=float(args.rf_stage1_fraction),
-        reflow_start_step=int(getattr(args, "rf_reflow_start_step", 0) or 0),
-    )
+    del planned_continuation_steps
     reflow_step_weighted_units = float(wdro_robust_step_weighted_units) + _rf_reflow_extra_forward_units(
         _effective_rf_teacher_n_steps_path(args)
     )
-    return float(stage1_steps) * float(wdro_robust_step_weighted_units) + float(reflow_steps) * float(
-        reflow_step_weighted_units
-    )
+    return float(continuation_steps_value) * float(reflow_step_weighted_units)
 
 
 def _cdro_rf_continuation_weighted_units(
@@ -1506,19 +1454,11 @@ def _cdro_rf_continuation_weighted_units(
     continuation_steps_value = max(int(continuation_steps), 0)
     if continuation_steps_value <= 0:
         return 0.0
-    stage1_steps, reflow_steps = _rf_cdro_stage_progress(
-        continuation_steps=int(continuation_steps_value),
-        planned_continuation_steps=int(planned_continuation_steps),
-        stage1_fraction=float(args.rf_stage1_fraction),
-        pair_source=_resolve_rf_cdro_pair_source(args),
-        reflow_start_step=int(getattr(args, "rf_reflow_start_step", 0) or 0),
-    )
+    del planned_continuation_steps
     reflow_step_weighted_units = float(cdro_robust_step_weighted_units) + _rf_reflow_extra_forward_units(
         _effective_rf_teacher_n_steps_path(args)
     )
-    return float(stage1_steps) * float(cdro_robust_step_weighted_units) + float(reflow_steps) * float(
-        reflow_step_weighted_units
-    )
+    return float(continuation_steps_value) * float(reflow_step_weighted_units)
 
 
 def _shared_rf_total_weighted_units(
@@ -1867,6 +1807,82 @@ def _solve_baseline_steps_for_target_weighted(
         return 0
     step = int(round(float(target_weighted_units) / float(baseline_step_weighted_units)))
     return max(0, min(step, int(max_total_steps)))
+
+
+def _solve_steps_for_target_weighted(
+    *,
+    target_weighted_units: float,
+    step_weighted_units: float,
+    max_total_steps: int,
+) -> int:
+    if step_weighted_units <= 0.0:
+        return 0
+    step = int(round(float(target_weighted_units) / float(step_weighted_units)))
+    return max(0, min(step, int(max_total_steps)))
+
+
+def _resolve_rf_family_reflow_reference(
+    *,
+    args: argparse.Namespace,
+    baseline_trajectory_total_steps_max: int,
+    baseline_fixed_warmup_steps: int,
+    wdro_max_total_steps: int,
+    cdro_max_total_steps: int,
+    baseline_step_weighted_units: float,
+    wdro_robust_step_weighted_units: float,
+    cdro_robust_step_weighted_units: float,
+) -> Dict[str, Optional[float]]:
+    objective_is_rf = str(getattr(args, "training_objective", "edm")).strip().lower() == "rf"
+    report: Dict[str, Optional[float]] = {
+        "enabled": False,
+        "clean_continuation_total_steps": None,
+        "clean_reflow_start_step": None,
+        "continuation_weighted_compute_units": None,
+        "absolute_compute_be": None,
+        "absolute_weighted_compute_units": None,
+        "absolute_train_wall_clock_sec": None,
+        "clean_actual_train_wall_clock_sec": None,
+        "clean_stage1_weighted_compute_units": None,
+        "clean_stage1_compute_be": None,
+        "clean_source": "disabled",
+        "baseline_rf_reflow_start_step_override": None,
+        "wdro_rf_reflow_start_step_override": None,
+        "cdro_rf_reflow_start_step_override": None,
+    }
+    if not objective_is_rf:
+        return report
+    del (
+        baseline_trajectory_total_steps_max,
+        baseline_fixed_warmup_steps,
+        wdro_max_total_steps,
+        cdro_max_total_steps,
+        baseline_step_weighted_units,
+        wdro_robust_step_weighted_units,
+        cdro_robust_step_weighted_units,
+    )
+    report["clean_source"] = "shared_edm_teacher_reflow_protocol"
+    return report
+
+
+def _apply_shared_rf_family_reflow_boundary_rows(
+    *,
+    rows: List[Dict],
+    objective_is_rf: bool,
+    rf_family_reflow_reference: Dict[str, Optional[float]],
+    baseline_rows: List[Dict],
+) -> List[Dict]:
+    del baseline_rows
+    if not objective_is_rf or not bool(rf_family_reflow_reference.get("enabled", False)):
+        out = []
+        for row in rows:
+            updated = dict(row)
+            updated["shared_rf_reflow_start_available"] = False
+            updated["shared_rf_reflow_start_compute_be"] = ""
+            updated["shared_rf_reflow_start_weighted_compute_units"] = ""
+            updated["shared_rf_reflow_start_train_wall_clock_sec"] = ""
+            out.append(updated)
+        return out
+    return [dict(row) for row in rows]
 
 
 def _solve_cdro_total_steps_for_shared_cap(
@@ -2884,7 +2900,11 @@ def _build_run_toy_cmd(
                 str(args.wandb_entity),
             ]
         )
-    _append_rf_cli_args(cmd, args, rf_edm_init_ckpt_path=resolved_rf_edm_init_ckpt_path)
+    _append_rf_cli_args(
+        cmd,
+        args,
+        rf_edm_init_ckpt_path=resolved_rf_edm_init_ckpt_path,
+    )
     if (
         str(args.training_objective).strip().lower() == "rf"
         and rf_continuation_total_steps_override is not None
@@ -3636,6 +3656,16 @@ def main() -> None:
     baseline_fid_eval_step_set = set(int(step) for step in baseline_fid_eval_steps)
     baseline_run_steps = sorted({int(step) for step in baseline_curve_steps if int(step) > 0})
     baseline_trajectory_total_steps_max = max(baseline_run_steps) if baseline_run_steps else 0
+    rf_family_reflow_reference = _resolve_rf_family_reflow_reference(
+        args=args,
+        baseline_trajectory_total_steps_max=int(baseline_trajectory_total_steps_max),
+        baseline_fixed_warmup_steps=int(shared_robust_fixed_warmup_steps or 0),
+        wdro_max_total_steps=int(wdro_max_total_steps),
+        cdro_max_total_steps=int(cdro_max_total_steps),
+        baseline_step_weighted_units=float(baseline_step_weighted_units),
+        wdro_robust_step_weighted_units=float(wdro_robust_step_weighted_units),
+        cdro_robust_step_weighted_units=float(cdro_robust_step_weighted_units),
+    )
 
     print(
         "[collect-weighted] shared_cap="
@@ -3666,6 +3696,13 @@ def main() -> None:
         f"fixed_warmup_steps={int(cdro_fixed_warmup_steps)}",
         flush=True,
     )
+    if objective_is_rf:
+        print(
+            "[collect-weighted] rf_family_reflow_reference "
+            f"enabled={bool(rf_family_reflow_reference.get('enabled', False))} "
+            f"source={rf_family_reflow_reference.get('clean_source')}",
+            flush=True,
+        )
     print(f"[collect-weighted] weighted_targets={weighted_grid_targets}", flush=True)
     print(
         "[collect-weighted] fid_eval_schedule="
@@ -3893,15 +3930,15 @@ def main() -> None:
                                 if objective_is_rf and str(baseline_support_checkpoint).strip()
                                 else None
                             ),
-                            rf_continuation_total_steps_override=(
-                                max(
-                                    int(baseline_trajectory_total_steps_max) - int(shared_robust_fixed_warmup_steps),
-                                    0,
-                                )
-                                if objective_is_rf
-                                else None
-                            ),
+                    rf_continuation_total_steps_override=(
+                        max(
+                            int(baseline_trajectory_total_steps_max) - int(shared_robust_fixed_warmup_steps),
+                            0,
                         )
+                        if objective_is_rf
+                        else None
+                    ),
+                )
                         run_command(
                             cmd=cmd,
                             log_path=log_path,
@@ -4366,6 +4403,30 @@ def main() -> None:
     baseline_target_rows = [_ensure_row_fid_fields(row) for row in baseline_target_rows]
     wdro_rows = [_ensure_row_fid_fields(row) for row in wdro_rows]
     cdro_rows = [_ensure_row_fid_fields(row) for row in cdro_rows]
+    baseline_all_eval_rows = _apply_shared_rf_family_reflow_boundary_rows(
+        rows=baseline_all_eval_rows,
+        objective_is_rf=bool(objective_is_rf),
+        rf_family_reflow_reference=rf_family_reflow_reference,
+        baseline_rows=baseline_target_rows,
+    )
+    baseline_target_rows = _apply_shared_rf_family_reflow_boundary_rows(
+        rows=baseline_target_rows,
+        objective_is_rf=bool(objective_is_rf),
+        rf_family_reflow_reference=rf_family_reflow_reference,
+        baseline_rows=baseline_target_rows,
+    )
+    wdro_rows = _apply_shared_rf_family_reflow_boundary_rows(
+        rows=wdro_rows,
+        objective_is_rf=bool(objective_is_rf),
+        rf_family_reflow_reference=rf_family_reflow_reference,
+        baseline_rows=baseline_target_rows,
+    )
+    cdro_rows = _apply_shared_rf_family_reflow_boundary_rows(
+        rows=cdro_rows,
+        objective_is_rf=bool(objective_is_rf),
+        rf_family_reflow_reference=rf_family_reflow_reference,
+        baseline_rows=baseline_target_rows,
+    )
     combined_raw = baseline_target_rows + wdro_rows + cdro_rows
     combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
 
@@ -4416,6 +4477,32 @@ def main() -> None:
         baseline_all_eval_rows = list(baseline_target_rows)
         wdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "wild_diffusion"]
         cdro_rows = [row for row in combined_raw if str(row.get("method", "")) == "cdro"]
+        baseline_all_eval_rows = _apply_shared_rf_family_reflow_boundary_rows(
+            rows=baseline_all_eval_rows,
+            objective_is_rf=bool(objective_is_rf),
+            rf_family_reflow_reference=rf_family_reflow_reference,
+            baseline_rows=baseline_target_rows,
+        )
+        baseline_target_rows = _apply_shared_rf_family_reflow_boundary_rows(
+            rows=baseline_target_rows,
+            objective_is_rf=bool(objective_is_rf),
+            rf_family_reflow_reference=rf_family_reflow_reference,
+            baseline_rows=baseline_target_rows,
+        )
+        wdro_rows = _apply_shared_rf_family_reflow_boundary_rows(
+            rows=wdro_rows,
+            objective_is_rf=bool(objective_is_rf),
+            rf_family_reflow_reference=rf_family_reflow_reference,
+            baseline_rows=baseline_target_rows,
+        )
+        cdro_rows = _apply_shared_rf_family_reflow_boundary_rows(
+            rows=cdro_rows,
+            objective_is_rf=bool(objective_is_rf),
+            rf_family_reflow_reference=rf_family_reflow_reference,
+            baseline_rows=baseline_target_rows,
+        )
+        combined_raw = baseline_target_rows + wdro_rows + cdro_rows
+        combined_raw.sort(key=lambda row: (str(row["method"]), int(row["seed"]), int(row["step"])))
         combined_by_key = {
             (
                 str(row.get("method", "")),
@@ -4579,6 +4666,7 @@ def main() -> None:
             "baseline_step_weighted_units": float(baseline_step_weighted_units),
             "wdro_expected_robust_step_weighted_units": float(wdro_robust_step_weighted_units),
             "cdro_expected_robust_step_weighted_units": float(cdro_robust_step_weighted_units),
+            "rf_family_reflow_reference": rf_family_reflow_reference,
             "cdro_effective_n_steps_path": int(_effective_cdro_n_steps_path(args)),
             "rf_teacher_n_steps_path": int(_effective_rf_teacher_n_steps_path(args)),
             "rf_eval_n_steps_path": int(_effective_rf_eval_n_steps_path(args)),

@@ -87,11 +87,6 @@ def _validate_config(cfg: ToyConfig) -> None:
             "--rf-continuation-total-steps-override must be >= 0, got "
             f"{cfg.rf_continuation_total_steps_override}"
         )
-    if int(getattr(cfg, "rf_reflow_start_step", 0)) < 0:
-        raise ValueError(
-            "--rf-reflow-start-step must be >= 0, got "
-            f"{cfg.rf_reflow_start_step}"
-        )
     if int(getattr(cfg, "rf_teacher_n_steps_path", 0)) < 0:
         raise ValueError(
             "--rf-teacher-n-steps-path must be >= 0, got "
@@ -117,10 +112,6 @@ def _validate_config(cfg: ToyConfig) -> None:
     if str(cfg.rf_baseline_mode).lower() not in ("strong", "plain"):
         raise ValueError(
             f"--rf-baseline-mode must be one of ('strong', 'plain'), got {cfg.rf_baseline_mode}"
-        )
-    if not (0.0 < float(cfg.rf_stage1_fraction) < 1.0):
-        raise ValueError(
-            f"--rf-stage1-fraction must be in (0, 1), got {cfg.rf_stage1_fraction}"
         )
     if str(cfg.rf_reflow_t_distribution).lower() not in ("u_shaped", "uniform"):
         raise ValueError(
@@ -425,8 +416,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=ToyConfig.rf_baseline_mode,
         choices=["strong", "plain"],
     )
-    parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
-    parser.add_argument("--rf-reflow-start-step", type=int, default=ToyConfig.rf_reflow_start_step)
     parser.add_argument(
         "--rf-reflow-t-distribution",
         type=str,

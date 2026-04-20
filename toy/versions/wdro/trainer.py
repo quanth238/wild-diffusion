@@ -10,7 +10,6 @@ from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser
 from ...models import set_requires_grad
 from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import build_rectified_flow_state, compute_training_loss
-from ...shared.rf_stage import resolve_rf_stage_steps
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import resolve_rf_stage_t_distribution, sample_target_indices, sample_target_indices_log_normal
 from ...shared.trainer_common import generate_reflow_pairs
@@ -130,6 +129,65 @@ def _wdro_attack_batch(
     }
 
 
+def _wdro_attack_rf_pair_batch(
+    denoiser,
+    x_left: torch.Tensor,
+    x_clean: torch.Tensor,
+    sigma_levels: torch.Tensor,
+    cfg,
+    amp_dtype,
+    *,
+    t_distribution: str,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    attack_steps = max(int(cfg.wdro_attack_steps), 0)
+    if attack_steps == 0:
+        return x_clean.detach().clone(), {"attack_loss": 0.0, "transport_cost": 0.0}
+
+    gamma = float(cfg.wdro_gamma)
+    step_size = float(cfg.wdro_attack_step_size)
+    x_adv = x_clean.detach().clone()
+    last_attack_loss = torch.zeros((), device=x_clean.device, dtype=x_clean.dtype)
+    last_transport = torch.zeros((), device=x_clean.device, dtype=x_clean.dtype)
+
+    for _ in range(attack_steps):
+        x_adv.requires_grad_(True)
+        with autocast_context(x_clean.device, amp_dtype):
+            t = _sample_rf_t(
+                x_adv.shape[0],
+                device=x_adv.device,
+                dtype=sigma_levels.dtype,
+                distribution=t_distribution,
+            )
+            sigma = t * float(getattr(cfg, "sigma_max", float(sigma_levels[-1].item())))
+            x_state = build_rectified_flow_state(x_left, x_adv, t)
+            attack_loss = compute_training_loss(
+                cfg,
+                denoiser,
+                x_state,
+                x_adv,
+                sigma,
+                x_left=x_left,
+                x_right=x_adv,
+            )
+            transport = _transport_cost(x_adv, x_clean)
+            objective = attack_loss - gamma * transport
+        if has_nan_or_inf(objective):
+            raise RuntimeError("NaN/Inf detected in WDRO-RF pair attack objective.")
+        grad_x = torch.autograd.grad(objective, x_adv, only_inputs=True)[0]
+        with torch.no_grad():
+            x_adv = x_adv + step_size * grad_x
+            if bool(cfg.wdro_clamp_samples):
+                x_adv.clamp_(float(cfg.wdro_sample_min), float(cfg.wdro_sample_max))
+        x_adv = x_adv.detach()
+        last_attack_loss = attack_loss.detach()
+        last_transport = transport.detach()
+
+    return x_adv, {
+        "attack_loss": scalarize(last_attack_loss),
+        "transport_cost": scalarize(last_transport),
+    }
+
+
 def _build_combined_pool(
     denoiser,
     train_pool: torch.Tensor,
@@ -195,6 +253,8 @@ def _train_trajectory_robust_wdro_rf(
     optimizer_theta_state: Optional[dict] = None,
     ema_state_dict: Optional[dict] = None,
     rf_reflow_teacher_state_dict: Optional[dict] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
     return_state: bool = False,
 ):
     optimizer_theta = torch.optim.Adam(denoiser.parameters(), lr=cfg.lr_theta)
@@ -232,15 +292,8 @@ def _train_trajectory_robust_wdro_rf(
     ema_model = init_ema_model(denoiser, cfg, ema_state_dict=ema_state_dict)
 
     rf_stage_planning_total_steps = _resolve_rf_stage_planning_total_steps(cfg)
-    stage1_steps, reflow_steps = resolve_rf_stage_steps(
-        int(rf_stage_planning_total_steps),
-        float(getattr(cfg, "rf_stage1_fraction", 0.5)),
-        reflow_start_step=int(getattr(cfg, "rf_reflow_start_step", 0) or 0),
-    )
-    rf_stage1_t_distribution = resolve_rf_stage_t_distribution(
-        "rf_stage1",
-        reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-    )
+    stage1_steps = 0
+    reflow_steps = max(int(rf_stage_planning_total_steps), 0)
     rf_reflow_t_distribution = resolve_rf_stage_t_distribution(
         "rf_reflow",
         reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
@@ -248,85 +301,75 @@ def _train_trajectory_robust_wdro_rf(
     history["rf_stage1_steps"] = int(stage1_steps)
     history["rf_reflow_steps"] = int(reflow_steps)
     history["rf_stage_planning_total_steps"] = int(rf_stage_planning_total_steps)
-    history["rf_stage1_t_distribution_resolved"] = str(rf_stage1_t_distribution)
+    history["rf_stage1_t_distribution_resolved"] = ""
     history["rf_reflow_t_distribution_resolved"] = str(rf_reflow_t_distribution)
-    history["rf_eval_t_distribution_resolved"] = str(
-        rf_reflow_t_distribution if int(reflow_steps) > 0 else rf_stage1_t_distribution
-    )
-    history["rf_pair_source_resolved"] = "wdro_augmented_pool_then_reflow"
-
-    refresh_interval_steps = max(
-        int(math.ceil(float(cfg.wdro_refresh_epochs) * float(train_pool.shape[0]) / float(max(int(cfg.batch_size), 1)))),
-        1,
-    )
-    combined_pool = None
-    combined_stats = {
-        "attack_batches": 0,
-        "adv_examples": 0,
-        "dataset_size": int(train_pool.shape[0]),
-        "attack_loss_mean": 0.0,
-        "transport_cost_mean": 0.0,
-        "attack_construction_units": 0.0,
-    }
+    history["rf_eval_t_distribution_resolved"] = str(rf_reflow_t_distribution)
+    history["rf_pair_source_resolved"] = "shared_edm_teacher_reflow"
+    teacher_sigma_levels = rf_teacher_sigma_levels if rf_teacher_sigma_levels is not None else sigma_levels
     rf_pair_teacher = None
-    if rf_reflow_teacher_state_dict is not None:
+    if rf_teacher_model is not None:
+        rf_pair_teacher = rf_teacher_model.eval()
+        set_requires_grad(rf_pair_teacher, False)
+    elif rf_reflow_teacher_state_dict is not None:
         rf_pair_teacher = copy.deepcopy(denoiser).eval()
         rf_pair_teacher.load_state_dict(rf_reflow_teacher_state_dict, strict=True)
         set_requires_grad(rf_pair_teacher, False)
-        history.setdefault("rf_reflow_teacher_refresh_step", int(stage1_steps))
+    if rf_pair_teacher is not None:
+        history.setdefault("rf_reflow_teacher_refresh_step", 0)
+        history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
+        history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
         step_t0 = time.perf_counter()
-        refresh_attack_construction_units = 0.0
         reflow_pair_fwd_units = 0.0
-        if step <= int(stage1_steps):
-            refresh_now = combined_pool is None or step == 1 or ((step - 1) % refresh_interval_steps == 0)
-            if refresh_now:
-                combined_pool, combined_stats = _build_combined_pool(
-                    denoiser=denoiser,
-                    train_pool=train_pool,
-                    sigma_levels=sigma_levels,
-                    cfg=cfg,
-                    amp_dtype=amp_dtype,
-                )
-                refresh_attack_construction_units = float(combined_stats["attack_construction_units"])
-                history["wdro_refresh_step"].append(int(step))
-                history["wdro_dataset_size"].append(int(combined_stats["dataset_size"]))
-                history["wdro_adv_examples"].append(int(combined_stats["adv_examples"]))
-                history["wdro_attack_batches"].append(int(combined_stats["attack_batches"]))
-                history["wdro_attack_loss"].append(float(combined_stats["attack_loss_mean"]))
-                history["wdro_transport_cost"].append(float(combined_stats["transport_cost_mean"]))
-
-            idx = torch.randint(0, int(combined_pool.shape[0]), (int(cfg.batch_size),), device=combined_pool.device)
-            x_right = combined_pool[idx]
-            x_left = torch.randn_like(x_right)
-            t_distribution = rf_stage1_t_distribution
-            stage_name = "rf_stage1"
-            stage_energy = float(combined_stats["transport_cost_mean"])
-            stage_dual_surrogate = float(combined_stats["attack_loss_mean"])
-        else:
-            if rf_pair_teacher is None:
-                teacher_source = ema_model if ema_model is not None else denoiser
-                rf_pair_teacher = copy.deepcopy(teacher_source).eval()
-                set_requires_grad(rf_pair_teacher, False)
-                history.setdefault("rf_reflow_teacher_refresh_step", int(step - 1))
-            x_template = _sample_train_like_batch(
-                train_pool=train_pool,
-                batch_size=int(cfg.batch_size),
-                sample_train_batch_fn=sample_train_batch_fn,
-                device=sigma_levels.device,
-                dtype=sigma_levels.dtype,
-            )
-            x_left, x_right = generate_reflow_pairs(
-                rf_pair_teacher,
+        if rf_pair_teacher is None:
+            teacher_source = ema_model if ema_model is not None else denoiser
+            rf_pair_teacher = copy.deepcopy(teacher_source).eval()
+            set_requires_grad(rf_pair_teacher, False)
+            history.setdefault("rf_reflow_teacher_refresh_step", max(int(step - 1), 0))
+            history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
+            history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+        x_template = _sample_train_like_batch(
+            train_pool=train_pool,
+            batch_size=int(cfg.batch_size),
+            sample_train_batch_fn=sample_train_batch_fn,
+            device=sigma_levels.device,
+            dtype=sigma_levels.dtype,
+        )
+        x_left, x_right_clean = generate_reflow_pairs(
+            rf_pair_teacher,
+            teacher_sigma_levels,
+            x_template,
+        )
+        reflow_pair_fwd_units = float(max(int(teacher_sigma_levels.numel()) - 1, 0))
+        attack_applied = bool(
+            int(cfg.wdro_attack_steps) > 0 and torch.rand((), device=x_template.device).item() < float(cfg.wdro_adv_prob)
+        )
+        attack_stats = {"attack_loss": 0.0, "transport_cost": 0.0}
+        attack_construction_units = 0.0
+        if attack_applied:
+            x_right, attack_stats = _wdro_attack_rf_pair_batch(
+                denoiser,
+                x_left,
+                x_right_clean,
                 sigma_levels,
-                x_template,
+                cfg,
+                amp_dtype,
+                t_distribution=rf_reflow_t_distribution,
             )
-            reflow_pair_fwd_units = float(max(int(sigma_levels.numel()) - 1, 0))
-            t_distribution = rf_reflow_t_distribution
-            stage_name = "rf_reflow"
-            stage_energy = 0.0
-            stage_dual_surrogate = 0.0
+            attack_construction_units = float(max(int(cfg.wdro_attack_steps), 0))
+        else:
+            x_right = x_right_clean
+        history["wdro_refresh_step"].append(int(step))
+        history["wdro_dataset_size"].append(int(x_right.shape[0]))
+        history["wdro_adv_examples"].append(int(x_right.shape[0]) if attack_applied else 0)
+        history["wdro_attack_batches"].append(int(attack_applied))
+        history["wdro_attack_loss"].append(float(attack_stats["attack_loss"]))
+        history["wdro_transport_cost"].append(float(attack_stats["transport_cost"]))
+        t_distribution = rf_reflow_t_distribution
+        stage_name = "rf_reflow"
+        stage_energy = float(attack_stats["transport_cost"])
+        stage_dual_surrogate = float(attack_stats["attack_loss"])
 
         t = _sample_rf_t(
             int(x_right.shape[0]),
@@ -361,7 +404,7 @@ def _train_trajectory_robust_wdro_rf(
             batch_size=int(cfg.batch_size),
         )
 
-        step_batch_equiv = 1.0 + refresh_attack_construction_units + reflow_pair_fwd_units
+        step_batch_equiv = 1.0 + attack_construction_units + reflow_pair_fwd_units
         cumulative_batch_equiv_evals += step_batch_equiv
         loss_scalar = scalarize(loss)
         history["outer_loss"].append(loss_scalar)
@@ -381,7 +424,7 @@ def _train_trajectory_robust_wdro_rf(
         history["sched_clean_weight"].append(1.0)
         history["sched_phi_lr_scale"].append(0.0)
         history["batch_equiv_denoiser_evals_step"].append(float(step_batch_equiv))
-        history["batch_equiv_denoiser_evals_attack_construction"].append(float(refresh_attack_construction_units))
+        history["batch_equiv_denoiser_evals_attack_construction"].append(float(attack_construction_units))
         history["batch_equiv_denoiser_evals_attack_eval"].append(0.0)
         history["batch_equiv_denoiser_evals_clean_eval"].append(1.0)
         history["rf_stage"].append(str(stage_name))
@@ -392,15 +435,14 @@ def _train_trajectory_robust_wdro_rf(
         append_denoiser_op_count_step(
             history,
             n_fwd=float(reflow_pair_fwd_units),
-            n_fwd_inputgrad=float(refresh_attack_construction_units),
+            n_fwd_inputgrad=float(attack_construction_units),
             n_fwd_parambackward=1.0,
         )
 
         if step % int(cfg.log_every) == 0:
             print(
                 f"[wdro-rf] step={step:05d} stage={stage_name} loss={loss.item():.6f} "
-                f"pool={int(combined_stats['dataset_size']) if stage_name == 'rf_stage1' else int(train_pool.shape[0])} "
-                f"adv_examples={int(combined_stats['adv_examples']) if stage_name == 'rf_stage1' else 0} "
+                f"adv_examples={int(x_right.shape[0]) if attack_applied else 0} "
                 f"reflow_fwd={reflow_pair_fwd_units:.1f} "
                 f"be_evals={step_batch_equiv:.1f} be_evals_cum={cumulative_batch_equiv_evals:.1f}",
                 flush=True,
@@ -413,8 +455,15 @@ def _train_trajectory_robust_wdro_rf(
             "completed_steps": int(cfg.steps),
             "optimizer_theta_state": optimizer_theta.state_dict(),
             "ema_state_dict": None if ema_model is None else copy.deepcopy(ema_model.state_dict()),
-            "rf_reflow_teacher_state_dict": (
-                None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict())
+            "rf_teacher_state_dict": None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict()),
+            "rf_teacher_training_objective": (
+                "rf"
+                if rf_pair_teacher is None
+                else (
+                    "rf"
+                    if str(getattr(rf_pair_teacher, "generative_family", "")).lower() == "rectified_flow"
+                    else "edm"
+                )
             ),
             "resume_robust_state_dict": resume_robust_state_dict,
         }
@@ -441,6 +490,8 @@ def train_trajectory_robust_wdro(
     optimizer_theta_state: Optional[dict] = None,
     ema_state_dict: Optional[dict] = None,
     rf_reflow_teacher_state_dict: Optional[dict] = None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
     return_state: bool = False,
 ):
     del control, centers, sample_population_batch_fn
@@ -460,6 +511,8 @@ def train_trajectory_robust_wdro(
             optimizer_theta_state=optimizer_theta_state,
             ema_state_dict=ema_state_dict,
             rf_reflow_teacher_state_dict=rf_reflow_teacher_state_dict,
+            rf_teacher_model=rf_teacher_model,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels,
             return_state=return_state,
         )
 

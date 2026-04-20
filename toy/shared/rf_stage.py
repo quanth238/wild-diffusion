@@ -7,25 +7,19 @@ def resolve_rf_stage_steps(
     *,
     reflow_start_step: int = 0,
 ) -> tuple[int, int]:
-    """Resolve clean/WDRO RF stage-1 vs reflow steps.
+    """Resolve RF-family training as explicit teacher-pair reflow only.
 
-    When ``reflow_start_step`` is positive, it is treated as the explicit
-    continuation step where reflow begins. Otherwise we fall back to the legacy
-    ``rf_stage1_fraction`` split.
+    The current RF protocol is RF++-style: the shared EDM checkpoint is the
+    frozen teacher, and the RF-family student trains directly on teacher
+    synthetic pairs. Legacy stage-split knobs are accepted for backward CLI
+    compatibility, but they no longer change the RF-family continuation split.
     """
 
     total_steps_value = max(int(total_steps), 0)
-    explicit_reflow_start = max(int(reflow_start_step), 0)
     if total_steps_value <= 0:
         return 0, 0
-    if explicit_reflow_start > 0:
-        stage1_steps = min(explicit_reflow_start, total_steps_value)
-        return int(stage1_steps), int(max(total_steps_value - stage1_steps, 0))
-    if total_steps_value <= 1:
-        return int(total_steps_value), 0
-    stage1_steps = int(round(float(total_steps_value) * float(stage1_fraction)))
-    stage1_steps = max(1, min(stage1_steps, total_steps_value - 1))
-    return int(stage1_steps), int(total_steps_value - stage1_steps)
+    del stage1_fraction, reflow_start_step
+    return 0, int(total_steps_value)
 
 
 def resolve_rf_cdro_stage_steps(
@@ -35,16 +29,11 @@ def resolve_rf_cdro_stage_steps(
     *,
     reflow_start_step: int = 0,
 ) -> tuple[int, int]:
-    """Resolve CDRO-RF stage-1 vs reflow steps under the staged pair source."""
+    """Resolve CDRO-RF as explicit reflow unless legacy data-noise pairs are forced."""
 
     total_steps_value = max(int(total_steps), 0)
     mode = str(pair_source).strip().lower()
     if mode == "data_noise":
         return int(total_steps_value), 0
-    if mode == "reflow":
-        return 0, int(total_steps_value)
-    return resolve_rf_stage_steps(
-        int(total_steps_value),
-        float(stage1_fraction),
-        reflow_start_step=int(reflow_start_step),
-    )
+    del stage1_fraction, reflow_start_step
+    return 0, int(total_steps_value)

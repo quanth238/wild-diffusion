@@ -23,6 +23,7 @@ FAMILY_STYLE = {
 
 BOUNDARY_STYLE = {
     "shared_edm_warm_start": {"linestyle": ":", "alpha": 0.4, "linewidth": 1.2},
+    "shared_rf_reflow_start": {"linestyle": "-.", "alpha": 0.55, "linewidth": 1.35},
     "baseline_rf_reflow_start": {"linestyle": "-.", "alpha": 0.5, "linewidth": 1.3},
     "robust_rf_reflow_start": {"linestyle": "-.", "alpha": 0.5, "linewidth": 1.3},
 }
@@ -184,6 +185,9 @@ def normalize_row(row: Dict) -> Dict:
         "shared_edm_warm_start_compute_be",
         "shared_edm_warm_start_weighted_compute_units",
         "shared_edm_warm_start_train_wall_clock_sec",
+        "shared_rf_reflow_start_compute_be",
+        "shared_rf_reflow_start_weighted_compute_units",
+        "shared_rf_reflow_start_train_wall_clock_sec",
         "baseline_rf_reflow_start_compute_be",
         "baseline_rf_reflow_start_weighted_compute_units",
         "baseline_rf_reflow_start_train_wall_clock_sec",
@@ -195,6 +199,7 @@ def normalize_row(row: Dict) -> Dict:
     normalized["fid_eval_selected"] = _safe_bool(row.get("fid_eval_selected"))
     normalized["fid_evaluated"] = _safe_bool(row.get("fid_evaluated"))
     normalized["shared_edm_warm_start_available"] = _safe_bool(row.get("shared_edm_warm_start_available"))
+    normalized["shared_rf_reflow_start_available"] = _safe_bool(row.get("shared_rf_reflow_start_available"))
     normalized["baseline_rf_reflow_start_available"] = _safe_bool(row.get("baseline_rf_reflow_start_available"))
     normalized["robust_rf_reflow_start_available"] = _safe_bool(row.get("robust_rf_reflow_start_available"))
     normalized["weighted_compute_calibration_required_match"] = _safe_bool(
@@ -473,6 +478,7 @@ def _stable_boundary_x_from_values(values: List[float]) -> Optional[float]:
 def _draw_rf_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: List[str]) -> None:
     boundary_specs = (
         ("shared_edm_warm_start", "shared_edm_warm_start_available", "warm-start"),
+        ("shared_rf_reflow_start", "shared_rf_reflow_start_available", "reflow start"),
         ("baseline_rf_reflow_start", "baseline_rf_reflow_start_available", "reflow start"),
         ("robust_rf_reflow_start", "robust_rf_reflow_start_available", "reflow start"),
     )
@@ -517,6 +523,11 @@ def _draw_rf_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: List[s
     for series_key in series_keys:
         sample = next(row for row in rows if row.get("series_key") == series_key)
         for boundary_name, availability_field, label_suffix in boundary_specs:
+            if (
+                boundary_name in ("baseline_rf_reflow_start", "robust_rf_reflow_start")
+                and (str(sample.get("backbone_family", "")), "shared_rf_reflow_start") in family_boundary_drawn
+            ):
+                continue
             if (str(sample.get("backbone_family", "")), boundary_name) in family_boundary_drawn:
                 continue
             if boundary_name == "shared_edm_warm_start" and sample.get("robust_method") != "baseline":

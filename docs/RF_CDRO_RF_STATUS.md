@@ -11,23 +11,26 @@ This note is the shortest current description of the toy-side RF additions.
 
 ## Clean RF Baseline
 
-The public `RF` baseline in the toy stack is a strong two-stage baseline:
+The public `RF` baseline in the toy stack now follows the explicit RF++-style
+shared-teacher protocol:
 
-1. `rf_stage1`: continuous-time 1-RF training on straight pairs `(x_L, x_R) = (z, x0)` with
-   `x_t = (1 - t) x_L + t x_R` and target velocity `d = x_R - x_L`.
-2. `rf_reflow`: one frozen one-round reflow refresh, training on pairs
-   `(x_L, x_R) = (z, x_hat_teacher(z))`.
+1. start from the same shared EDM checkpoint used by the EDM family
+2. use that checkpoint as the frozen teacher
+3. train the RF student directly on teacher-generated reflow pairs
+   `(x_L, x_R) = (z, x_hat_teacher(z))`
 
 Implementation notes:
 
-- Stage-1 timestep law is uniform in continuous `t`.
 - Reflow-stage timestep law is controlled by `rf_reflow_t_distribution` and currently defaults to `u_shaped`.
-- EMA is kept in both stages.
+- EMA is kept for the RF-family student.
 - The shared EDM warm start is required through `rf_edm_init_ckpt_path`.
 - The shared RF family reflow/teacher grid now defaults to `rf_teacher_n_steps_path=40`.
 - The shared RF family eval/FID grid now defaults to `rf_eval_n_steps_path=9`.
-- RF-family runs now support one explicit common reflow-start knob through `rf_reflow_start_step`;
-  when left at `0`, the repo falls back to the legacy `rf_stage1_fraction` split.
+- RF-family training now uses one explicit shared-EDM-teacher reflow protocol rather than an in-run
+  stage split. `rf_stage1_fraction` and `rf_reflow_start_step` have been removed from the public
+  RF launch surfaces.
+- Shared-grid RF collection therefore treats RF-family continuation as reflow-only off the shared
+  EDM branchpoint, and the family reflow boundary now coincides with that shared warm-start point.
 
 ## CDRO-RF
 
@@ -46,10 +49,10 @@ The controlled rollout uses:
 
 The training target stays fixed as `d = x_R - x_L`, and the loss is path-averaged RF regression on the controlled states.
 
-Current staged pair law:
+Current pair law:
 
-1. robust stage-1 uses standard RF pairs `(z, x0)`
-2. robust reflow stage uses frozen one-round reflow pairs `(z, x_hat_teacher(z))`
+1. use the shared EDM checkpoint as the frozen teacher
+2. robustify one explicit reflow student on teacher-generated pairs `(z, x_hat_teacher(z))`
 
 `CDRO-RF` also requires the shared EDM warm-start checkpoint and skips the toy-side
 baseline warmup phase entirely.
@@ -61,10 +64,9 @@ to RF after the shared EDM warm start.
 
 Current direct-run behavior:
 
-1. robust RF stage-1 rebuilds the WDRO augmented pool with worst-case samples and
-   trains on RF pairs `(z, x_adv)`
-2. robust RF reflow freezes the stage-1 teacher and trains on one-round reflow pairs
-   `(z, x_hat_teacher(z))`
+1. use the shared EDM checkpoint as the frozen teacher
+2. construct WDRO adversarial reflow pairs against that teacher-generated pair distribution
+3. train one explicit reflow student on those robustified pairs
 
 Implementation notes:
 

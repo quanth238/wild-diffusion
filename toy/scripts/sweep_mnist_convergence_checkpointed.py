@@ -343,7 +343,6 @@ def _build_run_state_signature(*, cfg: ToyConfig, dataset, train_percent: float,
         "lr_theta": float(cfg.lr_theta),
         "training_objective": str(cfg.training_objective),
         "rf_baseline_mode": str(getattr(cfg, "rf_baseline_mode", "strong")),
-        "rf_stage1_fraction": float(getattr(cfg, "rf_stage1_fraction", 0.5)),
         "rf_reflow_t_distribution": str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         "rf_loss": str(getattr(cfg, "rf_loss", "pseudo_huber")),
         "rf_pseudo_huber_delta": float(getattr(cfg, "rf_pseudo_huber_delta", 0.1)),
@@ -918,7 +917,6 @@ def _build_config(args, *, train_percent: float, seed: int) -> ToyConfig:
     cfg.training_objective = str(args.training_objective)
     cfg.baseline_train_backend = str(args.baseline_train_backend)
     cfg.rf_baseline_mode = str(args.rf_baseline_mode)
-    cfg.rf_stage1_fraction = float(args.rf_stage1_fraction)
     cfg.rf_reflow_t_distribution = str(args.rf_reflow_t_distribution)
     cfg.rf_loss = str(args.rf_loss)
     cfg.rf_pseudo_huber_delta = float(args.rf_pseudo_huber_delta)
@@ -1641,7 +1639,6 @@ def build_parser():
     )
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
     parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong", "plain"])
-    parser.add_argument("--rf-stage1-fraction", type=float, default=ToyConfig.rf_stage1_fraction)
     parser.add_argument(
         "--rf-reflow-t-distribution",
         type=str,

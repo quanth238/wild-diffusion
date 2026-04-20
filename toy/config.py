@@ -81,17 +81,17 @@ class ToyConfig:
     clip_phi_grad: float = 1.0
     training_objective: str = "edm"  # edm|score|rf
     score_matching_weight_power: float = 2.0  # lambda(sigma)=sigma^p in score objective
-    # Rectified Flow baseline controls. Public RF runs default to a two-stage
-    # baseline: continuous-time 1-RF pretraining followed by one reflow round.
+    # Rectified Flow baseline controls. Public RF runs follow the RF++-style
+    # explicit reflow protocol: start from the shared EDM checkpoint, use that
+    # checkpoint as the frozen teacher, and train the RF-family student directly
+    # on teacher-generated pairs.
     rf_baseline_mode: str = "strong"  # strong|plain
-    rf_stage1_fraction: float = 0.5  # fallback only when rf_reflow_start_step=0
-    rf_reflow_start_step: int = 0  # explicit shared RF continuation step where reflow begins; 0 -> use fraction
     rf_reflow_t_distribution: str = "u_shaped"  # u_shaped|uniform
     rf_loss: str = "pseudo_huber"  # pseudo_huber|mse
     rf_pseudo_huber_delta: float = 0.1
     rf_edm_init_ckpt_path: str = ""  # required shared EDM warm-start for RF / CDRO-RF / Wild-Diffusion-RF
     rf_continuation_total_steps_override: int = 0  # stable RF continuation budget for resumed checkpoint sweeps
-    rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise
+    rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise; auto now resolves to explicit reflow
     rf_teacher_n_steps_path: int = 40  # shared RF reflow teacher grid; RF++-style default
     rf_eval_n_steps_path: int = 9  # shared RF eval/FID grid; fast RF-family inference default
 
