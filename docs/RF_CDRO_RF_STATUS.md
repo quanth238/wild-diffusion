@@ -26,6 +26,8 @@ Implementation notes:
 - The shared EDM warm start is required through `rf_edm_init_ckpt_path`.
 - The shared RF family reflow/teacher grid now defaults to `rf_teacher_n_steps_path=40`.
 - The shared RF family eval/FID grid now defaults to `rf_eval_n_steps_path=9`.
+- RF-family runs now support one explicit common reflow-start knob through `rf_reflow_start_step`;
+  when left at `0`, the repo falls back to the legacy `rf_stage1_fraction` split.
 
 ## CDRO-RF
 
@@ -96,7 +98,8 @@ Default RF-family step split:
 
 - shared RF teacher / reflow grid: `40`
 - shared RF eval / FID grid: `9`
-- CDRO-RF internal controlled rollout grid: `32`
+- RF-family training grid (`n_steps_path`) is unified at the shared teacher setting for RF runs,
+  so clean RF, Wild-Diffusion-RF, and CDRO-RF now all use `40`.
 
 ## What Is Still Deferred
 

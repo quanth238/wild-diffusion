@@ -44,6 +44,7 @@ from ..shared.sigma import (
     sample_target_indices,
 )
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
+from ..shared.rf_stage import resolve_rf_cdro_stage_steps, resolve_rf_stage_steps
 from ..model_backends.provider import build_model_bundle
 from .utils import (
     compute_terminal_match_stats,
@@ -73,7 +74,7 @@ from ..mainline_baseline import (
 from ..shared.reverse import generated_data_path_index_from_denoiser, sample_rectified_flow_paths_from_source
 from ..trainer import reverse_paths_from_terminal, sample_reverse_paths, train_baseline
 from ..utils import as_jsonable_metrics, ensure_dir, pick_device, set_seed, tensor_to_numpy
-from ..versions.cdro.trainer import _resolve_rf_cdro_pair_source, _resolve_rf_cdro_stage_steps
+from ..versions.cdro.trainer import _resolve_rf_cdro_pair_source
 from ..versions.registry import resolve_method_module
 
 
@@ -387,15 +388,24 @@ def _resolve_cdro_attack_num_steps(cfg) -> tuple[int, str]:
     return legacy, "inner_steps_legacy"
 
 
-def _resolve_rf_cdro_eval_stage(cfg, total_steps: int) -> str:
-    """Resolve which RF stage law should drive final CDRO-RF evaluation grids."""
+def _resolve_rf_eval_stage(cfg, total_steps: int, *, method_name: str) -> str:
+    """Resolve which RF stage law should drive final family evaluation grids."""
 
-    pair_source = _resolve_rf_cdro_pair_source(cfg)
-    stage1_steps, reflow_steps = _resolve_rf_cdro_stage_steps(
-        int(total_steps),
-        float(getattr(cfg, "rf_stage1_fraction", 0.5)),
-        pair_source,
-    )
+    reflow_start_step = int(getattr(cfg, "rf_reflow_start_step", 0) or 0)
+    if str(method_name).strip().lower() == "cdro":
+        pair_source = _resolve_rf_cdro_pair_source(cfg)
+        stage1_steps, reflow_steps = resolve_rf_cdro_stage_steps(
+            int(total_steps),
+            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+            pair_source,
+            reflow_start_step=reflow_start_step,
+        )
+    else:
+        stage1_steps, reflow_steps = resolve_rf_stage_steps(
+            int(total_steps),
+            float(getattr(cfg, "rf_stage1_fraction", 0.5)),
+            reflow_start_step=reflow_start_step,
+        )
     del stage1_steps
     return "rf_reflow" if int(reflow_steps) > 0 else "rf_stage1"
 
@@ -2234,12 +2244,14 @@ def run_experiment(cfg) -> dict:
     robust_steps_for_phase = int(phase_steps["robust_steps"])
     cfg_baseline = replace(cfg, steps=baseline_steps_for_phase)
     cfg_robust = replace(cfg, steps=robust_steps_for_phase)
-    rf_cdro_eval_stage = None
+    objective_is_rf = str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
+    rf_eval_stage = None
     rf_cdro_stage1_t_distribution = None
     rf_cdro_reflow_t_distribution = None
     rf_cdro_eval_t_distribution = None
+    if objective_is_rf:
+        rf_eval_stage = _resolve_rf_eval_stage(cfg_robust, robust_steps_for_phase, method_name=method_name)
     if _is_cdro_rf_port(cfg, method_name):
-        rf_cdro_eval_stage = _resolve_rf_cdro_eval_stage(cfg_robust, robust_steps_for_phase)
         rf_cdro_stage1_t_distribution = resolve_rf_stage_t_distribution(
             "rf_stage1",
             reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
@@ -2249,7 +2261,7 @@ def run_experiment(cfg) -> dict:
             reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
         rf_cdro_eval_t_distribution = resolve_rf_stage_t_distribution(
-            rf_cdro_eval_stage,
+            str(rf_eval_stage or "rf_reflow"),
             reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
         )
     if cfg.sigma_data <= 0:
@@ -2259,7 +2271,6 @@ def run_experiment(cfg) -> dict:
     print(f"[info] sigma_data={cfg.sigma_data:.6f}", flush=True)
     _print_dataset_info(cfg, dataset)
 
-    objective_is_rf = str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf"
     baseline_sigma_levels = _build_family_sigma_levels(cfg, device)
     sigma_levels = baseline_sigma_levels
     eval_sigma_levels = baseline_sigma_levels
@@ -2269,7 +2280,7 @@ def run_experiment(cfg) -> dict:
                 float(cfg.sigma_max),
                 int(cfg.n_steps_path),
                 device=device,
-                stage_name=str(rf_cdro_eval_stage),
+                stage_name=str(rf_eval_stage or "rf_reflow"),
                 reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
             )
         else:
@@ -2282,11 +2293,10 @@ def run_experiment(cfg) -> dict:
                 p_std=cfg.p_std,
             )
     if objective_is_rf:
-        eval_stage_name = str(rf_cdro_eval_stage or "rf_reflow") if method_name == "cdro" else "rf_reflow"
         eval_sigma_levels = _build_rf_eval_sigma_levels(
             cfg,
             device=device,
-            stage_name=eval_stage_name,
+            stage_name=str(rf_eval_stage or "rf_reflow"),
         )
     else:
         eval_sigma_levels = sigma_levels

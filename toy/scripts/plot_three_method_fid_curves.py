@@ -384,8 +384,38 @@ def _phase_boundary_x(*, rows: List[Dict], series_key: str, x_key: str) -> Optio
 def _draw_phase_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: List[str]) -> None:
     if x_key not in ("train_wall_clock_sec", "weighted_compute_units", "compute_budget_be"):
         return
+    family_phase_drawn: set[str] = set()
+    for backbone_family in sorted(
+        {
+            str(next(row for row in rows if row.get("series_key") == series_key).get("backbone_family", ""))
+            for series_key in series_keys
+        }
+    ):
+        family_values = []
+        for series_key in series_keys:
+            sample = next(row for row in rows if row.get("series_key") == series_key)
+            if str(sample.get("backbone_family", "")) != backbone_family:
+                continue
+            boundary_x = _phase_boundary_x(rows=rows, series_key=series_key, x_key=x_key)
+            if boundary_x is not None:
+                family_values.append(float(boundary_x))
+        family_boundary_x = _stable_boundary_x_from_values(family_values)
+        if family_boundary_x is None:
+            continue
+        family_style = FAMILY_STYLE.get(backbone_family, FAMILY_STYLE["rf"])
+        ax.axvline(
+            x=family_boundary_x,
+            color="0.45",
+            linestyle=family_style["linestyle"],
+            linewidth=1.25,
+            alpha=0.5,
+            label=f"{family_style['label']} family warmup end",
+        )
+        family_phase_drawn.add(backbone_family)
     for series_key in series_keys:
         sample = next(row for row in rows if row.get("series_key") == series_key)
+        if str(sample.get("backbone_family", "")) in family_phase_drawn:
+            continue
         boundary_x = _phase_boundary_x(rows=rows, series_key=series_key, x_key=x_key)
         if boundary_x is None:
             continue
@@ -429,15 +459,66 @@ def _stable_series_boundary_x(*, rows: List[Dict], series_key: str, field_name: 
     return float(sum(values) / float(len(values)))
 
 
+def _stable_boundary_x_from_values(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    min_value = min(values)
+    max_value = max(values)
+    tolerance = max(1e-9, 1e-6 * max(1.0, abs(min_value), abs(max_value)))
+    if abs(max_value - min_value) > tolerance:
+        return None
+    return float(sum(values) / float(len(values)))
+
+
 def _draw_rf_boundaries(*, ax, rows: List[Dict], x_key: str, series_keys: List[str]) -> None:
     boundary_specs = (
         ("shared_edm_warm_start", "shared_edm_warm_start_available", "warm-start"),
         ("baseline_rf_reflow_start", "baseline_rf_reflow_start_available", "reflow start"),
         ("robust_rf_reflow_start", "robust_rf_reflow_start_available", "reflow start"),
     )
+    family_boundary_drawn: set[tuple[str, str]] = set()
+    for backbone_family in sorted(
+        {
+            str(next(row for row in rows if row.get("series_key") == series_key).get("backbone_family", ""))
+            for series_key in series_keys
+        }
+    ):
+        family_style = FAMILY_STYLE.get(backbone_family, FAMILY_STYLE["rf"])
+        for boundary_name, availability_field, label_suffix in boundary_specs:
+            field_name = _boundary_series_field(x_key, boundary_name)
+            if field_name is None:
+                continue
+            family_values = []
+            for series_key in series_keys:
+                sample = next(row for row in rows if row.get("series_key") == series_key)
+                if str(sample.get("backbone_family", "")) != backbone_family:
+                    continue
+                boundary_x = _stable_series_boundary_x(
+                    rows=rows,
+                    series_key=series_key,
+                    field_name=field_name,
+                    availability_field=availability_field,
+                )
+                if boundary_x is not None:
+                    family_values.append(float(boundary_x))
+            family_boundary_x = _stable_boundary_x_from_values(family_values)
+            if family_boundary_x is None:
+                continue
+            style = BOUNDARY_STYLE[boundary_name]
+            ax.axvline(
+                x=family_boundary_x,
+                color="0.35",
+                linestyle=style["linestyle"],
+                linewidth=style["linewidth"],
+                alpha=style["alpha"],
+                label=f"{family_style['label']} family {label_suffix}",
+            )
+            family_boundary_drawn.add((backbone_family, boundary_name))
     for series_key in series_keys:
         sample = next(row for row in rows if row.get("series_key") == series_key)
         for boundary_name, availability_field, label_suffix in boundary_specs:
+            if (str(sample.get("backbone_family", "")), boundary_name) in family_boundary_drawn:
+                continue
             if boundary_name == "shared_edm_warm_start" and sample.get("robust_method") != "baseline":
                 continue
             field_name = _boundary_series_field(x_key, boundary_name)
