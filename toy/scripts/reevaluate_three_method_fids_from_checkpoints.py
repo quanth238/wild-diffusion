@@ -1259,6 +1259,7 @@ def _compute_rf_clean_probe_for_model(
         summary["pair_source"] = "teacher_reflow_pairs"
     elif stage_name == "rf_reflow":
         summary["pair_source"] = "straight_clean_pairs_fallback"
+        summary["missing_reason"] = "rf_teacher_unavailable_probe_fallback"
     else:
         summary["pair_source"] = "straight_clean_pairs"
 
