@@ -118,6 +118,17 @@ def _validate_config(cfg: ToyConfig) -> None:
             "--rf-reflow-t-distribution must be one of ('u_shaped', 'uniform'), got "
             f"{cfg.rf_reflow_t_distribution}"
         )
+    if str(getattr(cfg, "rf_edm_teacher_sampler", "")).strip().lower() not in (
+        "ancestral_stochastic",
+        "ancestral_mean_only",
+        "edm_euler",
+        "edm_heun",
+    ):
+        raise ValueError(
+            "--rf-edm-teacher-sampler must be one of "
+            "('ancestral_stochastic', 'ancestral_mean_only', 'edm_euler', 'edm_heun'), got "
+            f"{cfg.rf_edm_teacher_sampler}"
+        )
     if str(cfg.rf_loss).lower() not in ("pseudo_huber", "mse"):
         raise ValueError(f"--rf-loss must be one of ('pseudo_huber', 'mse'), got {cfg.rf_loss}")
     if float(cfg.rf_pseudo_huber_delta) <= 0:
@@ -435,6 +446,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=ToyConfig.rf_cdro_pair_source,
         choices=["auto", "reflow", "data_noise"],
+    )
+    parser.add_argument(
+        "--rf-edm-teacher-sampler",
+        type=str,
+        default=ToyConfig.rf_edm_teacher_sampler,
+        choices=["ancestral_stochastic", "ancestral_mean_only", "edm_euler", "edm_heun"],
     )
     parser.add_argument("--rf-teacher-n-steps-path", type=int, default=ToyConfig.rf_teacher_n_steps_path)
     parser.add_argument("--rf-eval-n-steps-path", type=int, default=ToyConfig.rf_eval_n_steps_path)

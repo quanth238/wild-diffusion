@@ -10,7 +10,11 @@ from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import compute_training_loss, inner_objective_attack_only
 from ...shared.rf_stage import resolve_rf_cdro_stage_steps
 from ...shared.runtime import autocast_context, resolve_amp_dtype
-from ...shared.trainer_common import generate_reflow_pairs
+from ...shared.trainer_common import (
+    generate_reflow_pairs,
+    resolve_rf_teacher_pair_sampling_mode,
+    resolve_rf_teacher_ve_sampler_mode,
+)
 from ...shared.sigma import (
     build_rf_stage_time_quantile_levels,
     resolve_rf_stage_t_distribution,
@@ -84,6 +88,10 @@ def _snapshot_tensor_values(value: torch.Tensor) -> list[float]:
     if snapshot.ndim > 1:
         snapshot = snapshot[0]
     return [float(v.item()) for v in snapshot.reshape(-1)]
+
+
+def _rf_teacher_pair_sampling_mode(cfg, teacher) -> str:
+    return resolve_rf_teacher_pair_sampling_mode(teacher, cfg)
 
 
 def _path_n_steps(sigma_levels: torch.Tensor) -> int:
@@ -633,6 +641,7 @@ def train_trajectory_robust_cdro(
         if rf_pair_teacher is not None:
             history.setdefault("rf_reflow_teacher_refresh_step", 0)
             history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
+            history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
     else:
         if use_stochastic_edm_ladders:
             history["transition_deltas"] = []
@@ -685,11 +694,13 @@ def train_trajectory_robust_cdro(
                     rf_pair_teacher = copy.deepcopy(teacher_source).eval()
                     set_requires_grad(rf_pair_teacher, False)
                     history.setdefault("rf_reflow_teacher_refresh_step", int(step - 1))
+                    history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
                 rf_pair_left, x0 = generate_reflow_pairs(
                     rf_pair_teacher,
                     teacher_pair_sigma_levels,
                     x_data,
                     sample_terminal_batch_fn=None,
+                    ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
                 )
                 reflow_pair_fwd_units = float(max(int(teacher_pair_sigma_levels.numel()) - 1, 0))
                 current_rf_stage = "rf_reflow"

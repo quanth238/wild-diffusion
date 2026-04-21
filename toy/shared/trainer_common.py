@@ -19,6 +19,7 @@ from .objective import (
 from .reverse import (
     generated_data_path_index_from_denoiser,
     reverse_paths_from_terminal,
+    resolve_ve_sampler_mode,
     sample_rectified_flow_paths_from_source,
     sample_reverse_paths,
 )
@@ -107,6 +108,31 @@ def _sample_teacher_terminal_like(
     return x_terminal, float(max(float(terminal_scale), 1e-8))
 
 
+def resolve_rf_teacher_ve_sampler_mode(cfg) -> str:
+    """Resolve the VE sampler used when an EDM teacher emits RF reflow pairs."""
+
+    return resolve_ve_sampler_mode(
+        stochastic=True,
+        sampler_mode=str(getattr(cfg, "rf_edm_teacher_sampler", "ancestral_stochastic")),
+    )
+
+
+def resolve_rf_teacher_pair_sampling_mode(
+    teacher,
+    cfg=None,
+    *,
+    ve_sampler_mode: Optional[str] = None,
+) -> str:
+    """Human-readable teacher pair sampler mode for RF diagnostics."""
+
+    family = str(getattr(teacher, "generative_family", "")).strip().lower()
+    if family == "rectified_flow":
+        return "deterministic_rf_path"
+    if ve_sampler_mode is None:
+        ve_sampler_mode = resolve_rf_teacher_ve_sampler_mode(cfg)
+    return resolve_ve_sampler_mode(stochastic=True, sampler_mode=ve_sampler_mode)
+
+
 @torch.no_grad()
 def generate_reflow_pairs(
     teacher,
@@ -114,6 +140,7 @@ def generate_reflow_pairs(
     x_template: torch.Tensor,
     *,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
+    ve_sampler_mode: str = "ancestral_stochastic",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate one-round reflow pairs `(x_left, x_right)` from a frozen teacher."""
 
@@ -138,11 +165,16 @@ def generate_reflow_pairs(
                 sigma_levels,
                 sample_terminal_batch_fn=sample_terminal_batch_fn,
             )
+            resolved_ve_sampler_mode = resolve_ve_sampler_mode(
+                stochastic=True,
+                sampler_mode=ve_sampler_mode,
+            )
             paths = reverse_paths_from_terminal(
                 denoiser=teacher,
                 x_terminal=x_terminal,
                 sigma_levels=sigma_levels,
-                stochastic=False,
+                stochastic=resolved_ve_sampler_mode == "ancestral_stochastic",
+                sampler_mode=resolved_ve_sampler_mode,
             )
             x_left = x_terminal / float(terminal_scale)
         generated_idx = generated_data_path_index_from_denoiser(teacher)
@@ -199,6 +231,7 @@ def _train_rf_pair_stage(
                 teacher_sigma_levels,
                 x_template,
                 sample_terminal_batch_fn=sample_terminal_batch_fn,
+                ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
             )
             reflow_fwd_units = float(max(int(teacher_sigma_levels.numel()) - 1, 0))
 
@@ -327,6 +360,10 @@ def _train_strong_rf_baseline(
     history["rf_public_baseline"] = "RF"
     history["rf_teacher_family_resolved"] = str(getattr(reflow_teacher, "generative_family", ""))
     history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+    history["rf_teacher_pair_sampling_mode_resolved"] = resolve_rf_teacher_pair_sampling_mode(
+        reflow_teacher,
+        cfg,
+    )
     eval_model = ema_model if ema_model is not None else denoiser
     return history, eval_model
 

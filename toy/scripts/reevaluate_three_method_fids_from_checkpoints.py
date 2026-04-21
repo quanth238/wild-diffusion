@@ -27,7 +27,7 @@ from toy.data_backends.provider import build_dataset_bundle  # noqa: E402
 from toy.model_backends.provider import build_model_bundle  # noqa: E402
 from toy.process_title import apply_process_title, build_process_title, child_process_env  # noqa: E402
 from toy.shared.objective import build_rectified_flow_state, weighted_denoise_loss, weighted_rectified_flow_loss  # noqa: E402
-from toy.shared.reverse import generated_data_path_index_from_denoiser, sample_reverse_paths  # noqa: E402
+from toy.shared.reverse import generated_data_path_index_from_denoiser, resolve_ve_sampler_mode, sample_reverse_paths  # noqa: E402
 from toy.shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype  # noqa: E402
 from toy.shared.sigma import (  # noqa: E402
     build_rf_stage_time_quantile_levels,
@@ -40,7 +40,7 @@ from toy.shared.sigma import (  # noqa: E402
     sample_sigmas_log_normal,
     sample_target_indices,
 )
-from toy.shared.trainer_common import generate_reflow_pairs  # noqa: E402
+from toy.shared.trainer_common import generate_reflow_pairs, resolve_rf_teacher_ve_sampler_mode  # noqa: E402
 from toy.utils import ensure_dir, pick_device, set_seed  # noqa: E402
 
 
@@ -602,6 +602,7 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "p_std",
         "rf_baseline_mode",
         "rf_cdro_pair_source",
+        "rf_edm_teacher_sampler",
         "rf_eval_n_steps_path",
         "rf_loss",
         "rf_pseudo_huber_delta",
@@ -688,6 +689,7 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str)
         str(getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)),
         bool(getattr(cfg, "cdro_eval_stochastic_ladders", False)),
         str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
+        str(getattr(cfg, "rf_edm_teacher_sampler", "ancestral_stochastic")),
         bool(getattr(cfg, "allow_tf32", True)),
         bool(getattr(cfg, "cudnn_benchmark", True)),
         int(getattr(cfg, "eval_seed_offset_metrics", ToyConfig.eval_seed_offset_metrics)),
@@ -978,6 +980,9 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
     if not isinstance(teacher_state_dict, dict):
         teacher_state_dict = None
     teacher_training_objective = str(trainer_state.get("rf_teacher_training_objective", "")).strip().lower()
+    teacher_sampler_mode = str(history.get("rf_teacher_pair_sampling_mode_resolved", "")).strip()
+    if not teacher_sampler_mode and teacher_training_objective == "edm":
+        teacher_sampler_mode = resolve_rf_teacher_ve_sampler_mode(cfg)
     return {
         "stage_name": stage_name,
         "completed_steps": int(completed_steps),
@@ -986,6 +991,7 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
         "t_distribution": str(t_distribution),
         "teacher_state_dict": teacher_state_dict,
         "teacher_training_objective": teacher_training_objective,
+        "teacher_sampler_mode": teacher_sampler_mode,
     }
 
 
@@ -1146,6 +1152,14 @@ def _compute_rf_clean_probe_for_model(
         explicit_training_objective=probe_spec.get("teacher_training_objective"),
         teacher_state_dict=teacher_state_dict if isinstance(teacher_state_dict, dict) else None,
     )
+    teacher_sampler_mode = str(probe_spec.get("teacher_sampler_mode", "")).strip()
+    if teacher_training_objective == "edm":
+        teacher_sampler_mode = resolve_ve_sampler_mode(
+            stochastic=True,
+            sampler_mode=teacher_sampler_mode or resolve_rf_teacher_ve_sampler_mode(ctx.cfg),
+        )
+    else:
+        teacher_sampler_mode = "deterministic_rf_path"
     summary: Dict[str, object] = {
         "enabled": True,
         "supported": True,
@@ -1166,6 +1180,7 @@ def _compute_rf_clean_probe_for_model(
         "t_distribution": t_distribution,
         "pair_source": "",
         "teacher_training_objective": teacher_training_objective,
+        "teacher_sampler_mode": teacher_sampler_mode,
     }
     if str(getattr(ctx.cfg, "training_objective", "edm")).strip().lower() != "rf":
         summary["supported"] = False
@@ -1214,6 +1229,7 @@ def _compute_rf_clean_probe_for_model(
                 teacher_sigma_levels,
                 x0,
                 sample_terminal_batch_fn=ctx.dataset.sample_terminal_batch,
+                ve_sampler_mode=teacher_sampler_mode,
             )
         else:
             x_left = ctx.dataset.sample_terminal_batch(int(x0.shape[0]), 1.0)

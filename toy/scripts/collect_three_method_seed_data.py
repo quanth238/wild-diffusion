@@ -235,6 +235,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=0.1)
     parser.add_argument("--rf-edm-init-ckpt-path", type=str, default="")
     parser.add_argument("--rf-cdro-pair-source", type=str, default="auto", choices=["auto", "reflow", "data_noise"])
+    parser.add_argument(
+        "--rf-edm-teacher-sampler",
+        type=str,
+        default=ToyConfig.rf_edm_teacher_sampler,
+        choices=["ancestral_stochastic", "ancestral_mean_only", "edm_euler", "edm_heun"],
+    )
     parser.add_argument("--rf-teacher-n-steps-path", type=int, default=ToyConfig.rf_teacher_n_steps_path)
     parser.add_argument("--rf-eval-n-steps-path", type=int, default=ToyConfig.rf_eval_n_steps_path)
     parser.add_argument("--eval-samples", type=int, default=2000)
@@ -352,6 +358,8 @@ def _append_rf_cli_args(
             str(args.rf_pseudo_huber_delta),
             "--rf-cdro-pair-source",
             str(args.rf_cdro_pair_source),
+            "--rf-edm-teacher-sampler",
+            str(args.rf_edm_teacher_sampler),
             "--rf-teacher-n-steps-path",
             str(_effective_rf_teacher_n_steps_path(args)),
             "--rf-eval-n-steps-path",
@@ -1340,7 +1348,10 @@ def _baseline_step_weighted_units(calibration: Dict) -> float:
 def _wdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibration: Dict) -> float:
     if str(getattr(args, "training_objective", "edm")).strip().lower() == "rf":
         units = weighted_compute_units(
-            n_fwd=float(_rf_reflow_extra_forward_units(_effective_rf_teacher_n_steps_path(args))),
+            # RF WDRO robust-step accounting should only price the attack/input-grad
+            # and parameter-backward work here. The shared RF reflow teacher forwards
+            # are added once in `_wdro_rf_continuation_weighted_units`.
+            n_fwd=0.0,
             n_fwd_inputgrad=float(max(0.0, min(float(args.wdro_adv_prob), 1.0)) * max(int(args.wdro_attack_steps), 0)),
             n_fwd_parambackward=1.0,
             calibration=calibration,

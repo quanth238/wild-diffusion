@@ -15,7 +15,11 @@ from ...shared.sigma import (
     sample_target_indices,
     sample_target_indices_log_normal,
 )
-from ...shared.trainer_common import generate_reflow_pairs
+from ...shared.trainer_common import (
+    generate_reflow_pairs,
+    resolve_rf_teacher_pair_sampling_mode,
+    resolve_rf_teacher_ve_sampler_mode,
+)
 from ...shared.train_utils import sample_train_batch
 from ...utils import batch_scalar_like, has_nan_or_inf, scalarize
 
@@ -57,6 +61,10 @@ def _sample_rf_t(
             f"Unsupported RF timestep distribution '{distribution}'. Expected one of: uniform, u_shaped."
         )
     return t.clamp(1e-5, 1.0 - 1e-5)
+
+
+def _rf_teacher_pair_sampling_mode(cfg, teacher) -> str:
+    return resolve_rf_teacher_pair_sampling_mode(teacher, cfg)
 
 
 def _train_trajectory_robust_clean_rf(
@@ -132,6 +140,7 @@ def _train_trajectory_robust_clean_rf(
         history.setdefault("rf_reflow_teacher_refresh_step", 0)
         history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
         history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+        history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
         step_t0 = time.perf_counter()
@@ -149,10 +158,12 @@ def _train_trajectory_robust_clean_rf(
             history.setdefault("rf_reflow_teacher_refresh_step", max(int(step - 1), 0))
             history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
             history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+            history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
         x_left, x_right = generate_reflow_pairs(
             rf_pair_teacher,
             teacher_sigma_levels,
             x_right,
+            ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
         )
         reflow_pair_fwd_units = float(max(int(teacher_sigma_levels.numel()) - 1, 0))
         t_distribution = rf_reflow_t_distribution

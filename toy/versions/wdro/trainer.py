@@ -12,7 +12,11 @@ from ...shared.ema import init_ema_model, update_ema_model
 from ...shared.objective import build_rectified_flow_state, compute_training_loss
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import resolve_rf_stage_t_distribution, sample_target_indices, sample_target_indices_log_normal
-from ...shared.trainer_common import generate_reflow_pairs
+from ...shared.trainer_common import (
+    generate_reflow_pairs,
+    resolve_rf_teacher_pair_sampling_mode,
+    resolve_rf_teacher_ve_sampler_mode,
+)
 from ...utils import batch_scalar_like, has_nan_or_inf, scalarize
 
 
@@ -60,6 +64,10 @@ def _sample_rf_t(
             f"Unsupported RF timestep distribution '{distribution}'. Expected one of: uniform, u_shaped."
         )
     return t.clamp(1e-5, 1.0 - 1e-5)
+
+
+def _rf_teacher_pair_sampling_mode(cfg, teacher) -> str:
+    return resolve_rf_teacher_pair_sampling_mode(teacher, cfg)
 
 
 def _wdro_attack_batch(
@@ -318,6 +326,7 @@ def _train_trajectory_robust_wdro_rf(
         history.setdefault("rf_reflow_teacher_refresh_step", 0)
         history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
         history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+        history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
 
     for step in range(int(start_step) + 1, int(cfg.steps) + 1):
         step_t0 = time.perf_counter()
@@ -329,6 +338,7 @@ def _train_trajectory_robust_wdro_rf(
             history.setdefault("rf_reflow_teacher_refresh_step", max(int(step - 1), 0))
             history["rf_teacher_family_resolved"] = str(getattr(rf_pair_teacher, "generative_family", ""))
             history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
+            history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
         x_template = _sample_train_like_batch(
             train_pool=train_pool,
             batch_size=int(cfg.batch_size),
@@ -340,6 +350,7 @@ def _train_trajectory_robust_wdro_rf(
             rf_pair_teacher,
             teacher_sigma_levels,
             x_template,
+            ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
         )
         reflow_pair_fwd_units = float(max(int(teacher_sigma_levels.numel()) - 1, 0))
         attack_applied = bool(
