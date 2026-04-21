@@ -8,12 +8,12 @@ import torch
 from ...app.utils import empty_robust_history
 from ...compute_accounting import append_denoiser_op_count_step, ensure_denoiser_op_count_history
 from ...shared.ema import init_ema_model, update_ema_model
-from ...shared.objective import build_rectified_flow_state, compute_training_loss
+from ...shared.objective import build_rectified_flow_state, build_training_state, compute_training_loss
 from ...shared.runtime import autocast_context, resolve_amp_dtype
 from ...shared.sigma import (
     resolve_rf_stage_t_distribution,
+    sample_sigmas_log_normal,
     sample_target_indices,
-    sample_target_indices_log_normal,
 )
 from ...shared.trainer_common import (
     generate_reflow_pairs,
@@ -21,7 +21,7 @@ from ...shared.trainer_common import (
     resolve_rf_teacher_ve_sampler_mode,
 )
 from ...shared.train_utils import sample_train_batch
-from ...utils import batch_scalar_like, has_nan_or_inf, scalarize
+from ...utils import has_nan_or_inf, scalarize
 
 
 def _is_rf_objective(cfg) -> bool:
@@ -339,16 +339,23 @@ def train_trajectory_robust_clean(
             sample_population_batch_fn=sample_population_batch_fn,
         )
         if cfg.use_log_normal_sigma_sampling:
-            indices = sample_target_indices_log_normal(
+            sigma = sample_sigmas_log_normal(
                 cfg.batch_size,
-                sigma_levels,
+                sigma_min=float(cfg.sigma_min),
+                sigma_max=float(cfg.sigma_max),
+                device=sigma_levels.device,
                 p_mean=cfg.p_mean,
                 p_std=cfg.p_std,
+                dtype=sigma_levels.dtype,
             )
         else:
             indices = sample_target_indices(cfg.batch_size, sigma_levels)
-        sigma = sigma_levels[indices]
-        x_noisy = x0 + batch_scalar_like(sigma, x0) * torch.randn_like(x0)
+            sigma = sigma_levels[indices]
+        x_noisy = build_training_state(
+            cfg=cfg,
+            x_clean=x0,
+            sigma=sigma,
+        )
 
         optimizer_theta.zero_grad(set_to_none=True)
         with autocast_context(sigma_levels.device, amp_dtype):

@@ -689,7 +689,7 @@ def _context_key_for_cfg(cfg: ToyConfig, device: torch.device, method_name: str)
         str(getattr(cfg, "cdro_edm_ladder_mode", DETERMINISTIC_MIDPOINT_QUANTILE_LADDER)),
         bool(getattr(cfg, "cdro_eval_stochastic_ladders", False)),
         str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
-        str(getattr(cfg, "rf_edm_teacher_sampler", "ancestral_stochastic")),
+        str(getattr(cfg, "rf_edm_teacher_sampler", "edm_heun")),
         bool(getattr(cfg, "allow_tf32", True)),
         bool(getattr(cfg, "cudnn_benchmark", True)),
         int(getattr(cfg, "eval_seed_offset_metrics", ToyConfig.eval_seed_offset_metrics)),

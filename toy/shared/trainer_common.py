@@ -113,7 +113,7 @@ def resolve_rf_teacher_ve_sampler_mode(cfg) -> str:
 
     return resolve_ve_sampler_mode(
         stochastic=True,
-        sampler_mode=str(getattr(cfg, "rf_edm_teacher_sampler", "ancestral_stochastic")),
+        sampler_mode=str(getattr(cfg, "rf_edm_teacher_sampler", "edm_heun")),
     )
 
 
@@ -140,7 +140,7 @@ def generate_reflow_pairs(
     x_template: torch.Tensor,
     *,
     sample_terminal_batch_fn: Optional[Callable[[int, float], torch.Tensor]] = None,
-    ve_sampler_mode: str = "ancestral_stochastic",
+    ve_sampler_mode: str = "edm_heun",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate one-round reflow pairs `(x_left, x_right)` from a frozen teacher."""
 

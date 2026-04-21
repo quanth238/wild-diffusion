@@ -30,14 +30,14 @@ from toy.shared.sigma import build_sigma_levels, resolve_rf_teacher_n_steps_path
 from toy.utils import pick_device, set_seed, tensor_to_numpy  # noqa: E402
 
 
-DEFAULT_MODES = ["ancestral_stochastic", "ancestral_mean_only", "edm_heun"]
+DEFAULT_MODES = ["edm_heun", "ancestral_stochastic", "ancestral_mean_only"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Compare EDM teacher sampling modes on one checkpoint using shared terminal noise so "
-            "ancestral stochastic, posterior-mean-only, and EDM Heun can be measured side by side."
+            "EDM Heun, ancestral stochastic, and posterior-mean-only can be measured side by side."
         )
     )
     parser.add_argument("--checkpoint", type=str, required=True)

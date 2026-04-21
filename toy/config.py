@@ -92,7 +92,7 @@ class ToyConfig:
     rf_edm_init_ckpt_path: str = ""  # required shared EDM warm-start for RF / CDRO-RF / Wild-Diffusion-RF
     rf_continuation_total_steps_override: int = 0  # stable RF continuation budget for resumed checkpoint sweeps
     rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise; auto now resolves to explicit reflow
-    rf_edm_teacher_sampler: str = "ancestral_stochastic"  # ancestral_stochastic|ancestral_mean_only|edm_euler|edm_heun
+    rf_edm_teacher_sampler: str = "edm_heun"  # ancestral_stochastic|ancestral_mean_only|edm_euler|edm_heun
     rf_teacher_n_steps_path: int = 40  # shared RF reflow teacher grid; RF++-style default
     rf_eval_n_steps_path: int = 9  # shared RF eval/FID grid; fast RF-family inference default
 
