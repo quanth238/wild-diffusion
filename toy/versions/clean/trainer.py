@@ -142,7 +142,8 @@ def _train_trajectory_robust_clean_rf(
         history["rf_teacher_pair_n_steps_path_resolved"] = int(max(int(teacher_sigma_levels.numel()) - 1, 0))
         history["rf_teacher_pair_sampling_mode_resolved"] = _rf_teacher_pair_sampling_mode(cfg, rf_pair_teacher)
 
-    for step in range(int(start_step) + 1, int(cfg.steps) + 1):
+    total_steps = int(rf_stage_planning_total_steps)
+    for step in range(int(start_step) + 1, int(total_steps) + 1):
         step_t0 = time.perf_counter()
         reflow_pair_fwd_units = 0.0
         x_right = sample_train_batch(
@@ -245,7 +246,7 @@ def _train_trajectory_robust_clean_rf(
     if return_state:
         resume_model_state = copy.deepcopy(denoiser.state_dict())
         trainer_state = {
-            "completed_steps": int(cfg.steps),
+            "completed_steps": int(total_steps),
             "optimizer_theta_state": optimizer_theta.state_dict(),
             "ema_state_dict": None if ema_model is None else copy.deepcopy(ema_model.state_dict()),
             "rf_teacher_state_dict": None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict()),

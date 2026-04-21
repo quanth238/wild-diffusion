@@ -3,7 +3,10 @@ from .trainer import train_trajectory_robust_clean
 
 NAME = "clean"
 IMPLEMENTED = True
-DESCRIPTION = "Baseline EDM continuation from a loaded checkpoint (no control rollout training)."
+DESCRIPTION = (
+    "Baseline continuation path: EDM continues from a checkpoint, and RF mode continues from the shared EDM "
+    "branch via the public --baseline-only path or explicit continuation lineage."
+)
 
 
 def train_trajectory_robust(*args, **kwargs):

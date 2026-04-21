@@ -27,6 +27,7 @@ def rollout_eval(
     sigma_levels,
     control_radius_kappa,
     kappa_by_step=None,
+    rf_pair_left=None,
 ):
     """Evaluation rollout for CDRO using the denoiser-dependent u-space attack."""
 
@@ -42,6 +43,7 @@ def rollout_eval(
         step_size=float(cfg.cdro_step_size),
         total_budget=float(cfg.cdro_total_budget_rho),
         time_horizon=float(cfg.cdro_time_horizon),
+        rf_pair_left=rf_pair_left,
     )
 
 

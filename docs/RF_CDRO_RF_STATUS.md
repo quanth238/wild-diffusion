@@ -100,8 +100,9 @@ Default RF-family step split:
 
 - shared RF teacher / reflow grid: `40`
 - shared RF eval / FID grid: `9`
-- RF-family training grid (`n_steps_path`) is unified at the shared teacher setting for RF runs,
-  so clean RF, Wild-Diffusion-RF, and CDRO-RF now all use `40`.
+- clean RF and Wild-Diffusion-RF normalize their training grid to the shared teacher setting (`40`)
+- CDRO-RF still generates teacher reflow pairs on the shared teacher grid, but its post-pair rollout/training
+  grid is the explicit `n_steps_path` / `cdro_n_steps_path` surface used by rho x N sweeps
 
 ## What Is Still Deferred
 

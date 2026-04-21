@@ -160,9 +160,10 @@ def _build_rf_cdro_stage_grid_info(
         stage_name,
         reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
     )
+    rollout_n_steps = max(int(getattr(cfg, "n_steps_path", 0) or 0), 1)
     sigma_levels = build_rf_stage_time_quantile_levels(
         float(getattr(cfg, "sigma_max", 1.0)),
-        int(resolve_rf_teacher_n_steps_path(cfg)),
+        int(rollout_n_steps),
         device=device,
         stage_name=stage_name,
         reflow_distribution=distribution,
@@ -202,10 +203,11 @@ def _sample_rf_cdro_stage_grid_info(
         stage_name,
         reflow_distribution=str(getattr(cfg, "rf_reflow_t_distribution", "u_shaped")),
     )
+    rollout_n_steps = max(int(getattr(cfg, "n_steps_path", 0) or 0), 1)
     if bool(getattr(cfg, "cdro_per_example_sigma_ladders", True)):
         sigma_levels = sample_rf_stage_time_stratified_levels_batch(
             float(getattr(cfg, "sigma_max", 1.0)),
-            int(resolve_rf_teacher_n_steps_path(cfg)),
+            int(rollout_n_steps),
             device=device,
             batch_size=int(batch_size),
             stage_name=stage_name,
@@ -215,7 +217,7 @@ def _sample_rf_cdro_stage_grid_info(
     else:
         sigma_levels = sample_rf_stage_time_stratified_levels(
             float(getattr(cfg, "sigma_max", 1.0)),
-            int(resolve_rf_teacher_n_steps_path(cfg)),
+            int(rollout_n_steps),
             device=device,
             stage_name=stage_name,
             reflow_distribution=distribution,
@@ -541,6 +543,7 @@ def train_trajectory_robust_cdro(
     step_size = float(cfg.cdro_step_size)
     total_budget = float(cfg.cdro_total_budget_rho)
     time_horizon = float(cfg.cdro_time_horizon)
+    total_steps = int(_resolve_rf_stage_planning_total_steps(cfg) if _is_rf_objective(cfg) else int(cfg.steps))
     path_batch_equiv_evals = _path_batch_equiv_denoiser_evals(sigma_levels)
     cumulative_batch_equiv_evals = (
         float(history["batch_equiv_denoiser_evals_cumulative"][-1])
@@ -669,7 +672,7 @@ def train_trajectory_robust_cdro(
         flush=True,
     )
 
-    for step in range(int(start_step) + 1, int(cfg.steps) + 1):
+    for step in range(int(start_step) + 1, int(total_steps) + 1):
         step_t0 = time.perf_counter()
         x_data = sample_train_batch(
             cfg,
@@ -938,7 +941,7 @@ def train_trajectory_robust_cdro(
 
         run_diag = (
             bool(cfg.collapse_diagnostics_enabled)
-            and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(cfg.steps))
+            and (step % max(int(cfg.collapse_diag_every), 1) == 0 or step == 1 or step == int(total_steps))
         )
         if run_diag:
             if attack_path_enabled:
@@ -1060,7 +1063,7 @@ def train_trajectory_robust_cdro(
     if return_state:
         resume_robust_state_dict = copy.deepcopy(denoiser.state_dict())
         trainer_state = {
-            "completed_steps": int(cfg.steps),
+            "completed_steps": int(total_steps),
             "optimizer_theta_state": optimizer_theta.state_dict(),
             "ema_state_dict": None if ema_model is None else copy.deepcopy(ema_model.state_dict()),
             "rf_teacher_state_dict": None if rf_pair_teacher is None else copy.deepcopy(rf_pair_teacher.state_dict()),

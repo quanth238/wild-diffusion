@@ -161,7 +161,10 @@ def resolve_rf_stage_t_distribution(
     *,
     reflow_distribution: str = "u_shaped",
 ) -> str:
-    """Resolve the clean/robust RF timestep law used by a named training stage."""
+    """Resolve the clean/robust RF timestep law used by a named training stage.
+
+    Legacy aliases remain accepted for backward compatibility with older logs.
+    """
 
     stage = str(stage_name).strip().lower()
     if stage in ("rf_stage1", "stage1", "data_noise"):
@@ -175,7 +178,9 @@ def resolve_rf_stage_t_distribution(
             )
         return mode
     raise ValueError(
-        f"Unsupported RF stage '{stage_name}'. Expected one of: rf_stage1, rf_reflow, stage1, reflow, data_noise."
+        "Unsupported RF stage "
+        f"'{stage_name}'. Expected one of: rf_stage1, rf_reflow, stage1, reflow, data_noise "
+        "(legacy aliases stage1/data_noise remain accepted for compatibility)."
     )
 
 

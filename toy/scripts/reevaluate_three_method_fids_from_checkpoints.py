@@ -175,7 +175,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rf-teacher-n-steps-path-default", type=int, default=ToyConfig.rf_teacher_n_steps_path)
     parser.add_argument("--rf-eval-n-steps-path-default", type=int, default=ToyConfig.rf_eval_n_steps_path)
     parser.add_argument("--cdro-eval-stochastic-ladders", action="store_true")
-    parser.add_argument("--respect-row-n-steps-path", action="store_true")
+    parser.add_argument(
+        "--respect-row-n-steps-path",
+        action="store_true",
+        help="Compatibility no-op: row n_steps_path values are now respected by default.",
+    )
     parser.add_argument("--sigma-min", type=float, default=0.002)
     parser.add_argument("--sigma-max", type=float, default=2.0)
     parser.add_argument("--metrics-eval-seed-offset", type=int, default=ToyConfig.eval_seed_offset_metrics)
@@ -484,18 +488,19 @@ def _load_checkpoint_payload(ckpt_path: str) -> Dict:
 
 
 def _baseline_state_dict_from_payload(payload: Dict, ckpt_path: str) -> Dict[str, torch.Tensor]:
-    if "baseline_state_dict" in payload:
-        state_dict = payload["baseline_state_dict"]
-    elif "state_dict" in payload:
-        state_dict = payload["state_dict"]
-    else:
-        raise RuntimeError(
-            "Missing keys 'baseline_state_dict' and 'state_dict' in baseline checkpoint: "
-            f"{ckpt_path}"
-        )
-    if not isinstance(state_dict, dict):
-        raise RuntimeError(f"Invalid baseline state_dict in checkpoint: {ckpt_path}")
-    return state_dict
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid checkpoint format (expect dict): {ckpt_path}")
+    for key in ("baseline_state_dict", "state_dict", "model_state_dict", "robust_state_dict", "ema_state_dict"):
+        state_dict = payload.get(key)
+        if isinstance(state_dict, dict):
+            return state_dict
+    if payload and all(torch.is_tensor(value) for value in payload.values()):
+        return payload
+    raise RuntimeError(
+        "Could not find a model state dict in checkpoint. Expected one of "
+        "baseline_state_dict, state_dict, model_state_dict, robust_state_dict, ema_state_dict, "
+        f"or a raw tensor state dict: {ckpt_path}"
+    )
 
 
 def _load_baseline_state_dict(ckpt_path: str) -> Dict[str, torch.Tensor]:
@@ -608,7 +613,6 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "rf_loss",
         "rf_pseudo_huber_delta",
         "rf_reflow_t_distribution",
-        "rf_stage1_fraction",
         "rf_teacher_n_steps_path",
         "sigma_data",
         "sigma_max",
@@ -632,12 +636,10 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
         source_cfg = payload.get("config", {})
         if isinstance(source_cfg, dict):
             _apply_cfg_overrides(cfg, source_cfg)
-    if not bool(args.respect_row_n_steps_path):
-        cfg.n_steps_path = int(args.n_steps_path_default)
     effective_training_objective = _effective_eval_training_objective_from_row(row)
     if effective_training_objective:
         cfg.training_objective = str(effective_training_objective)
-    if bool(args.respect_row_n_steps_path) and row.get("n_steps_path"):
+    if row.get("n_steps_path"):
         cfg.n_steps_path = _safe_int(row.get("n_steps_path"), cfg.n_steps_path)
     if row.get("rf_teacher_n_steps_path"):
         cfg.rf_teacher_n_steps_path = _safe_int(row.get("rf_teacher_n_steps_path"), cfg.rf_teacher_n_steps_path)
@@ -1009,11 +1011,17 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
     if not isinstance(teacher_state_dict, dict):
         teacher_state_dict = trainer_state.get("rf_reflow_teacher_state_dict")
     if not isinstance(teacher_state_dict, dict):
+        teacher_state_dict = payload.get("rf_teacher_state_dict")
+    if not isinstance(teacher_state_dict, dict):
         teacher_state_dict = None
-    teacher_training_objective = str(trainer_state.get("rf_teacher_training_objective", "")).strip().lower()
+    teacher_training_objective = str(
+        trainer_state.get("rf_teacher_training_objective", payload.get("rf_teacher_training_objective", ""))
+    ).strip().lower()
     teacher_sampler_mode = str(history.get("rf_teacher_pair_sampling_mode_resolved", "")).strip()
     if teacher_state_dict is None:
-        teacher_ckpt_path = str(getattr(cfg, "rf_edm_init_ckpt_path", "") or "").strip()
+        teacher_ckpt_path = str(
+            payload.get("shared_edm_branch_ckpt_path", getattr(cfg, "rf_edm_init_ckpt_path", "")) or ""
+        ).strip()
         if teacher_ckpt_path and os.path.isfile(teacher_ckpt_path):
             try:
                 teacher_state_dict = _load_baseline_state_dict(teacher_ckpt_path)

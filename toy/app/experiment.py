@@ -44,6 +44,7 @@ from ..shared.sigma import (
     sample_target_indices,
 )
 from ..shared.runtime import autocast_context, configure_runtime, format_amp_dtype, resolve_amp_dtype
+from ..shared.trainer_common import generate_reflow_pairs, resolve_rf_teacher_ve_sampler_mode
 from ..model_backends.provider import build_model_bundle
 from .utils import (
     compute_terminal_match_stats,
@@ -392,6 +393,22 @@ def _resolve_rf_eval_stage(cfg, total_steps: int, *, method_name: str) -> str:
 
     del cfg, total_steps, method_name
     return "rf_reflow"
+
+
+def _resolve_rf_continuation_total_steps(cfg, *, method_name: str) -> int:
+    """Resolve the execution-active total step budget for RF continuation paths."""
+
+    total_steps = max(int(getattr(cfg, "steps", 0)), 0)
+    if bool(getattr(cfg, "baseline_only", False)):
+        return int(total_steps)
+    if str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf":
+        return int(total_steps)
+    if str(method_name).strip().lower() not in {"clean", "wdro", "cdro"}:
+        return int(total_steps)
+    override = int(getattr(cfg, "rf_continuation_total_steps_override", 0) or 0)
+    if override > 0:
+        return int(override)
+    return int(total_steps)
 
 
 def _checkpoint_state_dict_for_rf_init(payload: Any) -> tuple[Dict[str, torch.Tensor], str]:
@@ -1220,6 +1237,50 @@ def _method_rollout_kwargs(cfg, method) -> Dict:
     return {}
 
 
+@torch.no_grad()
+def _prepare_rf_eval_rollout_inputs(
+    *,
+    cfg,
+    dataset: DatasetBundle,
+    x_target: torch.Tensor,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
+) -> Dict[str, Optional[torch.Tensor]]:
+    """Resolve RF-family eval inputs on the intended teacher-reflow pair law."""
+
+    if str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf":
+        return {
+            "x_target": x_target,
+            "rf_pair_left": None,
+            "pair_source": "",
+        }
+    if rf_teacher_model is None:
+        return {
+            "x_target": x_target,
+            "rf_pair_left": None,
+            "pair_source": "straight_clean_pairs_fallback",
+        }
+    teacher_sigma_levels = rf_teacher_sigma_levels if rf_teacher_sigma_levels is not None else build_sigma_levels(
+        float(getattr(cfg, "sigma_min", 0.002)),
+        float(getattr(cfg, "sigma_max", 2.0)),
+        int(resolve_rf_teacher_n_steps_path(cfg)),
+        device=x_target.device,
+    )
+    teacher_sigma_levels = teacher_sigma_levels.to(device=x_target.device, dtype=x_target.dtype)
+    rf_pair_left, rf_pair_right = generate_reflow_pairs(
+        rf_teacher_model,
+        teacher_sigma_levels,
+        x_target,
+        sample_terminal_batch_fn=dataset.sample_terminal_batch,
+        ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
+    )
+    return {
+        "x_target": rf_pair_right,
+        "rf_pair_left": rf_pair_left,
+        "pair_source": "teacher_reflow_pairs",
+    }
+
+
 def _rollout_for_eval(
     *,
     cfg,
@@ -1231,20 +1292,33 @@ def _rollout_for_eval(
     kappa_by_step: torch.Tensor,
     rollout_kwargs: Dict,
     attack_net,
+    rf_pair_left: Optional[torch.Tensor] = None,
 ):
     """Method-aware eval rollout with optional method-specific override."""
 
     rollout_eval_fn = getattr(method, "rollout_eval", None)
     if callable(rollout_eval_fn):
-        return rollout_eval_fn(
-            cfg=cfg,
-            x0=x0,
-            target_indices=target_indices,
-            attack_net=attack_net,
-            sigma_levels=sigma_levels,
-            control_radius_kappa=cfg.control_radius_kappa,
-            kappa_by_step=kappa_by_step,
-        )
+        try:
+            return rollout_eval_fn(
+                cfg=cfg,
+                x0=x0,
+                target_indices=target_indices,
+                attack_net=attack_net,
+                sigma_levels=sigma_levels,
+                control_radius_kappa=cfg.control_radius_kappa,
+                kappa_by_step=kappa_by_step,
+                rf_pair_left=rf_pair_left,
+            )
+        except TypeError:
+            return rollout_eval_fn(
+                cfg=cfg,
+                x0=x0,
+                target_indices=target_indices,
+                attack_net=attack_net,
+                sigma_levels=sigma_levels,
+                control_radius_kappa=cfg.control_radius_kappa,
+                kappa_by_step=kappa_by_step,
+            )
     try:
         return method.rollout_controlled_ve(
             x0=x0,
@@ -1255,6 +1329,7 @@ def _rollout_for_eval(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
             cfg=cfg,
+            rf_pair_left=rf_pair_left,
             **rollout_kwargs,
         )
     except TypeError:
@@ -1266,6 +1341,7 @@ def _rollout_for_eval(
             grad_through_control=False,
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
+            rf_pair_left=rf_pair_left,
             **rollout_kwargs,
         )
 
@@ -1502,7 +1578,7 @@ def _resolve_phase_steps(
 ) -> Dict[str, Any]:
     """Resolve baseline/robust step budgets while preserving legacy behavior."""
 
-    total_steps = int(cfg.steps)
+    total_steps = int(_resolve_rf_continuation_total_steps(cfg, method_name=method_name))
     baseline_steps_override = int(getattr(cfg, "baseline_steps_override", 0))
     baseline_steps = int(cfg.baseline_steps_override) if baseline_steps_override > 0 else total_steps
     robust_steps = total_steps
@@ -1790,6 +1866,9 @@ def _save_baseline_checkpoint(
     baseline_history: Dict,
     signature: Dict,
     baseline_runtime: Optional[Dict[str, Any]] = None,
+    rf_teacher_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+    rf_teacher_training_objective: str = "",
+    shared_edm_branch_ckpt_path: str = "",
 ) -> None:
     """Persist baseline eval model + history + signature for later fair reuse."""
 
@@ -1801,6 +1880,9 @@ def _save_baseline_checkpoint(
         "baseline_history": baseline_history,
         "baseline_state_dict": baseline_eval.state_dict(),
         "baseline_runtime": baseline_runtime,
+        "rf_teacher_state_dict": rf_teacher_state_dict,
+        "rf_teacher_training_objective": str(rf_teacher_training_objective or ""),
+        "shared_edm_branch_ckpt_path": _normalize_checkpoint_identity_path(shared_edm_branch_ckpt_path),
     }
     tmp_path = f"{ckpt_path}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
     torch.save(payload, tmp_path)
@@ -1902,6 +1984,8 @@ def _build_baseline_gate(
     method,
     rollout_kwargs: Dict,
     amp_dtype,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ) -> Dict:
     """Compute baseline acceptance gate metrics before robust phase.
 
@@ -1917,18 +2001,27 @@ def _build_baseline_gate(
     sigma_levels_gate = sigma_levels[: gate_terminal_step + 1]
 
     x_gate = dataset.sample_val_batch(cfg.debug_eval_batch)
-    idx_gate = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
+    gate_inputs = _prepare_rf_eval_rollout_inputs(
+        cfg=cfg,
+        dataset=dataset,
+        x_target=x_gate,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    x_gate_target = gate_inputs["x_target"]
+    idx_gate = sample_target_indices(int(x_gate_target.shape[0]), sigma_levels)
     with autocast_context(x_gate.device, amp_dtype):
         gate_roll = _rollout_for_eval(
             cfg=cfg,
             method=method,
-            x0=x_gate,
+            x0=x_gate_target,
             target_indices=idx_gate,
             control=control,
             sigma_levels=sigma_levels,
             kappa_by_step=kappa_by_step,
             rollout_kwargs=rollout_kwargs,
             attack_net=baseline_eval,
+            rf_pair_left=gate_inputs["rf_pair_left"],
         )
         gate_ref_paths = gate_roll.states_ref[:, : gate_terminal_step + 1]
         if str(getattr(cfg, "training_objective", "edm")).strip().lower() == "rf":
@@ -1948,7 +2041,9 @@ def _build_baseline_gate(
             )
             gate_endpoint = gate_rev_det[:, 0]
     gate_endpoint_mode_metrics = dataset.evaluate_sample_metrics(tensor_to_numpy(gate_endpoint))
-    gate_endpoint_recovery_mse = float((gate_endpoint - x_gate).reshape(x_gate.shape[0], -1).pow(2).mean().item())
+    gate_endpoint_recovery_mse = float(
+        (gate_endpoint - x_gate_target).reshape(x_gate_target.shape[0], -1).pow(2).mean().item()
+    )
     with autocast_context(x_gate.device, amp_dtype):
         gate_gen_paths = sample_reverse_paths(
             denoiser=baseline_eval,
@@ -1990,6 +2085,8 @@ def _run_robust_phase(
     """Execute or skip robust training depending on baseline-only mode and gate status."""
 
     attack_training_executed = False
+    method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
+    target_total_steps = _resolve_rf_continuation_total_steps(cfg, method_name=method_name)
     if cfg.baseline_only:
         with torch.no_grad():
             for p in control.parameters():
@@ -2010,21 +2107,20 @@ def _run_robust_phase(
                 p.zero_()
         return False, empty_robust_history(), robust, None
 
-    if int(cfg.steps) <= 0:
+    if int(target_total_steps) <= 0:
         with torch.no_grad():
             for p in control.parameters():
                 p.zero_()
         return False, empty_robust_history(), robust, None
 
     trainer_kwargs: Dict[str, Any] = {}
-    method_name = str(getattr(method, "NAME", cfg.method_version)).lower()
     if robust_resume_payload is not None:
         trainer_state_in = robust_resume_payload.get("trainer_state", {})
         completed_steps = int(
             robust_resume_payload.get("completed_steps", trainer_state_in.get("completed_steps", 0))
         )
         history_init = robust_resume_payload.get("history_robust", empty_robust_history())
-        if completed_steps >= int(cfg.steps):
+        if completed_steps >= int(target_total_steps):
             return True, history_init, robust, trainer_state_in
         if method_name in ("clean", "v2", "wild", "wdro", "v1.1", "1.1", "cdro"):
             trainer_kwargs["start_step"] = int(completed_steps)
@@ -2439,6 +2535,8 @@ def run_experiment(cfg) -> dict:
             cfg,
             sample_batch_fn=dataset.sample_population_batch,
             method=method,
+            rf_teacher_model=rf_teacher_model,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels,
         )
         runtime_sec["preflight"] = float(time.perf_counter() - t_phase)
         print("[check] preflight passed", flush=True)
@@ -2573,6 +2671,19 @@ def run_experiment(cfg) -> dict:
                         "step": int(baseline_steps_for_phase),
                         "train_wall_clock_sec": float(runtime_sec["baseline_train"]),
                     },
+                    rf_teacher_state_dict=(
+                        None if rf_teacher_model is None else copy.deepcopy(rf_teacher_model.state_dict())
+                    ),
+                    rf_teacher_training_objective=(
+                        ""
+                        if rf_teacher_model is None
+                        else (
+                            "rf"
+                            if str(getattr(rf_teacher_model, "generative_family", "")).lower() == "rectified_flow"
+                            else "edm"
+                        )
+                    ),
+                    shared_edm_branch_ckpt_path=str(getattr(cfg, "rf_edm_init_ckpt_path", "") or ""),
                 )
                 runtime_sec["baseline_ckpt_save"] += float(time.perf_counter() - t_phase)
                 baseline_ckpt_saved = True
@@ -2638,6 +2749,8 @@ def run_experiment(cfg) -> dict:
                 method=method,
                 rollout_kwargs=rollout_kwargs,
                 amp_dtype=amp_dtype,
+                rf_teacher_model=rf_teacher_model,
+                rf_teacher_sigma_levels=rf_teacher_sigma_levels,
             )
 
         baseline_gate = _run_with_scoped_seed(
@@ -2679,52 +2792,70 @@ def run_experiment(cfg) -> dict:
 
     # Evaluate denoise curves on train-pool and held-out pools to expose overfitting under limited data.
     x_train_eval = dataset.sample_train_batch(cfg.debug_eval_batch)
-    idx_train_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
+    train_eval_inputs = _prepare_rf_eval_rollout_inputs(
+        cfg=cfg,
+        dataset=dataset,
+        x_target=x_train_eval,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    x_train_target = train_eval_inputs["x_target"]
+    idx_train_eval = sample_target_indices(int(x_train_target.shape[0]), sigma_levels)
     with autocast_context(device, amp_dtype):
         train_roll = _rollout_for_eval(
             cfg=cfg,
             method=method,
-            x0=x_train_eval,
+            x0=x_train_target,
             target_indices=idx_train_eval,
             control=control,
             sigma_levels=sigma_levels,
             kappa_by_step=kappa_by_step,
             rollout_kwargs=rollout_kwargs,
             attack_net=robust,
+            rf_pair_left=train_eval_inputs["rf_pair_left"],
         )
         denoise_error_curves_train = compute_denoise_error_curves(
             baseline_model=baseline_eval,
             robust_model=robust,
-            x0=x_train_eval,
+            x0=x_train_target,
             states_ref=train_roll.states_ref,
             states_ctrl=train_roll.states_ctrl,
             sigma_levels=sigma_levels,
         )
 
     x_val_eval = dataset.sample_val_batch(cfg.debug_eval_batch)
-    idx_val_eval = sample_target_indices(cfg.debug_eval_batch, sigma_levels)
+    val_eval_inputs = _prepare_rf_eval_rollout_inputs(
+        cfg=cfg,
+        dataset=dataset,
+        x_target=x_val_eval,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    x_val_target = val_eval_inputs["x_target"]
+    idx_val_eval = sample_target_indices(int(x_val_target.shape[0]), sigma_levels)
     with autocast_context(device, amp_dtype):
         val_roll = _rollout_for_eval(
             cfg=cfg,
             method=method,
-            x0=x_val_eval,
+            x0=x_val_target,
             target_indices=idx_val_eval,
             control=control,
             sigma_levels=sigma_levels,
             kappa_by_step=kappa_by_step,
             rollout_kwargs=rollout_kwargs,
             attack_net=robust,
+            rf_pair_left=val_eval_inputs["rf_pair_left"],
         )
         denoise_error_curves_val = compute_denoise_error_curves(
             baseline_model=baseline_eval,
             robust_model=robust,
-            x0=x_val_eval,
+            x0=x_val_target,
             states_ref=val_roll.states_ref,
             states_ctrl=val_roll.states_ctrl,
             sigma_levels=sigma_levels,
         )
     denoise_error_curves = denoise_error_curves_val
-    x_demo = x_val_eval
+    x_demo = x_val_target
     demo_roll = val_roll
     n_steps = int(sigma_levels.numel() - 1)
     terminal_step = cfg.debug_terminal_step

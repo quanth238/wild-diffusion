@@ -1,5 +1,5 @@
 import copy
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -7,6 +7,7 @@ from .data import sample_gmm
 from .models import set_requires_grad
 from .shared.objective import compute_training_loss, inner_objective_attack_only
 from .shared.sigma import sample_target_indices
+from .shared.trainer_common import generate_reflow_pairs, resolve_rf_teacher_ve_sampler_mode
 from .versions.registry import resolve_method_module
 
 
@@ -27,6 +28,29 @@ def _sample_check_batch(cfg, batch_size: int, centers=None, sample_batch_fn=None
     if centers is None:
         raise ValueError("centers must be provided when no sample_batch_fn is available for checks.")
     return sample_gmm(batch_size, centers, cfg.data_std)
+
+
+@torch.no_grad()
+def _prepare_rf_check_rollout_inputs(
+    cfg,
+    x_target: torch.Tensor,
+    *,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Resolve RF preflight batches on the intended teacher-reflow pair law."""
+
+    if str(getattr(cfg, "training_objective", "edm")).strip().lower() != "rf":
+        return x_target, None
+    if rf_teacher_model is None or rf_teacher_sigma_levels is None:
+        return x_target, None
+    x_left, x_right = generate_reflow_pairs(
+        rf_teacher_model,
+        rf_teacher_sigma_levels,
+        x_target,
+        ve_sampler_mode=resolve_rf_teacher_ve_sampler_mode(cfg),
+    )
+    return x_right, x_left
 
 
 def _finite_difference_scalar(loss_fn, param: torch.Tensor, idx: Tuple[int, ...], eps: float) -> float:
@@ -62,13 +86,28 @@ def _argmax_abs_index(tensor: torch.Tensor) -> Tuple[int, ...]:
     return tuple(torch.unravel_index(torch.tensor(flat_idx), tensor.shape))
 
 
-def sanity_check_rollout(control, centers, sigma_levels, cfg, sample_batch_fn=None, method=None) -> Dict[str, float]:
+def sanity_check_rollout(
+    control,
+    centers,
+    sigma_levels,
+    cfg,
+    sample_batch_fn=None,
+    method=None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
     """Quick rollout sanity: shape consistency + control magnitude diagnostics."""
 
     if method is None:
         method = resolve_method_module(cfg.method_version)
     x0 = _sample_check_batch(cfg, 64, centers=centers, sample_batch_fn=sample_batch_fn)
-    idx = sample_target_indices(64, sigma_levels)
+    x_target, rf_pair_left = _prepare_rf_check_rollout_inputs(
+        cfg,
+        x0,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    idx = sample_target_indices(int(x_target.shape[0]), sigma_levels)
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -81,15 +120,16 @@ def sanity_check_rollout(control, centers, sigma_levels, cfg, sample_batch_fn=No
     roll = _rollout_controlled_ve_with_cfg(
         method,
         cfg,
-        x0,
+        x_target,
         idx,
         control,
         sigma_levels,
         grad_through_control=False,
         control_radius_kappa=cfg.control_radius_kappa,
         kappa_by_step=kappa_by_step,
+        rf_pair_left=rf_pair_left,
     )
-    assert roll.x_target.shape == x0.shape
+    assert roll.x_target.shape == x_target.shape
     assert roll.sigma_target.shape == idx.shape
     assert roll.states_ref is not None and roll.states_ctrl is not None and roll.delta_path is not None
     flat_dev = (roll.states_ctrl - roll.states_ref).reshape(roll.states_ref.shape[0], roll.states_ref.shape[1], -1)
@@ -121,6 +161,8 @@ def gradient_check_denoiser(
     cfg,
     sample_batch_fn=None,
     method=None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """Compare autodiff vs finite-difference gradient for denoiser objective."""
 
@@ -131,8 +173,17 @@ def gradient_check_denoiser(
     set_requires_grad(control, False)
 
     x0 = _sample_check_batch(cfg, 32, centers=centers, sample_batch_fn=sample_batch_fn)
-    idx = sample_target_indices(32, sigma_levels)
-    eps_schedule = torch.randn((sigma_levels.numel() - 1, x0.shape[0], *x0.shape[1:]), device=x0.device)
+    x_target, rf_pair_left = _prepare_rf_check_rollout_inputs(
+        cfg,
+        x0,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    idx = sample_target_indices(int(x_target.shape[0]), sigma_levels)
+    eps_schedule = torch.randn(
+        (sigma_levels.numel() - 1, x_target.shape[0], *x_target.shape[1:]),
+        device=x_target.device,
+    )
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -147,7 +198,7 @@ def gradient_check_denoiser(
         roll = _rollout_controlled_ve_with_cfg(
             method,
             cfg,
-            x0,
+            x_target,
             idx,
             control,
             sigma_levels,
@@ -155,12 +206,13 @@ def gradient_check_denoiser(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
+            rf_pair_left=rf_pair_left,
         )
         return compute_training_loss(
             cfg,
             denoiser,
             roll.x_target,
-            x0,
+            x_target,
             roll.sigma_target,
             x_left=getattr(roll, "x_left", None),
             x_right=getattr(roll, "x_right", None),
@@ -191,6 +243,8 @@ def gradient_check_control(
     cfg,
     sample_batch_fn=None,
     method=None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """Compare autodiff vs finite-difference gradient for inner control objective."""
 
@@ -201,8 +255,17 @@ def gradient_check_control(
     set_requires_grad(control, True)
 
     x0 = _sample_check_batch(cfg, 32, centers=centers, sample_batch_fn=sample_batch_fn)
-    idx = sample_target_indices(32, sigma_levels)
-    eps_schedule = torch.randn((sigma_levels.numel() - 1, x0.shape[0], *x0.shape[1:]), device=x0.device)
+    x_target, rf_pair_left = _prepare_rf_check_rollout_inputs(
+        cfg,
+        x0,
+        rf_teacher_model=rf_teacher_model,
+        rf_teacher_sigma_levels=rf_teacher_sigma_levels,
+    )
+    idx = sample_target_indices(int(x_target.shape[0]), sigma_levels)
+    eps_schedule = torch.randn(
+        (sigma_levels.numel() - 1, x_target.shape[0], *x_target.shape[1:]),
+        device=x_target.device,
+    )
     kappa_by_step = method.build_kappa_schedule(
         sigma_levels=sigma_levels,
         base_kappa=cfg.control_radius_kappa,
@@ -217,7 +280,7 @@ def gradient_check_control(
         roll = _rollout_controlled_ve_with_cfg(
             method,
             cfg,
-            x0,
+            x_target,
             idx,
             control,
             sigma_levels,
@@ -225,12 +288,13 @@ def gradient_check_control(
             control_radius_kappa=cfg.control_radius_kappa,
             kappa_by_step=kappa_by_step,
             eps_schedule=eps_schedule,
+            rf_pair_left=rf_pair_left,
         )
         train_loss = compute_training_loss(
             cfg,
             denoiser,
             roll.x_target,
-            x0,
+            x_target,
             roll.sigma_target,
             x_left=getattr(roll, "x_left", None),
             x_right=getattr(roll, "x_right", None),
@@ -267,7 +331,17 @@ def gradient_check_control(
     }
 
 
-def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_batch_fn=None, method=None) -> Dict:
+def run_preflight_checks(
+    denoiser,
+    control,
+    centers,
+    sigma_levels,
+    cfg,
+    sample_batch_fn=None,
+    method=None,
+    rf_teacher_model=None,
+    rf_teacher_sigma_levels: Optional[torch.Tensor] = None,
+) -> Dict:
     """Numerical preflight checks run on CPU/float64 copies before training."""
 
     if method is None:
@@ -282,6 +356,13 @@ def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_b
     control_chk = copy.deepcopy(control).to("cpu").to(torch.float64)
     centers_chk = None if centers is None else centers.detach().to("cpu").to(torch.float64)
     sigma_levels_chk = sigma_levels.detach().to("cpu").to(torch.float64)
+    rf_teacher_model_chk = None
+    rf_teacher_sigma_levels_chk = None
+    if rf_teacher_model is not None:
+        rf_teacher_model_chk = copy.deepcopy(rf_teacher_model).to("cpu").to(torch.float64)
+        rf_teacher_model_chk.eval()
+    if rf_teacher_sigma_levels is not None:
+        rf_teacher_sigma_levels_chk = rf_teacher_sigma_levels.detach().to("cpu").to(torch.float64)
 
     def sample_batch_chk(batch_size: int) -> torch.Tensor:
         if sample_batch_fn is None:
@@ -296,6 +377,8 @@ def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_b
             cfg,
             sample_batch_fn=sample_batch_chk,
             method=method,
+            rf_teacher_model=rf_teacher_model_chk,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels_chk,
         ),
         "gradcheck_denoiser": gradient_check_denoiser(
             denoiser_chk,
@@ -305,6 +388,8 @@ def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_b
             cfg,
             sample_batch_fn=sample_batch_chk,
             method=method,
+            rf_teacher_model=rf_teacher_model_chk,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels_chk,
         ),
         "gradcheck_control": gradient_check_control(
             denoiser_chk,
@@ -314,6 +399,8 @@ def run_preflight_checks(denoiser, control, centers, sigma_levels, cfg, sample_b
             cfg,
             sample_batch_fn=sample_batch_chk,
             method=method,
+            rf_teacher_model=rf_teacher_model_chk,
+            rf_teacher_sigma_levels=rf_teacher_sigma_levels_chk,
         ),
     }
 

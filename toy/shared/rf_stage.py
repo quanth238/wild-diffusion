@@ -29,7 +29,10 @@ def resolve_rf_cdro_stage_steps(
     *,
     reflow_start_step: int = 0,
 ) -> tuple[int, int]:
-    """Resolve CDRO-RF as explicit shared-teacher reflow only."""
+    """Resolve CDRO-RF as explicit shared-teacher reflow only.
+
+    Legacy pair-source aliases remain accepted for backward compatibility.
+    """
 
     total_steps_value = max(int(total_steps), 0)
     mode = str(pair_source).strip().lower()
