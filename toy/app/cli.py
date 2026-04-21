@@ -540,6 +540,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collapse-delta-ratio-tol", type=float, default=ToyConfig.collapse_delta_ratio_tol)
     parser.add_argument("--constraint-saturation-threshold", type=float, default=ToyConfig.constraint_saturation_threshold)
     parser.add_argument("--collapse-v-l2-tol", type=float, default=None)
+    parser.add_argument("--enable-collapse-diagnostics", action="store_true")
     parser.add_argument("--disable-collapse-diagnostics", action="store_true")
     parser.add_argument("--baseline-gate-enabled", action="store_true", default=ToyConfig.baseline_gate_enabled)
     parser.add_argument("--disable-baseline-gate", action="store_true")
@@ -596,6 +597,7 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
     disable_ema_rampup = bool(args_dict.pop("disable_ema_rampup"))
     disable_limited_data = bool(args_dict.pop("disable_limited_data"))
     disable_mnist_percent_split = bool(args_dict.pop("disable_mnist_percent_split"))
+    enable_collapse_diagnostics = bool(args_dict.pop("enable_collapse_diagnostics"))
     disable_collapse_diagnostics = bool(args_dict.pop("disable_collapse_diagnostics"))
     disable_time_dependent_kappa = bool(args_dict.pop("disable_time_dependent_kappa"))
     disable_kappa_preserve_l2_budget = bool(args_dict.pop("disable_kappa_preserve_l2_budget"))
@@ -635,6 +637,8 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.limited_data_enabled = False
     if disable_mnist_percent_split:
         cfg.mnist_use_percent_split = False
+    if enable_collapse_diagnostics:
+        cfg.collapse_diagnostics_enabled = True
     if disable_collapse_diagnostics:
         cfg.collapse_diagnostics_enabled = False
     if disable_time_dependent_kappa:

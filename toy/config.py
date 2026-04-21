@@ -142,7 +142,7 @@ class ToyConfig:
     warmup_ramp_steps: int = 600
     warmup_attack_weight_start: float = 0.0
     warmup_phi_lr_scale_start: float = 0.0
-    collapse_diagnostics_enabled: bool = True
+    collapse_diagnostics_enabled: bool = False
     collapse_diag_every: int = 100
     collapse_gap_ratio_tol: float = 0.05
     collapse_delta_ratio_tol: float = 0.05

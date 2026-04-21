@@ -2309,7 +2309,11 @@ def _extract_cdro_row(
         robust_logging_only_forward_count_excluded = adjusted_cdro_weighted[
             "robust_logging_only_forward_count_excluded"
         ]
-        weighted_compute_source = "cdro_adjusted_excluding_logging_forward"
+        weighted_compute_source = (
+            "cdro_adjusted_excluding_logging_forward"
+            if float(robust_logging_only_forward_count_excluded or 0.0) > 0.0
+            else "metrics_payload_cdro_no_adjustment_needed"
+        )
     train_wall_clock_sec = compute_accounting.get("train_wall_clock_sec", runtime.get("train_wall_clock_sec"))
     if train_wall_clock_sec is None:
         train_wall_clock_sec = runtime.get("effective_train_total")
@@ -2718,6 +2722,79 @@ def _shared_warmup_artifact_from_baseline_rows(
             "shared_source_method": "baseline",
         },
     }
+
+
+def _rf_baseline_raw_rows_support_full_reuse(
+    *,
+    rows: List[Dict],
+    seeds: List[int],
+    fixed_warmup_steps: int,
+    trajectory_total_steps_max: int,
+    comparison_steps: List[int],
+    target_rf_teacher_n_steps_path: int,
+    target_rf_eval_n_steps_path: int,
+) -> Tuple[bool, str]:
+    expected_robust_steps = sorted(
+        int(step) for step in comparison_steps if int(step) > int(fixed_warmup_steps)
+    )
+    if not expected_robust_steps:
+        return False, "missing_expected_rf_robust_steps"
+    for seed in seeds:
+        seed_rows = [dict(row) for row in rows if int(row["seed"]) == int(seed)]
+        if not seed_rows:
+            return False, f"missing_seed_{int(seed)}"
+        warmup_rows = [
+            row for row in seed_rows if str(row.get("row_origin", "")) == "trajectory_warmup_phase"
+        ]
+        if not warmup_rows:
+            return False, f"missing_warmup_rows_seed_{int(seed)}"
+        robust_rows = [
+            row for row in seed_rows if str(row.get("row_origin", "")) == "trajectory_robust_phase"
+        ]
+        if not robust_rows:
+            return False, f"missing_robust_rows_seed_{int(seed)}"
+        robust_steps = sorted(int(row["step"]) for row in robust_rows)
+        if robust_steps != expected_robust_steps:
+            return False, f"robust_step_mismatch_seed_{int(seed)}"
+        objectives = {str(row.get("training_objective", "")).strip().lower() for row in seed_rows}
+        if objectives != {"rf"}:
+            return False, f"training_objective_mismatch_seed_{int(seed)}_{sorted(objectives)}"
+        try:
+            reused_total_steps = _uniform_int_field_from_rows(
+                rows=seed_rows,
+                field_name="trajectory_total_steps_max",
+                context=f"reused RF baseline raw CSV seed={int(seed)}",
+            )
+        except RuntimeError as exc:
+            return False, f"trajectory_total_steps_missing_seed_{int(seed)}: {exc}"
+        if int(reused_total_steps) != int(trajectory_total_steps_max):
+            return False, (
+                f"trajectory_total_steps_mismatch_seed_{int(seed)}_"
+                f"{int(reused_total_steps)}_vs_{int(trajectory_total_steps_max)}"
+            )
+        teacher_values = {
+            int(parsed)
+            for row in seed_rows
+            for parsed in [_optional_int(row.get("rf_teacher_n_steps_path"))]
+            if parsed is not None and int(parsed) > 0
+        }
+        if teacher_values and teacher_values != {int(target_rf_teacher_n_steps_path)}:
+            return False, (
+                f"rf_teacher_n_steps_path_mismatch_seed_{int(seed)}_"
+                f"{sorted(teacher_values)}_vs_{int(target_rf_teacher_n_steps_path)}"
+            )
+        eval_values = {
+            int(parsed)
+            for row in seed_rows
+            for parsed in [_optional_int(row.get("rf_eval_n_steps_path"))]
+            if parsed is not None and int(parsed) > 0
+        }
+        if eval_values and eval_values != {int(target_rf_eval_n_steps_path)}:
+            return False, (
+                f"rf_eval_n_steps_path_mismatch_seed_{int(seed)}_"
+                f"{sorted(eval_values)}_vs_{int(target_rf_eval_n_steps_path)}"
+            )
+    return True, ""
 
 
 def _build_baseline_sweep_cmd(
@@ -3747,10 +3824,24 @@ def main() -> None:
     baseline_all_eval_rows: List[Dict] = []
     baseline_seed_manifests: List[Dict] = []
     shared_warmup_artifacts_by_seed: Dict[int, Dict[str, object]] = {}
+    rf_full_baseline_raw_reuse_enabled = False
+    rf_full_baseline_raw_reuse_reason = ""
     baseline_runs_csv = reused_baseline_runs_csv or None
     baseline_agg_csv = reused_baseline_aggregate_csv or None
     if shared_baseline_warm_start_enabled:
-        if reused_baseline_raw_csv and not objective_is_rf:
+        if reused_baseline_raw_csv and objective_is_rf:
+            rf_full_baseline_raw_reuse_enabled, rf_full_baseline_raw_reuse_reason = (
+                _rf_baseline_raw_rows_support_full_reuse(
+                    rows=reused_baseline_raw_rows_cache,
+                    seeds=seeds,
+                    fixed_warmup_steps=int(shared_robust_fixed_warmup_steps),
+                    trajectory_total_steps_max=int(baseline_trajectory_total_steps_max),
+                    comparison_steps=baseline_curve_steps,
+                    target_rf_teacher_n_steps_path=int(_effective_rf_teacher_n_steps_path(args)),
+                    target_rf_eval_n_steps_path=int(_effective_rf_eval_n_steps_path(args)),
+                )
+            )
+        if reused_baseline_raw_csv and (not objective_is_rf or rf_full_baseline_raw_reuse_enabled):
             print(
                 "[collect-weighted] baseline "
                 f"warmup_mode=shared_exact_clean_resume fixed_warmup_steps={int(shared_robust_fixed_warmup_steps)} "
@@ -3810,6 +3901,12 @@ def main() -> None:
                     }
                 )
         else:
+            if reused_baseline_raw_csv and objective_is_rf:
+                print(
+                    "[collect-weighted] baseline full RF raw reuse unavailable; "
+                    f"falling back to shared-warmup-only reuse because {rf_full_baseline_raw_reuse_reason}",
+                    flush=True,
+                )
             print(
                 "[collect-weighted] baseline "
                 f"warmup_mode=shared_exact_clean_resume fixed_warmup_steps={int(shared_robust_fixed_warmup_steps)}"
@@ -4660,6 +4757,10 @@ def main() -> None:
             **ema_config_dict(args),
             "baseline_reused_from_existing_runs_csv": bool(reused_baseline_runs_csv),
             "baseline_reused_from_existing_raw_csv": bool(reused_baseline_raw_csv),
+            "rf_shared_grid_full_baseline_raw_reuse": bool(rf_full_baseline_raw_reuse_enabled),
+            "rf_shared_grid_full_baseline_raw_reuse_reason": (
+                "" if rf_full_baseline_raw_reuse_enabled else str(rf_full_baseline_raw_reuse_reason)
+            ),
             "wdro_reused_from_existing_raw_csv": bool(reused_wdro_raw_csv),
             "wdro_enabled": bool(wdro_enabled),
             "wdro_optional_for_rf_first_milestone": False,

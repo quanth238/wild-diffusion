@@ -506,8 +506,17 @@ def cdro_adjusted_weighted_compute_from_compute_accounting(
         calibration=effective_calibration,
     )
     robust_count_source = str(robust_counts.get("count_source", "")).strip().lower()
+    # Preserve forward counts for modern CDRO records, where `n_fwd` already
+    # reflects only legitimate training work (for example RF teacher-pair
+    # forwards) and excludes removed logging-only sweeps. Legacy unadjusted
+    # records still fall back to zeroing `n_fwd`.
     override_n_fwd = 0.0
-    if robust_count_source in {"history_direct_cdro_adjusted", "history_inferred_cdro_adjusted"}:
+    if robust_count_source in {
+        "history_direct_cdro_adjusted",
+        "history_inferred_cdro_adjusted",
+        "history_direct_cdro",
+        "history_inferred_cdro",
+    }:
         override_n_fwd = _safe_float(robust_counts.get("n_fwd"))
     robust_weighted = weighted_compute_units_from_count_record(
         count_record=robust_counts,
