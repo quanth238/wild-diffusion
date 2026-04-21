@@ -602,6 +602,7 @@ def _apply_cfg_overrides(cfg: ToyConfig, source: Dict[str, object]) -> None:
         "p_std",
         "rf_baseline_mode",
         "rf_cdro_pair_source",
+        "rf_edm_init_ckpt_path",
         "rf_edm_teacher_sampler",
         "rf_eval_n_steps_path",
         "rf_loss",
@@ -656,6 +657,7 @@ def _config_from_row(args: argparse.Namespace, row: Dict[str, str]) -> ToyConfig
     cfg.dataset_path = _resolve_repo_path(cfg.dataset_path)
     cfg.dataset_val_path = _resolve_repo_path(cfg.dataset_val_path)
     cfg.fid_ref_path = _resolve_repo_path(getattr(cfg, "fid_ref_path", "") or args.fid_ref_path)
+    cfg.rf_edm_init_ckpt_path = _resolve_repo_path(str(getattr(cfg, "rf_edm_init_ckpt_path", "") or ""))
     return cfg
 
 
@@ -956,18 +958,47 @@ def _sample_edm_probe_batch(dataset, split: str, batch_size: int) -> torch.Tenso
 
 
 def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, object]:
-    history = payload.get("history_robust", {})
-    if not isinstance(history, dict):
+    history = None
+    for key in ("history_robust", "baseline_history", "history"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict) and candidate:
+            history = candidate
+            break
+    if history is None:
         history = {}
     trainer_state = payload.get("trainer_state", {})
     if not isinstance(trainer_state, dict):
         trainer_state = {}
-    completed_steps = _safe_int(payload.get("completed_steps", trainer_state.get("completed_steps", 0)), 0)
+    baseline_runtime = payload.get("baseline_runtime", {})
+    if not isinstance(baseline_runtime, dict):
+        baseline_runtime = {}
+    completed_steps = _safe_int(
+        payload.get(
+            "completed_steps",
+            trainer_state.get(
+                "completed_steps",
+                payload.get("step", baseline_runtime.get("step", 0)),
+            ),
+        ),
+        0,
+    )
     stage1_steps = _safe_int(history.get("rf_stage1_steps"), 0)
     reflow_steps = _safe_int(history.get("rf_reflow_steps"), 0)
-    stage_name = "rf_reflow" if reflow_steps > 0 and completed_steps > stage1_steps else "rf_stage1"
+    stage_curve = history.get("rf_stage", [])
+    if stage1_steps <= 0 and reflow_steps <= 0 and isinstance(stage_curve, list) and stage_curve:
+        last_stage = str(stage_curve[-1]).strip().lower()
+        if last_stage in {"rf_stage1", "rf_reflow"}:
+            stage_name = last_stage
+        else:
+            stage_name = "rf_stage1"
+    else:
+        stage_name = "rf_reflow" if reflow_steps > 0 and completed_steps > stage1_steps else "rf_stage1"
     distribution_key = f"{stage_name}_t_distribution_resolved"
     t_distribution = str(history.get(distribution_key, "")).strip()
+    if not t_distribution and isinstance(stage_curve, list) and stage_curve:
+        t_curve = history.get("rf_t_distribution", [])
+        if isinstance(t_curve, list) and t_curve:
+            t_distribution = str(t_curve[-1]).strip()
     if not t_distribution:
         t_distribution = (
             "uniform"
@@ -981,6 +1012,14 @@ def _rf_probe_spec_from_payload(payload: Dict, *, cfg: ToyConfig) -> Dict[str, o
         teacher_state_dict = None
     teacher_training_objective = str(trainer_state.get("rf_teacher_training_objective", "")).strip().lower()
     teacher_sampler_mode = str(history.get("rf_teacher_pair_sampling_mode_resolved", "")).strip()
+    if teacher_state_dict is None:
+        teacher_ckpt_path = str(getattr(cfg, "rf_edm_init_ckpt_path", "") or "").strip()
+        if teacher_ckpt_path and os.path.isfile(teacher_ckpt_path):
+            try:
+                teacher_state_dict = _load_baseline_state_dict(teacher_ckpt_path)
+                teacher_training_objective = "edm"
+            except Exception:
+                teacher_state_dict = None
     if not teacher_sampler_mode and teacher_training_objective == "edm":
         teacher_sampler_mode = resolve_rf_teacher_ve_sampler_mode(cfg)
     return {
