@@ -109,9 +109,10 @@ def _validate_config(cfg: ToyConfig) -> None:
         raise ValueError(
             f"--score-matching-weight-power must be >= 0, got {cfg.score_matching_weight_power}"
         )
-    if str(cfg.rf_baseline_mode).lower() not in ("strong", "plain"):
+    if str(cfg.rf_baseline_mode).lower() != "strong":
         raise ValueError(
-            f"--rf-baseline-mode must be one of ('strong', 'plain'), got {cfg.rf_baseline_mode}"
+            "--rf-baseline-mode only supports 'strong'; "
+            f"legacy plain mode was removed, got {cfg.rf_baseline_mode}"
         )
     if str(cfg.rf_reflow_t_distribution).lower() not in ("u_shaped", "uniform"):
         raise ValueError(
@@ -188,9 +189,10 @@ def _validate_config(cfg: ToyConfig) -> None:
                 "Pass --baseline-ckpt-path for the shared EDM warmup artifact, or use "
                 "--robust-resume-ckpt-path for later checkpoints along the same method path."
             )
-    if str(cfg.rf_cdro_pair_source).lower() not in ("auto", "reflow", "data_noise"):
+    if str(cfg.rf_cdro_pair_source).lower() not in ("auto", "reflow"):
         raise ValueError(
-            "--rf-cdro-pair-source must be one of ('auto', 'reflow', 'data_noise'), got "
+            "--rf-cdro-pair-source must be one of ('auto', 'reflow'); "
+            "legacy data_noise mode was removed, got "
             f"{cfg.rf_cdro_pair_source}"
         )
     if cfg.n_steps_path <= 0:
@@ -421,12 +423,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clip-phi-grad", type=float, default=ToyConfig.clip_phi_grad)
     parser.add_argument("--training-objective", type=str, default=ToyConfig.training_objective, choices=["edm", "score", "rf"])
     parser.add_argument("--score-matching-weight-power", type=float, default=ToyConfig.score_matching_weight_power)
-    parser.add_argument(
-        "--rf-baseline-mode",
-        type=str,
-        default=ToyConfig.rf_baseline_mode,
-        choices=["strong", "plain"],
-    )
+    parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong"])
     parser.add_argument(
         "--rf-reflow-t-distribution",
         type=str,
@@ -445,7 +442,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--rf-cdro-pair-source",
         type=str,
         default=ToyConfig.rf_cdro_pair_source,
-        choices=["auto", "reflow", "data_noise"],
+        choices=["auto", "reflow"],
     )
     parser.add_argument(
         "--rf-edm-teacher-sampler",

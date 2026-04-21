@@ -229,12 +229,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-backbone", type=str, default="conv", choices=["conv", "songunet", "ddpmpp"])
     parser.add_argument("--baseline-train-backend", type=str, default="toy", choices=["toy", "mainline"])
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
-    parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong", "plain"])
+    parser.add_argument("--rf-baseline-mode", type=str, default="strong", choices=["strong"])
     parser.add_argument("--rf-reflow-t-distribution", type=str, default="u_shaped", choices=["u_shaped", "uniform"])
     parser.add_argument("--rf-loss", type=str, default="pseudo_huber", choices=["pseudo_huber", "mse"])
     parser.add_argument("--rf-pseudo-huber-delta", type=float, default=0.1)
     parser.add_argument("--rf-edm-init-ckpt-path", type=str, default="")
-    parser.add_argument("--rf-cdro-pair-source", type=str, default="auto", choices=["auto", "reflow", "data_noise"])
+    parser.add_argument("--rf-cdro-pair-source", type=str, default="reflow", choices=["auto", "reflow"])
     parser.add_argument(
         "--rf-edm-teacher-sampler",
         type=str,
@@ -1414,8 +1414,10 @@ def _resolve_rf_cdro_pair_source(args: argparse.Namespace) -> str:
     mode = str(getattr(args, "rf_cdro_pair_source", "auto")).strip().lower()
     if mode in ("auto", "staged"):
         return "reflow"
-    if mode not in ("reflow", "data_noise"):
-        raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
+    if mode != "reflow":
+        raise ValueError(
+            f"Unsupported rf_cdro_pair_source='{mode}'. CDRO-RF shared-grid collection now supports only explicit reflow pairs."
+        )
     return mode
 
 

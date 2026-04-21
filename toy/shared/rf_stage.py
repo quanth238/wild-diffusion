@@ -29,11 +29,13 @@ def resolve_rf_cdro_stage_steps(
     *,
     reflow_start_step: int = 0,
 ) -> tuple[int, int]:
-    """Resolve CDRO-RF as explicit reflow unless legacy data-noise pairs are forced."""
+    """Resolve CDRO-RF as explicit shared-teacher reflow only."""
 
     total_steps_value = max(int(total_steps), 0)
     mode = str(pair_source).strip().lower()
-    if mode == "data_noise":
-        return int(total_steps_value), 0
+    if mode not in {"reflow", "auto", "staged", ""}:
+        raise ValueError(
+            f"Unsupported RF CDRO pair source '{pair_source}'. Expected explicit shared-teacher reflow."
+        )
     del stage1_fraction, reflow_start_step
     return 0, int(total_steps_value)

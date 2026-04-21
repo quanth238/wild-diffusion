@@ -12,7 +12,7 @@ Recent capability note:
 - Public comparison naming should read: `Baseline EDM`, `Wild-Diffusion`, `CDRO-EDM`, `RF`, `CDRO-RF`, `Wild-Diffusion-RF`.
 - In plots/presentation, the historically named `wdro` method should display as `Wild-Diffusion`.
 - All RF-family runs now require the shared EDM warm-start checkpoint via `rf_edm_init_ckpt_path`.
-- Public clean `RF` means the strong two-stage RF baseline (`rf_stage1` + `rf_reflow`), and that remains the default RF baseline mode.
+- Public clean `RF` means the explicit reflow-only RF baseline distilled from the shared EDM checkpoint.
 - Direct `method_version=wdro --training-objective rf` runs are now the canonical `Wild-Diffusion-RF` path, resuming RF robust training from the shared EDM checkpoint. `wdro_warmup_fraction` is ignored there.
 - Direct `WDRO-EDM` / `CDRO-EDM` runs should likewise start from an explicit shared EDM baseline checkpoint via `baseline_ckpt_path`; later continuation knots should use `robust_resume_ckpt_path`.
 - Shared-grid collector support for `Wild-Diffusion-RF` is still deferred; use direct `toy/run_toy.py` runs.

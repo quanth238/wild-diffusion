@@ -1240,14 +1240,10 @@ def _run_combo(
             ]
 
     print(f"[combo] start pct={train_percent:g} seed={seed} max_step={cfg.steps}", flush=True)
-    if (
-        str(cfg.training_objective).strip().lower() == "rf"
-        and str(getattr(cfg, "rf_baseline_mode", "strong")).strip().lower() == "strong"
-    ):
+    if str(cfg.training_objective).strip().lower() == "rf":
         raise NotImplementedError(
-            "The checkpointed baseline convergence sweep does not yet support the strong two-stage RF baseline. "
-            "Use toy/run_toy.py for public RF and CDRO-RF runs, or pass --rf-baseline-mode=plain for an internal "
-            "debug-only RF trajectory."
+            "The checkpointed baseline convergence sweep does not support the public RF reflow baseline. "
+            "Use toy/run_toy.py for RF-family runs."
         )
     set_seed(cfg.seed)
     dataset = build_dataset_bundle(cfg, device)
@@ -1638,7 +1634,7 @@ def build_parser():
         choices=list(SUPPORTED_BASELINE_TRAIN_BACKENDS),
     )
     parser.add_argument("--training-objective", type=str, default="edm", choices=["edm", "score", "rf"])
-    parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong", "plain"])
+    parser.add_argument("--rf-baseline-mode", type=str, default=ToyConfig.rf_baseline_mode, choices=["strong"])
     parser.add_argument(
         "--rf-reflow-t-distribution",
         type=str,
@@ -1652,7 +1648,7 @@ def build_parser():
         "--rf-cdro-pair-source",
         type=str,
         default=ToyConfig.rf_cdro_pair_source,
-        choices=["auto", "reflow", "data_noise"],
+        choices=["auto", "reflow"],
     )
     parser.add_argument("--n-steps-path", type=int, default=24)
     parser.add_argument("--sigma-min", type=float, default=0.01)

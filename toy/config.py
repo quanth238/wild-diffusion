@@ -85,13 +85,13 @@ class ToyConfig:
     # explicit reflow protocol: start from the shared EDM checkpoint, use that
     # checkpoint as the frozen teacher, and train the RF-family student directly
     # on teacher-generated pairs.
-    rf_baseline_mode: str = "strong"  # strong|plain
+    rf_baseline_mode: str = "strong"  # strong only; legacy plain mode removed
     rf_reflow_t_distribution: str = "u_shaped"  # u_shaped|uniform
     rf_loss: str = "pseudo_huber"  # pseudo_huber|mse
     rf_pseudo_huber_delta: float = 0.1
     rf_edm_init_ckpt_path: str = ""  # required shared EDM warm-start for RF / CDRO-RF / Wild-Diffusion-RF
     rf_continuation_total_steps_override: int = 0  # stable RF continuation budget for resumed checkpoint sweeps
-    rf_cdro_pair_source: str = "auto"  # auto|reflow|data_noise; auto now resolves to explicit reflow
+    rf_cdro_pair_source: str = "reflow"  # reflow|auto; auto is retained as a compatibility alias
     rf_edm_teacher_sampler: str = "edm_heun"  # ancestral_stochastic|ancestral_mean_only|edm_euler|edm_heun
     rf_teacher_n_steps_path: int = 40  # shared RF reflow teacher grid; RF++-style default
     rf_eval_n_steps_path: int = 9  # shared RF eval/FID grid; fast RF-family inference default

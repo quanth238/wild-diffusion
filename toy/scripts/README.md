@@ -27,6 +27,8 @@ Current comparison naming convention:
 
 Direct `Wild-Diffusion-RF` runs are supported through `toy/run_toy.py`, resuming RF robust training from the shared EDM checkpoint and ignoring `wdro_warmup_fraction`. The shared-grid collector still skips WDRO when `training_objective=rf`.
 
+RF-family support is now explicitly reflow-only: legacy `rf_baseline_mode=plain` and `rf_cdro_pair_source=data_noise` are no longer part of the supported public surface.
+
 For the EDM family, the canonical shared-grid flow is still `shared_exact`: one shared baseline warmup checkpoint across methods, then nearby same-method continuation checkpoints for later loss/FID reevaluation.
 
 ## Shared Wrappers

@@ -132,8 +132,10 @@ def _resolve_rf_cdro_pair_source(cfg) -> str:
     mode = str(getattr(cfg, "rf_cdro_pair_source", "auto")).strip().lower()
     if mode in ("auto", "staged"):
         return "reflow"
-    if mode not in ("reflow", "data_noise"):
-        raise ValueError(f"Unsupported rf_cdro_pair_source='{mode}'.")
+    if mode != "reflow":
+        raise ValueError(
+            f"Unsupported rf_cdro_pair_source='{mode}'. CDRO-RF now supports only explicit reflow pairs."
+        )
     return mode
 
 
