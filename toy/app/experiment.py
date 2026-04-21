@@ -1082,7 +1082,7 @@ def _compute_weighted_accounting(
         if direct_robust_counts is not None:
             if method_name == "cdro":
                 robust_n_fwd = float(direct_robust_counts["n_fwd"])
-                robust_count_source = "history_direct_cdro_adjusted"
+                robust_count_source = "history_direct_cdro"
             else:
                 robust_n_fwd = float(direct_robust_counts["n_fwd"])
                 robust_count_source = "history_direct"
@@ -1120,7 +1120,7 @@ def _compute_weighted_accounting(
                     float(cfg.outer_clean_weight)
                 )
             robust_n_fwd_parambackward = float(path_steps * robust_steps_total * active_outer_branches)
-            robust_count_source = "history_inferred_cdro_adjusted" if method_name == "cdro" else "history_inferred_pathwise"
+            robust_count_source = "history_inferred_cdro" if method_name == "cdro" else "history_inferred_pathwise"
         elif method_name == "clean":
             robust_n_fwd_parambackward = float(max(int(robust_steps_total), 0))
             robust_count_source = "history_inferred_clean"
@@ -1489,7 +1489,7 @@ def _estimate_cdro_robust_step_batch_equiv(cfg) -> float:
     if not attack_enabled:
         return float(path_steps if reference_path_enabled else 0.0)
     attack_construction_units = float(path_steps * max(int(attack_num_steps), 0))
-    attack_eval_units = float(path_steps * 2)
+    attack_eval_units = float(path_steps if float(getattr(cfg, "outer_attack_weight", 0.0)) > 0.0 else 0)
     clean_eval_units = float(path_steps if float(getattr(cfg, "outer_clean_weight", 0.0)) > 0.0 else 0)
     return attack_construction_units + attack_eval_units + clean_eval_units
 

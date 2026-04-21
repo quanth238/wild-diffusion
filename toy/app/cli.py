@@ -647,7 +647,9 @@ def parse_toy_config(argv: Optional[Sequence[str]] = None) -> ToyConfig:
         cfg.wild_fixed_noise_inner = False
     if collapse_v_l2_tol_legacy is not None:
         cfg.collapse_delta_ratio_tol = float(collapse_v_l2_tol_legacy)
-    if str(cfg.training_objective).strip().lower() == "rf":
+    # Keep baseline RF / WDRO-RF on the shared teacher grid, but let CDRO-RF use
+    # its own rollout grid after teacher pairs are generated.
+    if str(cfg.training_objective).strip().lower() == "rf" and str(cfg.method_version).strip().lower() != "cdro":
         cfg.n_steps_path = int(resolve_rf_teacher_n_steps_path(cfg))
     if cfg.use_log_normal_sigma_sampling and cfg.auto_log_normal_params:
         log_min = math.log(cfg.sigma_min)

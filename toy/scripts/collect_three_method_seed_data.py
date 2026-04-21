@@ -1373,8 +1373,9 @@ def _wdro_expected_robust_step_weighted_units(args: argparse.Namespace, calibrat
 
 
 def _effective_cdro_n_steps_path(args: argparse.Namespace) -> int:
-    if str(getattr(args, "training_objective", "edm")).strip().lower() == "rf":
-        return int(_effective_rf_teacher_n_steps_path(args))
+    # CDRO keeps its own rollout/training path grid. For RF runs the teacher pair
+    # generation grid stays on `rf_teacher_n_steps_path`, but CDRO-RF may train on
+    # a different post-pair rollout grid via `cdro_n_steps_path` / `n_steps_path`.
     override_value = max(int(getattr(args, "cdro_n_steps_path", 0)), 0)
     if override_value > 0:
         return int(override_value)
@@ -2815,7 +2816,7 @@ def _build_run_toy_cmd(
     rf_edm_init_ckpt_path: Optional[str] = None,
     rf_continuation_total_steps_override: Optional[int] = None,
 ) -> List[str]:
-    if str(args.training_objective).strip().lower() == "rf":
+    if str(args.training_objective).strip().lower() == "rf" and method_name != "cdro":
         n_steps_path_value = int(_effective_rf_teacher_n_steps_path(args))
     else:
         n_steps_path_value = int(_effective_cdro_n_steps_path(args)) if method_name == "cdro" else int(args.n_steps_path)

@@ -807,40 +807,11 @@ def train_trajectory_robust_cdro(
                 path_batch_equiv_evals * float(max(int(attack_num_steps), 0)) * rollout_multiplier
             )
 
-        if attack_path_enabled:
-            attack_loss_inner = None
-            transport_inner = None
-            for roll in rollouts:
-                with autocast_context(sigma_levels.device, amp_dtype):
-                    attack_loss_chunk = _path_average_training_loss(
-                        cfg,
-                        denoiser,
-                        roll.states_ctrl,
-                        x0,
-                        current_sigma_levels,
-                        x_left=roll.x_left,
-                        x_right=roll.x_right,
-                    )
-                transport_chunk = _control_transport_cost(roll.control_path, current_transition_deltas)
-                attack_loss_inner = (
-                    attack_loss_chunk if attack_loss_inner is None else (attack_loss_inner + attack_loss_chunk)
-                )
-                transport_inner = transport_chunk if transport_inner is None else (transport_inner + transport_chunk)
-            attack_loss_inner = attack_loss_inner / rollout_multiplier
-            transport_inner = transport_inner / rollout_multiplier
-            inner_obj = inner_objective_attack_only(attack_loss_inner)
-            if has_nan_or_inf(inner_obj):
-                raise RuntimeError("NaN/Inf detected in cdro inner objective.")
-        else:
-            attack_loss_inner = torch.zeros((), device=x0.device, dtype=x0.dtype)
-            transport_inner = None
-            for roll in rollouts:
-                transport_chunk = _control_transport_cost(roll.control_path, current_transition_deltas)
-                transport_inner = transport_chunk if transport_inner is None else (transport_inner + transport_chunk)
-            transport_inner = transport_inner / rollout_multiplier
-            inner_obj = torch.zeros((), device=x0.device, dtype=x0.dtype)
-
-        last_inner_obj = scalarize(inner_obj) if attack_path_enabled else 0.0
+        transport_inner = None
+        for roll in rollouts:
+            transport_chunk = _control_transport_cost(roll.control_path, current_transition_deltas)
+            transport_inner = transport_chunk if transport_inner is None else (transport_inner + transport_chunk)
+        transport_inner = transport_inner / rollout_multiplier
         last_transport = scalarize(transport_inner)
         delta_norm_mean_values = []
         delta_norm_max_values = []
@@ -912,7 +883,7 @@ def train_trajectory_robust_cdro(
                 outer_loss_attack_vals.append(float(outer_loss_attack_val))
                 outer_loss_clean_vals.append(float(outer_loss_clean_val))
                 outer_loss_vals.append(float(outer_loss_val))
-            attack_eval_units = path_batch_equiv_evals * 2.0 * rollout_multiplier
+            attack_eval_units = path_batch_equiv_evals * rollout_multiplier if lambda_ctrl > 0.0 else 0.0
             clean_eval_units = path_batch_equiv_evals * rollout_multiplier if lambda_ref > 0.0 else 0.0
         optimizer_theta.step()
         update_ema_model(
@@ -925,6 +896,7 @@ def train_trajectory_robust_cdro(
         outer_loss_attack_val = sum(outer_loss_attack_vals) / len(outer_loss_attack_vals)
         outer_loss_clean_val = sum(outer_loss_clean_vals) / len(outer_loss_clean_vals)
         outer_loss_val = sum(outer_loss_vals) / len(outer_loss_vals)
+        last_inner_obj = float(outer_loss_attack_val) if attack_path_enabled else 0.0
         outer_loss_attack = torch.tensor(outer_loss_attack_val, device=x0.device, dtype=x0.dtype)
         outer_loss_clean = torch.tensor(outer_loss_clean_val, device=x0.device, dtype=x0.dtype)
         outer_loss = torch.tensor(outer_loss_val, device=x0.device, dtype=x0.dtype)

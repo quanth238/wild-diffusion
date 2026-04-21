@@ -479,12 +479,12 @@ def cdro_adjusted_weighted_compute_from_compute_accounting(
     compute_accounting: Dict[str, Any],
     calibration: Dict[str, Any],
 ) -> Optional[Dict[str, float]]:
-    """Recompute CDRO weighted units excluding the logging-only forward reevaluation.
+    """Recompute legacy CDRO weighted units excluding the logging-only forward reevaluation.
 
-    The toy CDRO trainer records one extra attacked-path forward sweep used for
+    Historical CDRO runs recorded one extra attacked-path forward sweep used for
     `inner_obj` logging / NaN guarding. For comparison plots and budget matching,
-    we exclude that monitoring-only pass from CDRO weighted compute while keeping
-    the attack-construction input-grad and outer param-backward counts intact.
+    this helper removes that monitoring-only pass while keeping the
+    attack-construction input-grad and outer param-backward counts intact.
     """
 
     if not isinstance(compute_accounting, dict):
@@ -631,11 +631,7 @@ def cdro_robust_step_weighted_compute_units(
     outer_clean_weight: float,
     calibration: Dict[str, Any],
 ) -> Optional[float]:
-    """Weighted compute for one CDRO robust optimizer step.
-
-    This excludes the toy trainer's extra attacked-path `inner_obj` reevaluation
-    pass because that sweep is monitoring-only and does not change the update.
-    """
+    """Weighted compute for one CDRO robust optimizer step."""
 
     path_steps = max(int(n_steps_path), 0)
     if path_steps <= 0:
