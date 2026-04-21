@@ -175,12 +175,14 @@ def build_rows(args: argparse.Namespace):
         attack_num_steps=int(cdro_config["attack_num_steps"]),
         outer_attack_weight=float(cdro_config["outer_attack_weight"]),
         outer_clean_weight=float(cdro_config["outer_clean_weight"]),
+        total_budget_rho=float(cdro_config["cdro_total_budget_rho"]),
     )
     robust_step_compute_be = cdro_robust_step_compute_be(
         n_steps_path=int(cdro_config["cdro_n_steps_path"]),
         attack_num_steps=int(cdro_config["attack_num_steps"]),
         outer_attack_weight=float(cdro_config["outer_attack_weight"]),
         outer_clean_weight=float(cdro_config["outer_clean_weight"]),
+        total_budget_rho=float(cdro_config["cdro_total_budget_rho"]),
     )
 
     warmup_wcu = float(warmup_summary["warmup_weighted_compute_units"])

@@ -186,12 +186,14 @@ def main() -> None:
         attack_num_steps=args.attack_num_steps,
         outer_attack_weight=args.outer_attack_weight,
         outer_clean_weight=args.outer_clean_weight,
+        total_budget_rho=args.cdro_total_budget_rho,
     )
     robust_step_compute_be = cdro_robust_step_compute_be(
         n_steps_path=args.cdro_n_steps_path,
         attack_num_steps=args.attack_num_steps,
         outer_attack_weight=args.outer_attack_weight,
         outer_clean_weight=args.outer_clean_weight,
+        total_budget_rho=args.cdro_total_budget_rho,
     )
     plan = build_budget_plan(
         target_wcu=target_wcu,

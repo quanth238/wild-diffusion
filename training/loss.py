@@ -230,7 +230,9 @@ class EDMLossCDRO:
         delta_l2: torch.Tensor,
         delta_ratio: torch.Tensor,
     ) -> None:
-        attack_enabled = bool(lambda_ctrl > 0.0 and self.attack_num_steps > 0)
+        attack_enabled = bool(
+            lambda_ctrl > 0.0 and self.attack_num_steps > 0 and self.cdro_total_budget_rho > 0.0
+        )
         # The image-port rollout does not spend a standalone forward-only denoiser call per path step.
         n_fwd = 0.0
         n_fwd_inputgrad = float(self.cdro_n_steps_path * max(self.attack_num_steps, 0)) if attack_enabled else 0.0

@@ -119,9 +119,14 @@ def cdro_robust_step_weighted_compute_units(
     attack_num_steps: int,
     outer_attack_weight: float,
     outer_clean_weight: float,
+    total_budget_rho: float | None = None,
 ) -> float:
     path_steps = max(int(n_steps_path), 0)
-    attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(attack_num_steps) > 0)
+    attack_enabled = bool(
+        float(outer_attack_weight) > 0.0
+        and int(attack_num_steps) > 0
+        and (total_budget_rho is None or float(total_budget_rho) > 0.0)
+    )
     clean_enabled = bool(float(outer_clean_weight) > 0.0)
     active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
     # The image-port CDRO rollout constructs the nominal noisy state analytically and only
@@ -143,9 +148,14 @@ def cdro_robust_step_compute_be(
     attack_num_steps: int,
     outer_attack_weight: float,
     outer_clean_weight: float,
+    total_budget_rho: float | None = None,
 ) -> float:
     path_steps = max(int(n_steps_path), 0)
-    attack_enabled = bool(float(outer_attack_weight) > 0.0 and int(attack_num_steps) > 0)
+    attack_enabled = bool(
+        float(outer_attack_weight) > 0.0
+        and int(attack_num_steps) > 0
+        and (total_budget_rho is None or float(total_budget_rho) > 0.0)
+    )
     clean_enabled = bool(float(outer_clean_weight) > 0.0)
     active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
     return float(path_steps * ((max(int(attack_num_steps), 0) if attack_enabled else 0) + active_outer_branches))
