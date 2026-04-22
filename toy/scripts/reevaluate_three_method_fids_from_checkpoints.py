@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -264,7 +265,20 @@ def _row_seed(row: Dict[str, str]) -> int:
     return _safe_int(row.get("seed"), 0)
 
 
+def _checkpoint_step(path: str) -> Optional[int]:
+    checkpoint_path = _resolve_repo_path(path)
+    if not checkpoint_path:
+        return None
+    match = re.search(r"step0*([0-9]+)(?=\.[^.]+$)", os.path.basename(checkpoint_path))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _row_step(row: Dict[str, str]) -> int:
+    checkpoint_step = _checkpoint_step(row.get("checkpoint_path", ""))
+    if checkpoint_step is not None:
+        return int(checkpoint_step)
     return _safe_int(row.get("step"), 0)
 
 
@@ -1844,6 +1858,7 @@ def main() -> None:
             cache[cache_key] = cached
 
         updated = dict(row)
+        updated["step"] = str(_row_step(updated))
         updated["fid_original"] = str(row.get("fid", ""))
         updated["fid"] = str(cached["fid"])
         updated["reeval_metrics_path"] = str(cached["reeval_metrics_path"])

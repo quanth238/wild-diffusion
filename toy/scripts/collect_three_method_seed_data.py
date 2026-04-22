@@ -2033,6 +2033,7 @@ def _extract_wdro_row(
     calibration: Dict,
     train_accelerator_count: int,
     fid_selected: bool,
+    step_override: Optional[int],
     args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
@@ -2048,6 +2049,7 @@ def _extract_wdro_row(
     baseline_phase_steps = int(flow["baseline_phase_steps"])
     robust_phase_steps = int(flow["robust_phase_steps"])
     total_steps_requested = int(flow["total_steps_requested"])
+    effective_total_steps = int(total_steps_requested if step_override is None else step_override)
     compute_accounting = flow["compute_accounting"]
     budget_accounting = flow["budget_accounting"]
     robust_compute_be_raw = float(compute_accounting["robust_batch_equiv_denoiser_evals_total"])
@@ -2072,7 +2074,7 @@ def _extract_wdro_row(
     robust_train_wall_clock_sec = runtime.get("robust_phase")
     effective_images_seen_total = budget_accounting.get("effective_train_images_seen_total")
     if effective_images_seen_total is None:
-        total_images_shown_m_effective = float(total_steps_requested * batch_size) / 1_000_000.0
+        total_images_shown_m_effective = float(effective_total_steps * batch_size) / 1_000_000.0
     else:
         total_images_shown_m_effective = float(effective_images_seen_total) / 1_000_000.0
     warmup_only = bool(robust_phase_steps <= 0)
@@ -2082,7 +2084,7 @@ def _extract_wdro_row(
         else _optional_float(sample_quality.get("robust_fid"))
     )
     row = {
-        "step": int(total_steps_requested),
+        "step": int(effective_total_steps),
         "compute_budget_be": float(total_compute_be_effective),
         "baseline_compute_be": float(baseline_compute_be_effective),
         "robust_compute_be": float(robust_compute_be_raw),
@@ -2153,6 +2155,7 @@ def _extract_clean_row(
     calibration: Dict,
     train_accelerator_count: int,
     fid_selected: bool,
+    step_override: Optional[int],
     args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
@@ -2168,6 +2171,7 @@ def _extract_clean_row(
     baseline_phase_steps = int(flow["baseline_phase_steps"])
     robust_phase_steps = int(flow["robust_phase_steps"])
     total_steps_requested = int(flow["total_steps_requested"])
+    effective_total_steps = int(total_steps_requested if step_override is None else step_override)
     compute_accounting = flow["compute_accounting"]
     budget_accounting = flow["budget_accounting"]
     robust_compute_be_raw = float(compute_accounting["robust_batch_equiv_denoiser_evals_total"])
@@ -2192,7 +2196,7 @@ def _extract_clean_row(
     robust_train_wall_clock_sec = runtime.get("robust_phase")
     effective_images_seen_total = budget_accounting.get("effective_train_images_seen_total")
     if effective_images_seen_total is None:
-        total_images_shown_m_effective = float(total_steps_requested * batch_size) / 1_000_000.0
+        total_images_shown_m_effective = float(effective_total_steps * batch_size) / 1_000_000.0
     else:
         total_images_shown_m_effective = float(effective_images_seen_total) / 1_000_000.0
     warmup_only = bool(robust_phase_steps <= 0)
@@ -2202,7 +2206,7 @@ def _extract_clean_row(
         else _optional_float(sample_quality.get("robust_fid"))
     )
     row = {
-        "step": int(total_steps_requested),
+        "step": int(effective_total_steps),
         "compute_budget_be": float(total_compute_be_effective),
         "baseline_compute_be": float(baseline_compute_be_effective),
         "robust_compute_be": float(robust_compute_be_raw),
@@ -2269,6 +2273,7 @@ def _extract_cdro_row(
     calibration: Dict,
     train_accelerator_count: int,
     fid_selected: bool,
+    step_override: Optional[int],
     args: argparse.Namespace,
 ) -> Dict:
     payload = load_json(metrics_path)
@@ -2284,6 +2289,7 @@ def _extract_cdro_row(
     baseline_phase_steps = int(flow["baseline_phase_steps"])
     robust_phase_steps = int(flow["robust_phase_steps"])
     total_steps_requested = int(flow["total_steps_requested"])
+    effective_total_steps = int(total_steps_requested if step_override is None else step_override)
     compute_accounting = flow["compute_accounting"]
     budget_accounting = flow["budget_accounting"]
     robust_compute_be_raw = float(compute_accounting["robust_batch_equiv_denoiser_evals_total"])
@@ -2326,7 +2332,7 @@ def _extract_cdro_row(
     robust_train_wall_clock_sec = runtime.get("robust_phase")
     effective_images_seen_total = budget_accounting.get("effective_train_images_seen_total")
     if effective_images_seen_total is None:
-        total_images_shown_m_effective = float(total_steps_requested * batch_size) / 1_000_000.0
+        total_images_shown_m_effective = float(effective_total_steps * batch_size) / 1_000_000.0
     else:
         total_images_shown_m_effective = float(effective_images_seen_total) / 1_000_000.0
     warmup_only = bool(robust_phase_steps <= 0)
@@ -2336,7 +2342,7 @@ def _extract_cdro_row(
         else _optional_float(sample_quality.get("robust_fid"))
     )
     row = {
-        "step": int(total_steps_requested),
+        "step": int(effective_total_steps),
         "compute_budget_be": float(total_compute_be_effective),
         "baseline_compute_be": float(baseline_compute_be_effective),
         "robust_compute_be": float(robust_compute_be_raw),
@@ -4024,6 +4030,8 @@ def main() -> None:
                             f"fid={'yes' if fid_selected else 'no'}",
                             flush=True,
                         )
+                        # Collector checkpoint reruns should stop at the requested absolute knot.
+                        # Passing a global RF continuation override here lets resumed runs overshoot.
                         cmd = _build_run_toy_cmd(
                             args=args,
                             method_name="clean",
@@ -4041,15 +4049,7 @@ def main() -> None:
                                 if objective_is_rf and str(baseline_support_checkpoint).strip()
                                 else None
                             ),
-                    rf_continuation_total_steps_override=(
-                        max(
-                            int(baseline_trajectory_total_steps_max) - int(shared_robust_fixed_warmup_steps),
-                            0,
                         )
-                        if objective_is_rf
-                        else None
-                    ),
-                )
                         run_command(
                             cmd=cmd,
                             log_path=log_path,
@@ -4061,6 +4061,7 @@ def main() -> None:
                         calibration=calibration,
                         train_accelerator_count=int(args.train_accelerator_count),
                         fid_selected=bool(fid_selected),
+                        step_override=int(total_steps),
                         args=args,
                     )
                     row["checkpoint_path"] = checkpoint_path
@@ -4304,11 +4305,6 @@ def main() -> None:
                             if objective_is_rf and str(wdro_support_checkpoint).strip()
                             else None
                         ),
-                        rf_continuation_total_steps_override=(
-                            max(int(wdro_max_total_steps) - int(wdro_fixed_warmup_steps), 0)
-                            if objective_is_rf
-                            else None
-                        ),
                     )
                     run_command(
                         cmd=cmd,
@@ -4320,6 +4316,7 @@ def main() -> None:
                     calibration=calibration,
                     train_accelerator_count=int(args.train_accelerator_count),
                     fid_selected=bool(fid_selected),
+                    step_override=int(total_steps),
                     args=args,
                 )
                 row["checkpoint_path"] = checkpoint_path
@@ -4457,11 +4454,6 @@ def main() -> None:
                         if objective_is_rf and str(cdro_support_checkpoint).strip()
                         else None
                     ),
-                    rf_continuation_total_steps_override=(
-                        max(int(cdro_max_total_steps) - int(cdro_fixed_warmup_steps), 0)
-                        if objective_is_rf
-                        else None
-                    ),
                 )
                 run_command(
                     cmd=cmd,
@@ -4474,6 +4466,7 @@ def main() -> None:
                 calibration=calibration,
                 train_accelerator_count=int(args.train_accelerator_count),
                 fid_selected=bool(fid_selected),
+                step_override=int(total_steps),
                 args=args,
             )
             row["checkpoint_path"] = checkpoint_path
