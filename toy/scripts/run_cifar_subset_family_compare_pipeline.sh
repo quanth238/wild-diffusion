@@ -12,6 +12,7 @@ SEEDS="${SEEDS:-0}"
 PERCENTS="${PERCENTS:-100}"
 DRY_RUN="${DRY_RUN:-0}"
 AUTO_CALIBRATE="${AUTO_CALIBRATE:-0}"
+SKIP_EXISTING="${SKIP_EXISTING:-0}"
 
 if [[ ! -f "${SUMMARY_PATH}" ]]; then
   echo "[error] missing CIFAR subset summary: ${SUMMARY_PATH}" >&2
@@ -157,6 +158,11 @@ if [[ "${USE_EMA_EVAL}" == "1" ]]; then
   fi
 fi
 
+skip_existing_args=()
+if [[ "${SKIP_EXISTING}" == "1" ]]; then
+  skip_existing_args+=(--skip-existing)
+fi
+
 run_cmd() {
   if [[ "${DRY_RUN}" == "1" ]]; then
     printf '[dry-run]'; printf ' %q' "$@"; printf '\n'
@@ -262,6 +268,7 @@ for pct in ${PERCENTS}; do
     --cdro-edm-ladder-mode "${CDRO_EDM_LADDER_MODE}" \
     --cdro-warmup-fraction "${CDRO_WARMUP_FRACTION}" \
     --cdro-n-steps-path "${EDM_CDRO_N_STEPS_PATH}" \
+    "${skip_existing_args[@]}" \
     "${ema_args[@]}"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
@@ -324,6 +331,7 @@ for pct in ${PERCENTS}; do
     --rf-edm-teacher-sampler "${RF_EDM_TEACHER_SAMPLER}" \
     --rf-teacher-n-steps-path "${RF_TEACHER_N_STEPS_PATH}" \
     --rf-eval-n-steps-path "${RF_EVAL_N_STEPS_PATH}" \
+    "${skip_existing_args[@]}" \
     "${ema_args[@]}"
 
   run_cmd "${PYTHON_BIN}" "${ROOT_DIR}/toy/scripts/plot_three_method_family_compare_from_runs.py" \

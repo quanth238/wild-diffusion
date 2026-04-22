@@ -572,8 +572,9 @@ def train_trajectory_robust_wdro(
         "transport_cost_mean": 0.0,
         "attack_construction_units": 0.0,
     }
+    total_steps = int(cfg.steps)
 
-    for step in range(int(start_step) + 1, int(cfg.steps) + 1):
+    for step in range(int(start_step) + 1, int(total_steps) + 1):
         refresh_now = combined_pool is None or step == 1 or ((step - 1) % refresh_interval_steps == 0)
         refresh_attack_construction_units = 0.0
         if refresh_now:
