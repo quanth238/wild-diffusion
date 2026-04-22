@@ -192,7 +192,7 @@ launch_and_eval() {
   tail -n 1 "${manifest_csv}"
 }
 
-echo "[INFO] Starting rho=0 N=8/N=16 baseline-80k workflow on $(hostname)"
+echo "[INFO] Starting rho=0 N=${RUN_N_STEPS} baseline-80k workflow on $(hostname)"
 echo "[INFO] Campaign tag: ${CAMPAIGN_TAG}"
 echo "[INFO] Train outroot: ${TRAIN_OUTROOT}"
 echo "[INFO] Eval sweep root: ${EVAL_SWEEP_ROOT}"
@@ -208,14 +208,14 @@ for raw_n_steps in "${run_n_steps_list[@]}"; do
     continue
   fi
   case "${n_steps}" in
-    8|16)
+    4|8|16)
       launch_and_eval "${n_steps}"
       ;;
     *)
-      echo "[ERROR] Unsupported RUN_N_STEPS entry: ${n_steps} (expected 8 and/or 16)"
+      echo "[ERROR] Unsupported RUN_N_STEPS entry: ${n_steps} (expected 4, 8, and/or 16)"
       exit 1
       ;;
   esac
 done
 
-echo "[OK] rho=0 N=8/N=16 baseline-80k workflow complete."
+echo "[OK] rho=0 N=${RUN_N_STEPS} baseline-80k workflow complete."
