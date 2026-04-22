@@ -9,6 +9,7 @@ These are the scripts that match the current working decision in this repo:
 - `setup_simpsons_mnist_rgb.py`: stage the RGB dataset under `toy_data/simpsons_mnist_rgb/` and build the FID ref.
 - `run_simpsons_mnist_once.sh`: single Simpsons smoke run. Defaults to `RUN_MODE=robust` and `METHOD_VERSION=cdro`, with smoke-scale training/eval sizes but the locked CDRO method knobs.
 - `collect_three_method_seed_data.py`: canonical family-aware weighted-grid collector for EDM/RF baselines and robust methods.
+- `plot_three_method_family_compare_from_runs.py`: discover one or more combined CSV buckets, keep colliding series source-distinct when needed, and render the family-aware compare plots.
 - `run_simpsons_locked_default_percent_sweep.sh`: locked percent sweep for the current Simpsons defaults.
 - `plot_three_method_fid_curves.py`: plotting for the collected three-method runs.
 - `reevaluate_three_method_fids_from_checkpoints.py`: re-run FID from saved checkpoints when needed; it records `edm_clean_probe` for EDM checkpoints, `rf_clean_probe` for RF checkpoints, and `objective_clean_probe` as the family-native alias.
@@ -38,7 +39,9 @@ These are generic helpers, not the source of truth for the Simpsons method choic
 - `run_image_once.sh`: generic image-folder wrapper around `toy/run_toy.py`. Pass `METHOD_VERSION` explicitly when method choice matters.
 - `run_toy_once.sh`: generic toy-wrapper helper. Pass `METHOD_VERSION` explicitly when method choice matters.
 - `setup_cifar_subset_imagefolder.py`: stage a class-filtered CIFAR-10 train/test image_folder dataset plus matching FID ref for low-budget toy image runs.
+- `calibrate_cifar_subset_weighted_compute.sh`: build matching EDM/RF weighted-compute calibrations for the CIFAR subset defaults.
 - `run_cifar_subset_once.sh`: smoke wrapper for the toy `image_conv` CIFAR subset path. Defaults to a 2-class CIFAR setup and keeps the same lightweight architecture family used by Simpsons.
+- `run_cifar_subset_family_compare_pipeline.sh`: run the locked EDM family, branch the RF family from the shared EDM warmup checkpoint, and then emit combined EDM-vs-RF compare plots for the CIFAR subset.
 
 ## Historical Or Experimental Scripts
 

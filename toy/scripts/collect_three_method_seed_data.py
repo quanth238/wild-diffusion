@@ -373,6 +373,36 @@ def _append_rf_cli_args(
         cmd.extend(["--rf-edm-init-ckpt-path", resolved_rf_edm_init_ckpt_path])
 
 
+def _append_rf_sweep_cli_args(
+    cmd: List[str],
+    args: argparse.Namespace,
+    *,
+    rf_edm_init_ckpt_path: Optional[str] = None,
+) -> None:
+    objective_is_rf = str(getattr(args, "training_objective", "")).strip().lower() == "rf"
+    resolved_rf_edm_init_ckpt_path = str(
+        rf_edm_init_ckpt_path if rf_edm_init_ckpt_path is not None else getattr(args, "rf_edm_init_ckpt_path", "")
+    ).strip()
+    if not objective_is_rf and not resolved_rf_edm_init_ckpt_path:
+        return
+    cmd.extend(
+        [
+            "--rf-baseline-mode",
+            str(args.rf_baseline_mode),
+            "--rf-reflow-t-distribution",
+            str(args.rf_reflow_t_distribution),
+            "--rf-loss",
+            str(args.rf_loss),
+            "--rf-pseudo-huber-delta",
+            str(args.rf_pseudo_huber_delta),
+            "--rf-cdro-pair-source",
+            str(args.rf_cdro_pair_source),
+        ]
+    )
+    if resolved_rf_edm_init_ckpt_path:
+        cmd.extend(["--rf-edm-init-ckpt-path", resolved_rf_edm_init_ckpt_path])
+
+
 def parse_int_list(text: str) -> List[int]:
     values = sorted({int(tok.strip()) for tok in text.split(",") if tok.strip()})
     if not values:
@@ -2871,7 +2901,7 @@ def _build_baseline_sweep_cmd(
         "--train-accelerator-count",
         str(args.train_accelerator_count),
     ]
-    _append_rf_cli_args(cmd, args)
+    _append_rf_sweep_cli_args(cmd, args)
     append_ema_cli_args(cmd, args)
     if float(args.weighted_inputgrad_alpha) > 0.0 and float(args.weighted_parambackward_beta) > 0.0:
         cmd.extend(
