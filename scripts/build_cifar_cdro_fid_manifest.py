@@ -72,8 +72,74 @@ def _safe_mean_field_any(payload: Dict, *keys: str):
     return None
 
 
+def _interpolate_trace_field(trace: List[Dict[str, float]], *, target_kimg: float, field: str) -> float:
+    if not trace:
+        raise RuntimeError(f"Cannot interpolate {field!r} without any trace rows.")
+    rows = sorted(trace, key=lambda item: item["kimg"])
+    exact = [row for row in rows if abs(float(row["kimg"]) - float(target_kimg)) <= 1e-9]
+    if exact:
+        return float(exact[-1][field])
+    if float(target_kimg) <= float(rows[0]["kimg"]):
+        return float(rows[0][field])
+    if float(target_kimg) >= float(rows[-1]["kimg"]):
+        return float(rows[-1][field])
+    for idx in range(1, len(rows)):
+        prev_row = rows[idx - 1]
+        row = rows[idx]
+        x0 = float(prev_row["kimg"])
+        x1 = float(row["kimg"])
+        if x0 <= float(target_kimg) <= x1:
+            if x1 <= x0:
+                return float(row[field])
+            frac = (float(target_kimg) - x0) / (x1 - x0)
+            y0 = float(prev_row[field])
+            y1 = float(row[field])
+            return float(y0 + frac * (y1 - y0))
+    return float(rows[-1][field])
+
+
+def _stitch_effective_total_sec(raw_trace: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    if not raw_trace:
+        return []
+    segments: List[List[Dict[str, float]]] = []
+    current_segment: List[Dict[str, float]] = []
+    prev_kimg = None
+    prev_total_sec = None
+    for row in raw_trace:
+        row_kimg = float(row["kimg"])
+        row_total_sec = float(row["total_sec"])
+        if current_segment and (
+            (prev_kimg is not None and row_kimg + 1e-9 < float(prev_kimg))
+            or (prev_total_sec is not None and row_total_sec + 1e-9 < float(prev_total_sec))
+        ):
+            segments.append(current_segment)
+            current_segment = []
+        current_segment.append(dict(row))
+        prev_kimg = row_kimg
+        prev_total_sec = row_total_sec
+    if current_segment:
+        segments.append(current_segment)
+
+    stitched: List[Dict[str, float]] = []
+    for segment in segments:
+        start_kimg = float(segment[0]["kimg"])
+        base_effective_sec = 0.0
+        if stitched:
+            base_effective_sec = _interpolate_trace_field(
+                stitched,
+                target_kimg=start_kimg,
+                field="effective_total_sec",
+            )
+        for row in segment:
+            row = dict(row)
+            row["effective_total_sec"] = float(base_effective_sec + float(row["total_sec"]))
+            stitched.append(row)
+    stitched.sort(key=lambda item: item["kimg"])
+    return stitched
+
+
 def load_stats_trace(path: Path) -> List[Dict[str, float]]:
-    trace: List[Dict[str, float]] = []
+    raw_trace: List[Dict[str, float]] = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -84,7 +150,7 @@ def load_stats_trace(path: Path) -> List[Dict[str, float]]:
             total_sec = _safe_mean_field(payload, "Timing/total_sec")
             if kimg is None or total_sec is None:
                 continue
-            trace.append(
+            raw_trace.append(
                 {
                     "kimg": float(kimg),
                     "total_sec": float(total_sec),
@@ -96,10 +162,9 @@ def load_stats_trace(path: Path) -> List[Dict[str, float]]:
                     "cdro_delta_ratio_mean": _safe_mean_field(payload, "CDRO/delta_ratio_mean"),
                 }
             )
-    if not trace:
+    if not raw_trace:
         raise RuntimeError(f"No stats rows found in {path}")
-    trace.sort(key=lambda item: item["kimg"])
-    return trace
+    return _stitch_effective_total_sec(raw_trace)
 
 
 def parse_kimg_list(text: str) -> List[int]:
@@ -204,6 +269,7 @@ def build_rows(args: argparse.Namespace):
             trace_row = {
                 "kimg": float(warmup_kimg),
                 "total_sec": 0.0,
+                "effective_total_sec": 0.0,
                 "loss": None,
                 "cdro_edm_clean_probe": None,
                 "cdro_outer_loss": None,
@@ -226,7 +292,7 @@ def build_rows(args: argparse.Namespace):
             )
             robust_wcu = float(robust_steps) * float(robust_step_wcu)
             robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
-            total_sec = float(warmup_sec + trace_row["total_sec"])
+            total_sec = float(warmup_sec + trace_row["effective_total_sec"])
             row_origin = "trajectory_robust_phase"
         eval_tag = f"cdro_kimg{int(kimg):06d}"
         loss_final = trace_row["cdro_outer_loss"]
@@ -246,9 +312,9 @@ def build_rows(args: argparse.Namespace):
                 "train_wall_clock_sec": float(total_sec),
                 "train_elapsed_sec": float(total_sec),
                 "train_gpu_hours": float(total_sec) / 3600.0,
-                "train_wall_clock_source": "normalized_baseline_warmup_plus_observed_cdro_stats_jsonl",
+                "train_wall_clock_source": "normalized_baseline_warmup_plus_stitched_cdro_stats_jsonl",
                 "baseline_train_wall_clock_sec_effective": float(warmup_sec),
-                "robust_train_wall_clock_sec_effective": float(trace_row["total_sec"]),
+                "robust_train_wall_clock_sec_effective": float(trace_row["effective_total_sec"]),
                 "baseline_train_wall_clock_source": "normalized_baseline_stats_jsonl",
                 "weighted_compute_units": float(warmup_wcu + robust_wcu),
                 "baseline_weighted_compute_units": float(warmup_wcu),
