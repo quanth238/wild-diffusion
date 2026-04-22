@@ -37,6 +37,8 @@ These are generic helpers, not the source of truth for the Simpsons method choic
 
 - `run_image_once.sh`: generic image-folder wrapper around `toy/run_toy.py`. Pass `METHOD_VERSION` explicitly when method choice matters.
 - `run_toy_once.sh`: generic toy-wrapper helper. Pass `METHOD_VERSION` explicitly when method choice matters.
+- `setup_cifar_subset_imagefolder.py`: stage a class-filtered CIFAR-10 train/test image_folder dataset plus matching FID ref for low-budget toy image runs.
+- `run_cifar_subset_once.sh`: smoke wrapper for the toy `image_conv` CIFAR subset path. Defaults to a 2-class CIFAR setup and keeps the same lightweight architecture family used by Simpsons.
 
 ## Historical Or Experimental Scripts
 
