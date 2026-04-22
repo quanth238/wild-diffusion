@@ -16,6 +16,7 @@ RUN_LOG="${RUN_LOG:-${LOG_DIR}/cdro_rho0_n008_n016_baseline80k_${CAMPAIGN_TAG}.l
 TICK_KIMG="${TICK_KIMG:-128}"
 DUMP_TICKS_FRESH="${DUMP_TICKS_FRESH:-1}"
 DUMP_TICKS_RESUME="${DUMP_TICKS_RESUME:-1}"
+RUN_N_STEPS="${RUN_N_STEPS:-8,16}"
 
 mkdir -p "${LOG_DIR}" "${TRAIN_OUTROOT}" "${EVAL_SWEEP_ROOT}"
 
@@ -35,12 +36,21 @@ for cmd_name in python bash find tee sort jq; do
   fi
 done
 
-exec > >(tee -a "${RUN_LOG}") 2>&1
+if [[ -r /proc/self/fd ]]; then
+  exec > >(tee -a "${RUN_LOG}") 2>&1
+else
+  exec >>"${RUN_LOG}" 2>&1
+fi
 
 # shellcheck disable=SC1090
 source "${VENV_DIR}/bin/activate"
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+if [[ ! -r /proc/self/maps || ! -r /proc/cpuinfo || ! -r /proc/sys/vm/mmap_min_addr ]]; then
+  # shellcheck disable=SC1091
+  source "${ROOT_DIR}/scripts/ensure_procfs_compat.sh"
+fi
 
 find_run_dir() {
   local n_steps="$1"
@@ -187,10 +197,25 @@ echo "[INFO] Campaign tag: ${CAMPAIGN_TAG}"
 echo "[INFO] Train outroot: ${TRAIN_OUTROOT}"
 echo "[INFO] Eval sweep root: ${EVAL_SWEEP_ROOT}"
 echo "[INFO] Run log: ${RUN_LOG}"
+echo "[INFO] RUN_N_STEPS: ${RUN_N_STEPS}"
 date -u
 nvidia-smi || true
 
-launch_and_eval 8
-launch_and_eval 16
+IFS=',' read -r -a run_n_steps_list <<< "${RUN_N_STEPS}"
+for raw_n_steps in "${run_n_steps_list[@]}"; do
+  n_steps="$(echo "${raw_n_steps}" | tr -d '[:space:]')"
+  if [[ -z "${n_steps}" ]]; then
+    continue
+  fi
+  case "${n_steps}" in
+    8|16)
+      launch_and_eval "${n_steps}"
+      ;;
+    *)
+      echo "[ERROR] Unsupported RUN_N_STEPS entry: ${n_steps} (expected 8 and/or 16)"
+      exit 1
+      ;;
+  esac
+done
 
 echo "[OK] rho=0 N=8/N=16 baseline-80k workflow complete."

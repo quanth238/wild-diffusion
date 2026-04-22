@@ -109,6 +109,11 @@ if ! command -v python >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ ! -r /proc/self/maps || ! -r /proc/cpuinfo || ! -r /proc/sys/vm/mmap_min_addr ]]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/ensure_procfs_compat.sh"
+fi
+
 if [[ "${INSTALL_DEPS}" == "auto" ]]; then
   if [[ "${ENV_MODE}" == "conda" ]]; then
     INSTALL_DEPS="0"

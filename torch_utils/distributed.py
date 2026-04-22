@@ -23,7 +23,8 @@ def init():
     if 'WORLD_SIZE' not in os.environ:
         os.environ['WORLD_SIZE'] = '1'
 
-    backend = 'gloo' if os.name == 'nt' else 'nccl'
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    backend = 'gloo' if os.name == 'nt' or world_size == 1 else 'nccl'
     torch.distributed.init_process_group(backend=backend, init_method='env://')
     torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
 
