@@ -13,6 +13,9 @@ EVAL_SWEEP_ROOT="${EVAL_SWEEP_ROOT:-${ROOT_DIR}/training-runs/fid-sweeps/cdro_rh
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/training-runs/fid-sweeps/logs}"
 PYTORCH_FID_REF="${PYTORCH_FID_REF:-${ROOT_DIR}/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/pytorch_fid_cifar10_train_ref_stats.npz}"
 RUN_LOG="${RUN_LOG:-${LOG_DIR}/cdro_rho0_n008_n016_baseline80k_${CAMPAIGN_TAG}.log}"
+TICK_KIMG="${TICK_KIMG:-128}"
+DUMP_TICKS_FRESH="${DUMP_TICKS_FRESH:-1}"
+DUMP_TICKS_RESUME="${DUMP_TICKS_RESUME:-1}"
 
 mkdir -p "${LOG_DIR}" "${TRAIN_OUTROOT}" "${EVAL_SWEEP_ROOT}"
 
@@ -41,38 +44,85 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 find_run_dir() {
   local n_steps="$1"
-  find "${TRAIN_OUTROOT}" -mindepth 1 -maxdepth 1 -type d \
+  find -L "${TRAIN_OUTROOT}" -mindepth 1 -maxdepth 1 -type d \
     -name "*-n$(printf '%03d' "${n_steps}")-rho0p0-*" | sort | tail -n 1
+}
+
+latest_training_state() {
+  local run_dir="$1"
+  find -L "${run_dir}" -mindepth 1 -maxdepth 1 -type f -name 'training-state-*.pt' | sort | tail -n 1
+}
+
+resume_existing_run() {
+  local run_dir="$1"
+  local target_kimg="$2"
+  local n_steps="$3"
+  local resume_state
+
+  resume_state="$(latest_training_state "${run_dir}")"
+  if [[ -z "${resume_state}" || ! -f "${resume_state}" ]]; then
+    echo "[ERROR] Could not find a resume state in ${run_dir}"
+    exit 1
+  fi
+
+  echo "[INFO] Resuming existing rho=0, N=${n_steps} run from ${resume_state##*/} to ${target_kimg} kimg"
+  RESUME="${resume_state}" \
+  DURATION_MIMG="$(python -c "print(${target_kimg} / 1000.0)")" \
+  BATCH=1024 \
+  BATCH_GPU=1024 \
+  LR=1e-5 \
+  WORKERS=16 \
+  ARCH=ddpmpp \
+  PRECOND=cdroedm \
+  COND=0 \
+  FP16=1 \
+  AUGMENT=0.12 \
+  DEBUG_EVAL=0 \
+  DEBUG_ADV_VISUAL=0 \
+  CIFAR_TRAIN_PERCENT=20 \
+  CIFAR_TRAIN_SEED=0 \
+  TICK_KIMG="${TICK_KIMG}" \
+  SNAP_TICKS=1 \
+  DUMP_TICKS="${DUMP_TICKS_RESUME}" \
+  SEED=0 \
+  ENV_MODE=venv \
+  INSTALL_DEPS=0 \
+  VENV_DIR="${VENV_DIR}" \
+  EXTRA_TRAIN_ARGS="--cdro-n-steps-path=${n_steps} --cdro-step-size=0.02 --cdro-total-budget-rho=0.0 --cdro-time-horizon=1.0 --cdro-sigma-min=0.002 --cdro-sigma-max=80.0 --cdro-edm-ladder-mode=stochastic_stratified_quantile --cdro-per-example-sigma-ladders=True --attack-num-steps=1 --outer-attack-weight=1.0 --outer-clean-weight=0.0" \
+    bash "${ROOT_DIR}/scripts/setup_and_train_cifar10.sh"
 }
 
 launch_and_eval() {
   local n_steps="$1"
   local run_dir
   local total_kimg
+  local target_state
   local eval_outdir="${EVAL_SWEEP_ROOT}/n$(printf '%03d' "${n_steps}")"
   local manifest_csv="${eval_outdir}/cifar10_cdro_budget_manifest.csv"
 
   mkdir -p "${eval_outdir}"
 
-  echo "[INFO] Launching rho=0, N=${n_steps} to target WCU ${TARGET_WCU}"
-  python "${ROOT_DIR}/scripts/launch_cifar20_cdro_budgeted.py" \
-    --outdir-root "${TRAIN_OUTROOT}" \
-    --target-wcu "${TARGET_WCU}" \
-    --batch-size 1024 \
-    --batch-gpu 1024 \
-    --cdro-n-steps-path "${n_steps}" \
-    --cdro-total-budget-rho 0.0 \
-    --outer-attack-weight 1.0 \
-    --outer-clean-weight 0.0 \
-    --tick-kimg 128 \
-    --snap-ticks 1 \
-    --dump-ticks 8 \
-    --env-mode venv \
-    --venv-dir "${VENV_DIR}" \
-    --install-deps 0 \
-    --launch
-
   run_dir="$(find_run_dir "${n_steps}")"
+  if [[ -z "${run_dir}" || ! -d "${run_dir}" ]]; then
+    echo "[INFO] Launching fresh rho=0, N=${n_steps} to target WCU ${TARGET_WCU}"
+    python "${ROOT_DIR}/scripts/launch_cifar20_cdro_budgeted.py" \
+      --outdir-root "${TRAIN_OUTROOT}" \
+      --target-wcu "${TARGET_WCU}" \
+      --batch-size 1024 \
+      --batch-gpu 1024 \
+      --cdro-n-steps-path "${n_steps}" \
+      --cdro-total-budget-rho 0.0 \
+      --outer-attack-weight 1.0 \
+      --outer-clean-weight 0.0 \
+      --tick-kimg "${TICK_KIMG}" \
+      --snap-ticks 1 \
+      --dump-ticks "${DUMP_TICKS_FRESH}" \
+      --env-mode venv \
+      --venv-dir "${VENV_DIR}" \
+      --install-deps 0 \
+      --launch
+    run_dir="$(find_run_dir "${n_steps}")"
+  fi
   if [[ -z "${run_dir}" || ! -d "${run_dir}" ]]; then
     echo "[ERROR] Could not resolve run dir for N=${n_steps}"
     exit 1
@@ -82,6 +132,13 @@ launch_and_eval() {
   if [[ -z "${total_kimg}" || "${total_kimg}" == "null" ]]; then
     echo "[ERROR] Could not resolve total_kimg_int from ${run_dir}/cdro_budget_plan.json"
     exit 1
+  fi
+  target_state="$(printf "%s/training-state-%06d.pt" "${run_dir}" "${total_kimg}")"
+
+  if [[ ! -f "${target_state}" ]]; then
+    resume_existing_run "${run_dir}" "${total_kimg}" "${n_steps}"
+  else
+    echo "[SKIP] Found ${target_state}; skipping training for N=${n_steps}"
   fi
 
   echo "[INFO] Completed training for N=${n_steps}; run_dir=${run_dir}"
