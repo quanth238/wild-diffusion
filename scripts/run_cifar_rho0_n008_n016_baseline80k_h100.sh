@@ -13,6 +13,7 @@ EVAL_SWEEP_ROOT="${EVAL_SWEEP_ROOT:-${ROOT_DIR}/training-runs/fid-sweeps/cdro_rh
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/training-runs/fid-sweeps/logs}"
 PYTORCH_FID_REF="${PYTORCH_FID_REF:-${ROOT_DIR}/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/pytorch_fid_cifar10_train_ref_stats.npz}"
 RUN_LOG="${RUN_LOG:-${LOG_DIR}/cdro_rho0_n008_n016_baseline80k_${CAMPAIGN_TAG}.log}"
+TRAIN_LR="${TRAIN_LR:-1e-5}"
 TICK_KIMG="${TICK_KIMG:-128}"
 DUMP_TICKS_FRESH="${DUMP_TICKS_FRESH:-1}"
 DUMP_TICKS_RESUME="${DUMP_TICKS_RESUME:-1}"
@@ -80,7 +81,7 @@ resume_existing_run() {
   DURATION_MIMG="$(python -c "print(${target_kimg} / 1000.0)")" \
   BATCH=1024 \
   BATCH_GPU=1024 \
-  LR=1e-5 \
+  LR="${TRAIN_LR}" \
   WORKERS=16 \
   ARCH=ddpmpp \
   PRECOND=cdroedm \
@@ -120,6 +121,7 @@ launch_and_eval() {
       --target-wcu "${TARGET_WCU}" \
       --batch-size 1024 \
       --batch-gpu 1024 \
+      --lr "${TRAIN_LR}" \
       --cdro-n-steps-path "${n_steps}" \
       --cdro-total-budget-rho 0.0 \
       --outer-attack-weight 1.0 \
@@ -197,6 +199,7 @@ echo "[INFO] Campaign tag: ${CAMPAIGN_TAG}"
 echo "[INFO] Train outroot: ${TRAIN_OUTROOT}"
 echo "[INFO] Eval sweep root: ${EVAL_SWEEP_ROOT}"
 echo "[INFO] Run log: ${RUN_LOG}"
+echo "[INFO] TRAIN_LR: ${TRAIN_LR}"
 echo "[INFO] RUN_N_STEPS: ${RUN_N_STEPS}"
 date -u
 nvidia-smi || true
