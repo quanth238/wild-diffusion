@@ -11,7 +11,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from toy.compute_accounting import load_weighted_compute_calibration, weighted_compute_units  # noqa: E402
+from toy.compute_accounting import (  # noqa: E402
+    denoiser_flops,
+    load_flop_calibration,
+    load_weighted_compute_calibration,
+    weighted_compute_units,
+)
 
 
 DEFAULT_BASELINE_RUN_DIR = (
@@ -32,6 +37,7 @@ DEFAULT_CALIBRATION_JSON = (
     "/home/bachlc/GM-CDRO/training-runs/compute_calibration/"
     "cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_20260414.json"
 )
+DEFAULT_FLOP_CALIBRATION_JSON = ""
 DEFAULT_PYTORCH_FID_REF = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
     "pytorch_fid_cifar10_train_ref_stats.npz"
@@ -142,6 +148,56 @@ def cdro_robust_step_weighted_compute_units(
     return float(value)
 
 
+def baseline_step_flops(*, calibration: Dict) -> float | None:
+    value = denoiser_flops(
+        n_fwd=0.0,
+        n_fwd_inputgrad=0.0,
+        n_fwd_parambackward=1.0,
+        calibration=calibration,
+    )
+    return None if value is None else float(value)
+
+
+def wdro_robust_step_flops(
+    *,
+    calibration: Dict,
+    attack_construction_units_per_step: float,
+) -> float | None:
+    value = denoiser_flops(
+        n_fwd=0.0,
+        n_fwd_inputgrad=float(max(float(attack_construction_units_per_step), 0.0)),
+        n_fwd_parambackward=1.0,
+        calibration=calibration,
+    )
+    return None if value is None else float(value)
+
+
+def cdro_robust_step_flops(
+    *,
+    calibration: Dict,
+    n_steps_path: int,
+    attack_num_steps: int,
+    outer_attack_weight: float,
+    outer_clean_weight: float,
+    total_budget_rho: float | None = None,
+) -> float | None:
+    path_steps = max(int(n_steps_path), 0)
+    attack_enabled = bool(
+        float(outer_attack_weight) > 0.0
+        and int(attack_num_steps) > 0
+        and (total_budget_rho is None or float(total_budget_rho) > 0.0)
+    )
+    clean_enabled = bool(float(outer_clean_weight) > 0.0)
+    active_outer_branches = int(float(outer_attack_weight) > 0.0) + int(clean_enabled)
+    value = denoiser_flops(
+        n_fwd=0.0,
+        n_fwd_inputgrad=float(path_steps * max(int(attack_num_steps), 0)) if attack_enabled else 0.0,
+        n_fwd_parambackward=float(path_steps * active_outer_branches),
+        calibration=calibration,
+    )
+    return None if value is None else float(value)
+
+
 def cdro_robust_step_compute_be(
     *,
     n_steps_path: int,
@@ -230,3 +286,8 @@ def calibration_from_path(calibration_json: str) -> Dict:
     if not calibration.get("available", False):
         raise RuntimeError(f"Weighted-compute calibration is unavailable: {calibration_json}")
     return calibration
+
+
+def flop_calibration_from_path(calibration_json: str) -> Dict:
+    calibration = load_flop_calibration(calibration_path=calibration_json)
+    return calibration if isinstance(calibration, dict) else {"available": False}

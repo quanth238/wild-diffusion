@@ -14,11 +14,15 @@ if str(ROOT_DIR) not in sys.path:
 
 from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     DEFAULT_CALIBRATION_JSON,
+    DEFAULT_FLOP_CALIBRATION_JSON,
     DEFAULT_PYTORCH_FID_REF,
     DEFAULT_WDRO_SUMMARY_JSON,
+    baseline_step_flops,
     calibration_from_path,
+    cdro_robust_step_flops,
     cdro_robust_step_compute_be,
     cdro_robust_step_weighted_compute_units,
+    flop_calibration_from_path,
     load_warmup_summary,
 )
 
@@ -34,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-run-dir", type=str, required=True)
     parser.add_argument("--summary-json", type=str, default=DEFAULT_WDRO_SUMMARY_JSON)
     parser.add_argument("--calibration-json", type=str, default=DEFAULT_CALIBRATION_JSON)
+    parser.add_argument("--flop-calibration-json", type=str, default=DEFAULT_FLOP_CALIBRATION_JSON)
     parser.add_argument("--outdir", type=str, default="")
     parser.add_argument("--manifest-name", type=str, default="cifar10_cdro_budget_manifest.csv")
     parser.add_argument("--summary-name", type=str, default="cifar10_cdro_budget_manifest_summary.json")
@@ -70,6 +75,10 @@ def _safe_mean_field_any(payload: Dict, *keys: str):
         if value is not None:
             return value
     return None
+
+
+def _blank_if_none(value: object):
+    return "" if value is None else value
 
 
 def _interpolate_trace_field(trace: List[Dict[str, float]], *, target_kimg: float, field: str) -> float:
@@ -220,6 +229,7 @@ def build_rows(args: argparse.Namespace):
     budget_plan = json.loads(budget_plan_path.read_text(encoding="utf-8"))
     cdro_config = dict(budget_plan.get("cdro_config", {}))
     calibration = calibration_from_path(args.calibration_json)
+    flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
     warmup_summary = load_warmup_summary(args.summary_json)
     trace = load_stats_trace(cdro_run_dir / "stats.jsonl")
     requested_kimg = parse_kimg_list(args.kimg)
@@ -249,10 +259,22 @@ def build_rows(args: argparse.Namespace):
         outer_clean_weight=float(cdro_config["outer_clean_weight"]),
         total_budget_rho=float(cdro_config["cdro_total_budget_rho"]),
     )
+    robust_step_flops = cdro_robust_step_flops(
+        calibration=flop_calibration,
+        n_steps_path=int(cdro_config["cdro_n_steps_path"]),
+        attack_num_steps=int(cdro_config["attack_num_steps"]),
+        outer_attack_weight=float(cdro_config["outer_attack_weight"]),
+        outer_clean_weight=float(cdro_config["outer_clean_weight"]),
+        total_budget_rho=float(cdro_config["cdro_total_budget_rho"]),
+    )
 
     warmup_wcu = float(warmup_summary["warmup_weighted_compute_units"])
     warmup_sec = float(warmup_summary["warmup_train_wall_clock_sec"])
     warmup_compute_be = float(warmup_summary["warmup_compute_be"])
+    baseline_step_train_flops = baseline_step_flops(calibration=flop_calibration)
+    warmup_train_flops = (
+        None if baseline_step_train_flops is None else float(warmup_compute_be) * float(baseline_step_train_flops)
+    )
 
     if args.outdir:
         outdir = Path(args.outdir).resolve()
@@ -294,6 +316,12 @@ def build_rows(args: argparse.Namespace):
             robust_compute_be = float(robust_steps) * float(robust_step_compute_be)
             total_sec = float(warmup_sec + trace_row["effective_total_sec"])
             row_origin = "trajectory_robust_phase"
+        robust_train_flops = (
+            None if robust_step_flops is None else float(robust_steps) * float(robust_step_flops)
+        )
+        total_train_flops = (
+            None if warmup_train_flops is None or robust_train_flops is None else float(warmup_train_flops + robust_train_flops)
+        )
         eval_tag = f"cdro_kimg{int(kimg):06d}"
         loss_final = trace_row["cdro_outer_loss"]
         if loss_final is None:
@@ -322,6 +350,24 @@ def build_rows(args: argparse.Namespace):
                 "compute_budget_be": float(warmup_compute_be + robust_compute_be),
                 "baseline_compute_be": float(warmup_compute_be),
                 "robust_compute_be": float(robust_compute_be),
+                "total_train_flops": _blank_if_none(None if total_train_flops is None else float(total_train_flops)),
+                "total_train_tflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e12
+                ),
+                "total_train_pflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e15
+                ),
+                "baseline_train_flops": _blank_if_none(
+                    None if warmup_train_flops is None else float(warmup_train_flops)
+                ),
+                "robust_train_flops": _blank_if_none(
+                    None if robust_train_flops is None else float(robust_train_flops)
+                ),
+                "train_flop_source": (
+                    "flop_calibration_cdro_path_primitive_counts"
+                    if total_train_flops is not None
+                    else ""
+                ),
                 "weighted_compute_source": "cifar_calibration_cdro_path_primitive_counts",
                 "warmup_steps_fixed": float(warmup_compute_be),
                 "robust_steps_observed": float(robust_steps),
@@ -374,11 +420,19 @@ def build_rows(args: argparse.Namespace):
         "manifest_version": "cifar_cdro_fid_manifest_v2",
         "cdro_run_dir": str(cdro_run_dir),
         "calibration_json": str(Path(args.calibration_json).resolve()),
+        "flop_calibration_json": (
+            str(Path(args.flop_calibration_json).resolve()) if str(args.flop_calibration_json).strip() else None
+        ),
         "summary_json": str(Path(args.summary_json).resolve()),
         "warmup_summary": warmup_summary,
         "cdro_config": cdro_config,
         "robust_step_weighted_compute_units": float(robust_step_wcu),
         "robust_step_compute_be": float(robust_step_compute_be),
+        "warmup_train_flops": None if warmup_train_flops is None else float(warmup_train_flops),
+        "baseline_step_train_flops": (
+            None if baseline_step_train_flops is None else float(baseline_step_train_flops)
+        ),
+        "robust_step_train_flops": None if robust_step_flops is None else float(robust_step_flops),
         "snapshot_kimg": [int(value) for value in snapshot_kimg],
         "budget_plan_path": str(budget_plan_path),
         "budget_plan": budget_plan,

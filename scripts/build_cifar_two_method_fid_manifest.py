@@ -19,6 +19,12 @@ from toy.compute_accounting import (  # noqa: E402
     wdro_expected_attack_construction_units_per_step,
     weighted_compute_units,
 )
+from scripts.cifar_cdro_budget_utils import (  # noqa: E402
+    DEFAULT_FLOP_CALIBRATION_JSON,
+    baseline_step_flops,
+    flop_calibration_from_path,
+    wdro_robust_step_flops,
+)
 
 
 DEFAULT_BASELINE_RUN_DIR = (
@@ -52,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-run-dir", type=str, default=DEFAULT_BASELINE_RUN_DIR)
     parser.add_argument("--wdro-run-dir", type=str, default=DEFAULT_WDRO_RUN_DIR)
     parser.add_argument("--calibration-json", type=str, default=DEFAULT_CALIBRATION_JSON)
+    parser.add_argument("--flop-calibration-json", type=str, default=DEFAULT_FLOP_CALIBRATION_JSON)
     parser.add_argument("--outdir", type=str, default=DEFAULT_OUTDIR)
     parser.add_argument("--manifest-name", type=str, default="cifar10_baseline_vs_wdro_coarse_manifest.csv")
     parser.add_argument("--summary-name", type=str, default="cifar10_baseline_vs_wdro_coarse_manifest_summary.json")
@@ -89,6 +96,10 @@ def _safe_mean_field(payload: Dict, key: str) -> float:
     if isinstance(value, dict):
         value = value.get("mean")
     return float(value)
+
+
+def _blank_if_none(value: object):
+    return "" if value is None else value
 
 
 def load_stats_trace(path: Path) -> List[Tuple[float, float]]:
@@ -181,6 +192,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
     calibration = load_weighted_compute_calibration(calibration_path=args.calibration_json)
     if not calibration.get("available", False):
         raise RuntimeError(f"Weighted-compute calibration is unavailable: {args.calibration_json}")
+    flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
 
     baseline_trace = load_stats_trace(baseline_run_dir / "stats.jsonl")
     wdro_trace = load_stats_trace(wdro_run_dir / "stats.jsonl")
@@ -198,6 +210,10 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         kimg=warmup_boundary_kimg,
         batch_size=args.batch_size,
     )
+    baseline_step_train_flops = baseline_step_flops(calibration=flop_calibration)
+    warmup_boundary_train_flops = (
+        None if baseline_step_train_flops is None else float(warmup_boundary_be) * float(baseline_step_train_flops)
+    )
 
     robust_attack_units_per_step = wdro_expected_attack_construction_units_per_step(
         batch_size=args.batch_size,
@@ -214,6 +230,10 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
     )
     assert robust_units_per_step is not None
     robust_be_per_step = 1.0 + float(robust_attack_units_per_step)
+    robust_flops_per_step = wdro_robust_step_flops(
+        calibration=flop_calibration,
+        attack_construction_units_per_step=robust_attack_units_per_step,
+    )
 
     outdir = Path(args.outdir).resolve()
     eval_root = outdir / "evals"
@@ -228,6 +248,9 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
             calibration=calibration,
         )
         compute_be = _baseline_compute_be_for_kimg(kimg=kimg, batch_size=args.batch_size)
+        total_train_flops = (
+            None if baseline_step_train_flops is None else float(compute_be) * float(baseline_step_train_flops)
+        )
         eval_tag = f"baseline_kimg{kimg:06d}"
         rows.append(
             {
@@ -253,6 +276,22 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                 "compute_budget_be": float(compute_be),
                 "baseline_compute_be": float(compute_be),
                 "robust_compute_be": 0.0,
+                "total_train_flops": _blank_if_none(None if total_train_flops is None else float(total_train_flops)),
+                "total_train_tflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e12
+                ),
+                "total_train_pflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e15
+                ),
+                "baseline_train_flops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops)
+                ),
+                "robust_train_flops": 0.0 if total_train_flops is not None else "",
+                "train_flop_source": (
+                    "flop_calibration_baseline"
+                    if total_train_flops is not None
+                    else ""
+                ),
                 "weighted_compute_source": "cifar_calibration_baseline",
                 "warmup_steps_fixed": float(compute_be),
                 "robust_steps_observed": 0.0,
@@ -281,6 +320,14 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         total_wall_clock_sec = float(warmup_boundary_sec + robust_wall_clock_sec)
         total_weighted_compute = float(warmup_boundary_wcu + robust_weighted_compute)
         total_compute_be = float(warmup_boundary_be + robust_compute_be)
+        robust_train_flops = (
+            None if robust_flops_per_step is None else float(robust_steps) * float(robust_flops_per_step)
+        )
+        total_train_flops = (
+            None
+            if warmup_boundary_train_flops is None or robust_train_flops is None
+            else float(warmup_boundary_train_flops + robust_train_flops)
+        )
         eval_tag = f"wild_diffusion_kimg{kimg:06d}"
         rows.append(
             {
@@ -306,6 +353,24 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                 "compute_budget_be": float(total_compute_be),
                 "baseline_compute_be": float(warmup_boundary_be),
                 "robust_compute_be": float(robust_compute_be),
+                "total_train_flops": _blank_if_none(None if total_train_flops is None else float(total_train_flops)),
+                "total_train_tflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e12
+                ),
+                "total_train_pflops": _blank_if_none(
+                    None if total_train_flops is None else float(total_train_flops) / 1e15
+                ),
+                "baseline_train_flops": _blank_if_none(
+                    None if warmup_boundary_train_flops is None else float(warmup_boundary_train_flops)
+                ),
+                "robust_train_flops": _blank_if_none(
+                    None if robust_train_flops is None else float(robust_train_flops)
+                ),
+                "train_flop_source": (
+                    "flop_calibration_expected_wdro"
+                    if total_train_flops is not None
+                    else ""
+                ),
                 "weighted_compute_source": "cifar_calibration_expected_wdro",
                 "warmup_steps_fixed": float(warmup_boundary_be),
                 "robust_steps_observed": float(robust_steps),
@@ -330,15 +395,27 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         "baseline_run_dir": str(baseline_run_dir),
         "wdro_run_dir": str(wdro_run_dir),
         "calibration_json": str(Path(args.calibration_json).resolve()),
+        "flop_calibration_json": (
+            str(Path(args.flop_calibration_json).resolve()) if str(args.flop_calibration_json).strip() else None
+        ),
         "train_percent_label": str(args.train_percent_label),
         "seed": int(args.seed),
         "warmup_boundary_kimg": warmup_boundary_kimg,
         "warmup_boundary_train_wall_clock_sec": float(warmup_boundary_sec),
         "warmup_boundary_weighted_compute_units": float(warmup_boundary_wcu),
         "warmup_boundary_compute_be": float(warmup_boundary_be),
+        "warmup_boundary_train_flops": (
+            None if warmup_boundary_train_flops is None else float(warmup_boundary_train_flops)
+        ),
         "wdro_attack_units_per_step": float(robust_attack_units_per_step),
         "wdro_weighted_units_per_step": float(robust_units_per_step),
         "wdro_compute_be_per_step": float(robust_be_per_step),
+        "baseline_step_train_flops": (
+            None if baseline_step_train_flops is None else float(baseline_step_train_flops)
+        ),
+        "wdro_train_flops_per_step": (
+            None if robust_flops_per_step is None else float(robust_flops_per_step)
+        ),
         "baseline_kimg_grid": baseline_kimg_grid,
         "wdro_kimg_grid": wdro_kimg_grid,
         "num_rows": len(rows),

@@ -301,10 +301,12 @@ def summarize_rows(rows: List[Dict[str, object]]) -> Dict[str, object]:
             "best_fid": float(best_row["fid"]),
             "best_step": int(float(best_row["step"])),
             "best_weighted_compute_units": _safe_float(best_row.get("weighted_compute_units")),
+            "best_total_train_pflops": _safe_float(best_row.get("total_train_pflops")),
             "best_train_wall_clock_sec": _safe_float(best_row.get("train_wall_clock_sec")),
             "final_step": int(float(final_row["step"])),
             "final_fid": float(final_row["fid"]),
             "final_weighted_compute_units": _safe_float(final_row.get("weighted_compute_units")),
+            "final_total_train_pflops": _safe_float(final_row.get("total_train_pflops")),
             "final_train_wall_clock_sec": _safe_float(final_row.get("train_wall_clock_sec")),
         }
     return {"methods": per_method, "num_rows": len(rows)}

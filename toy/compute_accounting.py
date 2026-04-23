@@ -234,6 +234,30 @@ def _timing_stat_sec(payload: Optional[Dict[str, Any]], op_name: str, stat_key: 
     return _safe_float(op_stats.get(stat_key))
 
 
+def _flop_stat_value(payload: Optional[Dict[str, Any]], op_name: str) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    candidate_groups = []
+    flops = payload.get("flops")
+    if isinstance(flops, dict):
+        candidate_groups.append(flops)
+    candidate_groups.append(payload)
+    for group in candidate_groups:
+        if not isinstance(group, dict):
+            continue
+        op_stats = group.get(op_name)
+        if isinstance(op_stats, dict):
+            for key in ("per_batch_flops", "flops", "total_flops"):
+                value = _safe_float(op_stats.get(key))
+                if value is not None and value > 0.0:
+                    return float(value)
+        elif op_stats is not None:
+            value = _safe_float(op_stats)
+            if value is not None and value > 0.0:
+                return float(value)
+    return None
+
+
 def resolve_default_weighted_compute_calibration_path(
     *,
     calibration_path: str = "",
@@ -383,6 +407,131 @@ def load_weighted_compute_calibration(
     }
 
 
+def load_flop_calibration(
+    *,
+    calibration_path: str = "",
+    forward_flops: float = 0.0,
+    inputgrad_flops: float = 0.0,
+    parambackward_flops: float = 0.0,
+    training_objective: Optional[str] = None,
+    image_backbone: Optional[str] = None,
+    batch_size: Optional[int] = None,
+    hidden_dim: Optional[int] = None,
+    image_size: Optional[int] = None,
+    image_channels: Optional[int] = None,
+    device: Optional[str] = None,
+    device_name: Optional[str] = None,
+    amp_dtype: Optional[str] = None,
+    allow_tf32: Optional[bool] = None,
+    cudnn_benchmark: Optional[bool] = None,
+    score_matching_weight_power: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Resolve FLOP calibration from explicit values or a JSON payload."""
+
+    explicit_forward = _safe_float(forward_flops)
+    explicit_inputgrad = _safe_float(inputgrad_flops)
+    explicit_parambackward = _safe_float(parambackward_flops)
+    if (
+        explicit_forward is not None
+        and explicit_forward > 0.0
+        and explicit_inputgrad is not None
+        and explicit_inputgrad > 0.0
+        and explicit_parambackward is not None
+        and explicit_parambackward > 0.0
+    ):
+        return {
+            "available": True,
+            "forward_flops": float(explicit_forward),
+            "inputgrad_flops": float(explicit_inputgrad),
+            "parambackward_flops": float(explicit_parambackward),
+            "source": "explicit_cli",
+            "calibration_path": None,
+            "payload": None,
+            "compatibility": {
+                "available": False,
+                "required_match": True,
+                "exact_hardware_match": True,
+                "required_mismatches": [],
+                "advisory_mismatches": [],
+            },
+        }
+
+    path = str(calibration_path).strip()
+    if not path:
+        return {
+            "available": False,
+            "forward_flops": None,
+            "inputgrad_flops": None,
+            "parambackward_flops": None,
+            "source": "unavailable",
+            "calibration_path": None,
+            "payload": None,
+            "compatibility": {
+                "available": False,
+                "required_match": True,
+                "exact_hardware_match": True,
+                "required_mismatches": [],
+                "advisory_mismatches": [],
+            },
+        }
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"FLOP calibration file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    forward_value = _flop_stat_value(payload, "forward_only")
+    inputgrad_value = _flop_stat_value(payload, "forward_plus_inputgrad")
+    parambackward_value = _flop_stat_value(payload, "forward_plus_parambackward")
+    if (
+        forward_value is None
+        or forward_value <= 0.0
+        or inputgrad_value is None
+        or inputgrad_value <= 0.0
+        or parambackward_value is None
+        or parambackward_value <= 0.0
+    ):
+        raise RuntimeError(
+            f"Invalid FLOP calibration payload at {path}: "
+            "expected positive per-batch FLOP values for forward_only, "
+            "forward_plus_inputgrad, and forward_plus_parambackward."
+        )
+    compatibility = calibration_compatibility_report(
+        payload=payload,
+        training_objective=training_objective,
+        image_backbone=image_backbone,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        image_size=image_size,
+        image_channels=image_channels,
+        device=device,
+        device_name=device_name,
+        amp_dtype=amp_dtype,
+        allow_tf32=allow_tf32,
+        cudnn_benchmark=cudnn_benchmark,
+        score_matching_weight_power=score_matching_weight_power,
+    )
+    if compatibility["available"] and not compatibility["required_match"]:
+        mismatch_parts = [
+            f"{item['field']}: expected={item['expected']} actual={item['actual']}"
+            for item in compatibility["required_mismatches"]
+        ]
+        mismatch_text = "; ".join(mismatch_parts) if mismatch_parts else "unknown mismatch"
+        raise RuntimeError(
+            "FLOP calibration is incompatible with the active workload/runtime: "
+            f"{mismatch_text}. Calibration path: {os.path.abspath(path)}"
+        )
+    return {
+        "available": True,
+        "forward_flops": float(forward_value),
+        "inputgrad_flops": float(inputgrad_value),
+        "parambackward_flops": float(parambackward_value),
+        "source": "calibration_json",
+        "calibration_path": os.path.abspath(path),
+        "payload": payload,
+        "compatibility": compatibility,
+    }
+
+
 def weighted_compute_units(
     *,
     n_fwd: float,
@@ -399,6 +548,65 @@ def weighted_compute_units(
         + float(calibration["inputgrad_alpha"]) * float(n_fwd_inputgrad)
         + float(calibration["parambackward_beta"]) * float(n_fwd_parambackward)
     )
+
+
+def denoiser_flops(
+    *,
+    n_fwd: float,
+    n_fwd_inputgrad: float,
+    n_fwd_parambackward: float,
+    calibration: Dict[str, Any],
+) -> Optional[float]:
+    """Compute total denoiser FLOPs from primitive op counts."""
+
+    if not calibration.get("available", False):
+        return None
+    return (
+        float(n_fwd) * float(calibration["forward_flops"])
+        + float(n_fwd_inputgrad) * float(calibration["inputgrad_flops"])
+        + float(n_fwd_parambackward) * float(calibration["parambackward_flops"])
+    )
+
+
+def denoiser_flops_from_count_record(
+    *,
+    count_record: Dict[str, Any],
+    calibration: Dict[str, Any],
+    override_n_fwd: Optional[float] = None,
+) -> Optional[float]:
+    """Compute total denoiser FLOPs from a recorded count dict."""
+
+    if not isinstance(count_record, dict):
+        return None
+    n_fwd = _safe_float(count_record.get("n_fwd"))
+    n_fwd_inputgrad = _safe_float(count_record.get("n_fwd_inputgrad"))
+    n_fwd_parambackward = _safe_float(count_record.get("n_fwd_parambackward"))
+    if n_fwd is None or n_fwd_inputgrad is None or n_fwd_parambackward is None:
+        return None
+    return denoiser_flops(
+        n_fwd=float(override_n_fwd) if override_n_fwd is not None else float(n_fwd),
+        n_fwd_inputgrad=float(n_fwd_inputgrad),
+        n_fwd_parambackward=float(n_fwd_parambackward),
+        calibration=calibration,
+    )
+
+
+def flops_to_gflops(flops: Optional[float]) -> Optional[float]:
+    if flops is None:
+        return None
+    return float(flops) / 1e9
+
+
+def flops_to_tflops(flops: Optional[float]) -> Optional[float]:
+    if flops is None:
+        return None
+    return float(flops) / 1e12
+
+
+def flops_to_pflops(flops: Optional[float]) -> Optional[float]:
+    if flops is None:
+        return None
+    return float(flops) / 1e15
 
 
 def weighted_compute_units_from_count_record(

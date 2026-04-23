@@ -212,3 +212,12 @@ Treat older transfer writeups as stale unless they are revalidated and reintrodu
 For one-command CIFAR-10 evaluation (generate + FID + exported JSON/TXT logs), see:
 
 - `scripts/README_cifar10_eval_one_command.md`
+
+## Compute Calibration
+
+The repo now has separate calibration scripts for the CIFAR image stack:
+
+- Weighted compute ratios: `python scripts/calibrate_cifar_weighted_compute.py --out-json training-runs/compute_calibration/cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_weighted.json`
+- FLOP calibration for `TFLOPs` / `PFLOPs` manifest columns: `python scripts/calibrate_cifar_flops.py --out-json training-runs/compute_calibration/cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_flops.json`
+
+The FLOP script uses `torch.profiler` operator FLOP accounting on the same three primitive denoiser operations used by the WCU pipeline: `forward_only`, `forward_plus_inputgrad`, and `forward_plus_parambackward`.
