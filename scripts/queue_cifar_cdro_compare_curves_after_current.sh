@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
-TARGET_JOB_ID="${TARGET_JOB_ID:-10640}"
+TARGET_JOB_ID="${TARGET_JOB_ID:?TARGET_JOB_ID is required}"
 CURRENT_RUN_LOG="${CURRENT_RUN_LOG:?CURRENT_RUN_LOG is required}"
 CURRENT_DONE_PATTERN="${CURRENT_DONE_PATTERN:-[OK] N=4 positive-rho sweep complete.}"
 POLL_SEC="${POLL_SEC:-60}"

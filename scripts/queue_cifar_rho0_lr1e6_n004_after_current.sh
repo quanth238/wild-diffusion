@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
-TARGET_JOB_ID="${TARGET_JOB_ID:-10640}"
+TARGET_JOB_ID="${TARGET_JOB_ID:?TARGET_JOB_ID is required}"
 CURRENT_RUN_LOG="${CURRENT_RUN_LOG:-/mnt/data/bachlc/GM-CDRO/training-runs/fid-sweeps/logs/cdro_rho0_n004_baseline80k_20260422T094845Z.log}"
 CURRENT_DONE_PATTERN="${CURRENT_DONE_PATTERN:-[OK] rho=0 N=4 baseline-80k workflow complete.}"
 POLL_SEC="${POLL_SEC:-60}"

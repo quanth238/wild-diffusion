@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
-JOB_ID="${JOB_ID:-10640}"
+JOB_ID="${JOB_ID:?JOB_ID is required}"
 TMUX_TARGET="${TMUX_TARGET:-bachlc:h100}"
 LAUNCH_SCRIPT="${LAUNCH_SCRIPT:-${ROOT_DIR}/scripts/run_cifar_rho0_n001_confirmation_h100.sh}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/training-runs/fid-sweeps/logs}"
