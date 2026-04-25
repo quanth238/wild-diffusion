@@ -113,6 +113,10 @@ def next_run_dir(outdir_root: Path, desc: str) -> Path:
     return outdir_root / f"{run_id:05d}-{desc}"
 
 
+def format_float_tag(value: float) -> str:
+    return format(float(value), ".6g").replace("-", "m").replace("+", "").replace(".", "p")
+
+
 def format_run_desc(args: argparse.Namespace, target_wcu: float) -> str:
     wcu_tag = f"{int(round(float(target_wcu))):06d}"
     desc = (
@@ -120,7 +124,7 @@ def format_run_desc(args: argparse.Namespace, target_wcu: float) -> str:
         f"uncond-{args.arch}-cdroedm-gpus1-batch{int(args.batch_size)}-"
         f"{'fp16' if int(args.fp16) else 'fp32'}-paper-cifar10-uncond-{args.arch}-cdro-"
         f"{int(args.cifar_train_percent)}pct-n{int(args.cdro_n_steps_path):03d}-"
-        f"rho{float(args.cdro_total_budget_rho):.1f}-i{int(args.attack_num_steps)}-"
+        f"rho{format_float_tag(args.cdro_total_budget_rho)}-i{int(args.attack_num_steps)}-"
         f"aw{float(args.outer_attack_weight):.2f}-cw{float(args.outer_clean_weight):.2f}-"
         f"pel{int(bool(args.cdro_per_example_sigma_ladders))}-"
         f"bg{int(args.batch_gpu)}-resume{int(args.baseline_resume_kimg):06d}-wcu{wcu_tag}"
