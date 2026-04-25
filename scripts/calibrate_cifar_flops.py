@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attack-gamma", type=float, default=1.0)
     parser.add_argument("--warmup-iters", type=int, default=3)
     parser.add_argument("--measure-iters", type=int, default=5)
+    parser.add_argument("--training-inputgrad-forward-multiplier", type=float, default=2.0)
+    parser.add_argument("--training-parambackward-forward-multiplier", type=float, default=3.0)
     return parser.parse_args()
 
 
@@ -290,6 +292,12 @@ def main() -> None:
     parambackward_median = float(parambackward_stats["per_batch_flops"])
     if forward_median <= 0.0:
         raise RuntimeError(f"Forward-only FLOP benchmark returned a non-positive median: {forward_median}")
+    inputgrad_training_multiplier = float(args.training_inputgrad_forward_multiplier)
+    parambackward_training_multiplier = float(args.training_parambackward_forward_multiplier)
+    if inputgrad_training_multiplier <= 0.0 or parambackward_training_multiplier <= 0.0:
+        raise RuntimeError("Training FLOP multipliers must be positive.")
+    training_inputgrad_flops = float(forward_median * inputgrad_training_multiplier)
+    training_parambackward_flops = float(forward_median * parambackward_training_multiplier)
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     device_name = str(torch.cuda.get_device_name(device_index))
@@ -333,10 +341,58 @@ def main() -> None:
             "flop_definition": "sum(key_averages().flops) over profiler-supported operators per measured batch",
             "activities": [str(activity).split(".")[-1].lower() for activity in _profiler_activities(device)],
         },
+        "flop_accounting": {
+            "selected_cost_group": "training_flops",
+            "selected_cost_source": "analytical_training_from_profiler_forward",
+            "rationale": (
+                "torch.profiler with_flops is used to measure forward-only denoiser FLOPs. "
+                "CUDA backward FLOP attribution is incomplete for autograd graphs, so training "
+                "compute uses the standard analytical convention: forward+input-gradient = 2x "
+                "forward and forward+parameter-backward = 3x forward."
+            ),
+        },
         "flops": {
             "forward_only": forward_stats,
             "forward_plus_inputgrad": inputgrad_stats,
             "forward_plus_parambackward": parambackward_stats,
+        },
+        "training_flops": {
+            "source": "analytical_training_from_profiler_forward",
+            "definition": (
+                "Measured forward-only torch.profiler FLOPs; input-gradient primitive = "
+                f"{inputgrad_training_multiplier:g}x forward; parameter-backward training primitive = "
+                f"{parambackward_training_multiplier:g}x forward."
+            ),
+            "forward_only": {
+                "per_batch_flops": float(forward_median),
+                "per_image_flops": float(forward_median / float(args.batch_size)),
+                "forward_multiplier": 1.0,
+            },
+            "forward_plus_inputgrad": {
+                "per_batch_flops": float(training_inputgrad_flops),
+                "per_image_flops": float(training_inputgrad_flops / float(args.batch_size)),
+                "forward_multiplier": float(inputgrad_training_multiplier),
+            },
+            "forward_plus_parambackward": {
+                "per_batch_flops": float(training_parambackward_flops),
+                "per_image_flops": float(training_parambackward_flops / float(args.batch_size)),
+                "forward_multiplier": float(parambackward_training_multiplier),
+            },
+        },
+        "profiler_diagnostics": {
+            "forward_plus_inputgrad_profiler_over_forward": float(inputgrad_median / forward_median),
+            "forward_plus_parambackward_profiler_over_forward": float(parambackward_median / forward_median),
+            "forward_plus_inputgrad_wall_clock_over_forward": float(
+                inputgrad_stats["median_wall_clock_sec"] / forward_stats["median_wall_clock_sec"]
+            ),
+            "forward_plus_parambackward_wall_clock_over_forward": float(
+                parambackward_stats["median_wall_clock_sec"] / forward_stats["median_wall_clock_sec"]
+            ),
+            "note": (
+                "Profiler FLOP ratios near 1x for backward workloads indicate unsupported or "
+                "incomplete CUDA backward FLOP attribution; use training_flops for reported "
+                "training compute."
+            ),
         },
         "ratios": {
             "inputgrad_alpha": float(inputgrad_median / forward_median),
@@ -353,8 +409,10 @@ def main() -> None:
         "[flop-calibration] "
         f"device={device_name} batch={int(args.batch_size)} fp16={bool(args.fp16)} "
         f"forward_per_batch_flops={forward_median:.3e} "
-        f"inputgrad_alpha={payload['ratios']['inputgrad_alpha']:.4f} "
-        f"parambackward_beta={payload['ratios']['parambackward_beta']:.4f}",
+        f"training_inputgrad={inputgrad_training_multiplier:.3g}x "
+        f"training_parambackward={parambackward_training_multiplier:.3g}x "
+        f"profiler_inputgrad_alpha={payload['ratios']['inputgrad_alpha']:.4f} "
+        f"profiler_parambackward_beta={payload['ratios']['parambackward_beta']:.4f}",
         flush=True,
     )
     print(f"[flop-calibration] wrote {out_json}", flush=True)

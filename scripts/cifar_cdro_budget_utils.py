@@ -291,3 +291,27 @@ def calibration_from_path(calibration_json: str) -> Dict:
 def flop_calibration_from_path(calibration_json: str) -> Dict:
     calibration = load_flop_calibration(calibration_path=calibration_json)
     return calibration if isinstance(calibration, dict) else {"available": False}
+
+
+def flop_metadata_fields(calibration: Dict) -> Dict[str, object]:
+    if not isinstance(calibration, dict) or not calibration.get("available", False):
+        return {
+            "train_flop_cost_source": "",
+            "train_flop_cost_group": "",
+            "train_flop_definition": "",
+            "train_flop_forward_per_batch": "",
+            "train_flop_inputgrad_per_batch": "",
+            "train_flop_parambackward_per_batch": "",
+            "train_flop_inputgrad_forward_multiplier": "",
+            "train_flop_parambackward_forward_multiplier": "",
+        }
+    return {
+        "train_flop_cost_source": str(calibration.get("flop_cost_source", "")),
+        "train_flop_cost_group": str(calibration.get("flop_cost_group", "")),
+        "train_flop_definition": str(calibration.get("flop_definition", "")),
+        "train_flop_forward_per_batch": float(calibration["forward_flops"]),
+        "train_flop_inputgrad_per_batch": float(calibration["inputgrad_flops"]),
+        "train_flop_parambackward_per_batch": float(calibration["parambackward_flops"]),
+        "train_flop_inputgrad_forward_multiplier": float(calibration["inputgrad_forward_multiplier"]),
+        "train_flop_parambackward_forward_multiplier": float(calibration["parambackward_forward_multiplier"]),
+    }

@@ -23,6 +23,7 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     DEFAULT_FLOP_CALIBRATION_JSON,
     baseline_step_flops,
     flop_calibration_from_path,
+    flop_metadata_fields,
     wdro_robust_step_flops,
 )
 
@@ -193,6 +194,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
     if not calibration.get("available", False):
         raise RuntimeError(f"Weighted-compute calibration is unavailable: {args.calibration_json}")
     flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
+    flop_metadata = flop_metadata_fields(flop_calibration)
 
     baseline_trace = load_stats_trace(baseline_run_dir / "stats.jsonl")
     wdro_trace = load_stats_trace(wdro_run_dir / "stats.jsonl")
@@ -292,6 +294,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                     if total_train_flops is not None
                     else ""
                 ),
+                **flop_metadata,
                 "weighted_compute_source": "cifar_calibration_baseline",
                 "warmup_steps_fixed": float(compute_be),
                 "robust_steps_observed": 0.0,
@@ -371,6 +374,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                     if total_train_flops is not None
                     else ""
                 ),
+                **flop_metadata,
                 "weighted_compute_source": "cifar_calibration_expected_wdro",
                 "warmup_steps_fixed": float(warmup_boundary_be),
                 "robust_steps_observed": float(robust_steps),
@@ -416,6 +420,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         "wdro_train_flops_per_step": (
             None if robust_flops_per_step is None else float(robust_flops_per_step)
         ),
+        "flop_metadata": flop_metadata,
         "baseline_kimg_grid": baseline_kimg_grid,
         "wdro_kimg_grid": wdro_kimg_grid,
         "num_rows": len(rows),

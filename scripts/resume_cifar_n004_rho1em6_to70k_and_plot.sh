@@ -16,7 +16,13 @@ VENV_DIR="${VENV_DIR:-/home/bachlc/.venvs/wild-diffusion-h100}"
 RUN_DIR="${RUN_DIR:-/mnt/data/bachlc/GM-CDRO/training-runs/paper-cifar10-cdro-fp16-n004-rho1em6-edm200mimg_20260422T150118Z/rho1em06/00000-cifar10-32x32-train20pct-seed0-uncond-ddpmpp-cdroedm-gpus1-batch1024-fp16-paper-cifar10-uncond-ddpmpp-cdro-20pct-n004-rho0p0-i1-aw1p00-cw0p00-pel1-bg1024-resume040000-wcu460371}"
 SWEEP_ROOT="${SWEEP_ROOT:-/mnt/data/bachlc/GM-CDRO/training-runs/fid-sweeps/cdro_n004_rho1em6_edm200mimg_20260422T150118Z/rho1em06}"
 LOG_DIR="${LOG_DIR:-/mnt/data/bachlc/GM-CDRO/training-runs/fid-sweeps/logs}"
-RUN_LOG="${RUN_LOG:-${LOG_DIR}/cdro_n004_rho1em6_resume70k_and_plot_$(date -u +%Y%m%dT%H%M%SZ).log}"
+RUN_LOG="${RUN_LOG:-${LOG_DIR}/cdro_n004_rho1em6_resume${TARGET_KIMG}k_and_plot_$(date -u +%Y%m%dT%H%M%SZ).log}"
+TRAIN_TICK_KIMG="${TRAIN_TICK_KIMG:-128}"
+TRAIN_SNAP_TICKS="${TRAIN_SNAP_TICKS:-1}"
+TRAIN_DUMP_TICKS="${TRAIN_DUMP_TICKS:-1}"
+FLOP_CALIBRATION_JSON="${FLOP_CALIBRATION_JSON:-}"
+EXTRA_FID_KIMG="${EXTRA_FID_KIMG:-}"
+EXTRA_LOSS_KIMG="${EXTRA_LOSS_KIMG:-}"
 
 FID_OUTDIR="${FID_OUTDIR:-${SWEEP_ROOT}/posthoc_fid_curve}"
 LOSS_OUTDIR="${LOSS_OUTDIR:-${SWEEP_ROOT}/posthoc_loss_curve}"
@@ -48,6 +54,10 @@ echo "[INFO] Host: $(hostname)"
 echo "[INFO] Target kimg: ${TARGET_KIMG}"
 echo "[INFO] Run dir: ${RUN_DIR}"
 echo "[INFO] Run log: ${RUN_LOG}"
+echo "[INFO] Train tick kimg: ${TRAIN_TICK_KIMG}"
+echo "[INFO] Snapshot ticks: ${TRAIN_SNAP_TICKS}"
+echo "[INFO] State dump ticks: ${TRAIN_DUMP_TICKS}"
+echo "[INFO] FLOP calibration JSON: ${FLOP_CALIBRATION_JSON:-none}"
 
 for path in "${RUN_DIR}" "${VENV_DIR}" "${PYTORCH_FID_REF}" "${BASE_COMPARE_CSV}"; do
   if [[ ! -e "${path}" ]]; then
@@ -55,6 +65,10 @@ for path in "${RUN_DIR}" "${VENV_DIR}" "${PYTORCH_FID_REF}" "${BASE_COMPARE_CSV}
     exit 1
   fi
 done
+if [[ -n "${FLOP_CALIBRATION_JSON}" && ! -f "${FLOP_CALIBRATION_JSON}" ]]; then
+  echo "[ERROR] FLOP calibration JSON is missing: ${FLOP_CALIBRATION_JSON}"
+  exit 1
+fi
 
 for cmd_name in python3 python bash find sort tail tee; do
   if ! command -v "${cmd_name}" >/dev/null 2>&1; then
@@ -182,9 +196,9 @@ if (( current_kimg < TARGET_KIMG )); then
   DEBUG_ADV_VISUAL=0 \
   CIFAR_TRAIN_PERCENT=20 \
   CIFAR_TRAIN_SEED=0 \
-  TICK_KIMG=128 \
-  SNAP_TICKS=1 \
-  DUMP_TICKS=1 \
+  TICK_KIMG="${TRAIN_TICK_KIMG}" \
+  SNAP_TICKS="${TRAIN_SNAP_TICKS}" \
+  DUMP_TICKS="${TRAIN_DUMP_TICKS}" \
   SEED=0 \
   ENV_MODE=venv \
   INSTALL_DEPS=0 \
@@ -193,6 +207,11 @@ if (( current_kimg < TARGET_KIMG )); then
     bash "${ROOT_DIR}/scripts/setup_and_train_cifar10.sh"
 else
   echo "[SKIP] Training already has snapshot >= ${TARGET_KIMG} kimg"
+fi
+
+build_manifest_flop_args=()
+if [[ -n "${FLOP_CALIBRATION_JSON}" ]]; then
+  build_manifest_flop_args=(--flop-calibration-json "${FLOP_CALIBRATION_JSON}")
 fi
 
 final_kimg="$(latest_snapshot_kimg)"
@@ -210,8 +229,16 @@ if [[ -f "${LOSS_MANIFEST}" ]]; then
   cp -p "${LOSS_MANIFEST}" "${LOSS_MANIFEST}.bak_${backup_tag}"
 fi
 
-fid_kimg_list="$(append_unique_kimg_csv "${FID_MANIFEST}" "${final_kimg}" "40000,41921,43969,46017,48065,50113,52161,61967")"
-loss_kimg_list="$(append_unique_kimg_csv "${LOSS_MANIFEST}" "${final_kimg}" "40000,40129,40513,40769,41025,41281,41665,41921,42177,42561,42817,43073,43329,43713,43969,44225,44609,44865,45121,45377,45761,46017,46273,46657,46913,47169,47425,47809,48065,48321,48705,48961,49217,49473,49857,50113,50369,50753,51009,51265,51521,51905,52161,52417,52801,52930,54978,57026,60098,61967")"
+fid_seed_kimg="40000,41921,43969,46017,48065,50113,52161,61967"
+loss_seed_kimg="40000,40129,40513,40769,41025,41281,41665,41921,42177,42561,42817,43073,43329,43713,43969,44225,44609,44865,45121,45377,45761,46017,46273,46657,46913,47169,47425,47809,48065,48321,48705,48961,49217,49473,49857,50113,50369,50753,51009,51265,51521,51905,52161,52417,52801,52930,54978,57026,60098,61967"
+if [[ -n "${EXTRA_FID_KIMG}" ]]; then
+  fid_seed_kimg="${fid_seed_kimg},${EXTRA_FID_KIMG}"
+fi
+if [[ -n "${EXTRA_LOSS_KIMG}" ]]; then
+  loss_seed_kimg="${loss_seed_kimg},${EXTRA_LOSS_KIMG}"
+fi
+fid_kimg_list="$(append_unique_kimg_csv "${FID_MANIFEST}" "${final_kimg}" "${fid_seed_kimg}")"
+loss_kimg_list="$(append_unique_kimg_csv "${LOSS_MANIFEST}" "${final_kimg}" "${loss_seed_kimg}")"
 
 echo "[INFO] Rebuilding loss manifest for kimg: ${loss_kimg_list}"
 python "${ROOT_DIR}/scripts/build_cifar_cdro_fid_manifest.py" \
@@ -223,7 +250,8 @@ python "${ROOT_DIR}/scripts/build_cifar_cdro_fid_manifest.py" \
   --batch-size 1024 \
   --seed 0 \
   --train-percent-label "20%" \
-  --ref-path "${PYTORCH_FID_REF}"
+  --ref-path "${PYTORCH_FID_REF}" \
+  "${build_manifest_flop_args[@]}"
 
 restore_loss_probe_paths
 
@@ -261,7 +289,8 @@ python "${ROOT_DIR}/scripts/build_cifar_cdro_fid_manifest.py" \
   --batch-size 1024 \
   --seed 0 \
   --train-percent-label "20%" \
-  --ref-path "${PYTORCH_FID_REF}"
+  --ref-path "${PYTORCH_FID_REF}" \
+  "${build_manifest_flop_args[@]}"
 
 echo "[INFO] Running posthoc FID; existing rows should be reused"
 python "${ROOT_DIR}/scripts/run_cifar_fid_manifest.py" \

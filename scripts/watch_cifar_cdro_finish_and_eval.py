@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-compare-csv", type=str, default=DEFAULT_BASE_COMPARE_CSV)
     parser.add_argument("--merged-compare-csv", type=str, default=DEFAULT_MERGED_COMPARE_CSV)
     parser.add_argument("--merged-summary-json", type=str, default=DEFAULT_MERGED_SUMMARY_JSON)
+    parser.add_argument("--flop-calibration-json", type=str, default="")
     parser.add_argument("--env-mode", type=str, default="venv")
     parser.add_argument("--venv-dir", type=str, default=DEFAULT_VENV_DIR)
     parser.add_argument("--install-deps", type=str, default="0")
@@ -183,6 +184,8 @@ def build_cdro_manifest(args: argparse.Namespace, run_dir: Path, outdir: Path) -
         "--summary-name",
         str(args.manifest_summary_name),
     ]
+    if str(args.flop_calibration_json).strip():
+        cmd.extend(["--flop-calibration-json", str(args.flop_calibration_json)])
     run_subprocess(cmd)
     return outdir / str(args.manifest_name)
 

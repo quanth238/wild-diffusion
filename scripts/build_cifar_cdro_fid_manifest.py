@@ -23,6 +23,7 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     cdro_robust_step_compute_be,
     cdro_robust_step_weighted_compute_units,
     flop_calibration_from_path,
+    flop_metadata_fields,
     load_warmup_summary,
 )
 
@@ -230,6 +231,7 @@ def build_rows(args: argparse.Namespace):
     cdro_config = dict(budget_plan.get("cdro_config", {}))
     calibration = calibration_from_path(args.calibration_json)
     flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
+    flop_metadata = flop_metadata_fields(flop_calibration)
     warmup_summary = load_warmup_summary(args.summary_json)
     trace = load_stats_trace(cdro_run_dir / "stats.jsonl")
     requested_kimg = parse_kimg_list(args.kimg)
@@ -368,6 +370,7 @@ def build_rows(args: argparse.Namespace):
                     if total_train_flops is not None
                     else ""
                 ),
+                **flop_metadata,
                 "weighted_compute_source": "cifar_calibration_cdro_path_primitive_counts",
                 "warmup_steps_fixed": float(warmup_compute_be),
                 "robust_steps_observed": float(robust_steps),
@@ -433,6 +436,7 @@ def build_rows(args: argparse.Namespace):
             None if baseline_step_train_flops is None else float(baseline_step_train_flops)
         ),
         "robust_step_train_flops": None if robust_step_flops is None else float(robust_step_flops),
+        "flop_metadata": flop_metadata,
         "snapshot_kimg": [int(value) for value in snapshot_kimg],
         "budget_plan_path": str(budget_plan_path),
         "budget_plan": budget_plan,

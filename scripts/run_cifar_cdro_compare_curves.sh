@@ -10,6 +10,7 @@ EVAL_SWEEP_ROOT="${EVAL_SWEEP_ROOT:?EVAL_SWEEP_ROOT is required}"
 VENV_DIR="${VENV_DIR:-/home/bachlc/.venvs/wild-diffusion-h100}"
 BASE_COMPARE_CSV="${BASE_COMPARE_CSV:-/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/cifar10_baseline_vs_wdro_coarse_20260414_three_method_compare.csv}"
 PYTORCH_FID_REF="${PYTORCH_FID_REF:-${ROOT_DIR}/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/pytorch_fid_cifar10_train_ref_stats.npz}"
+FLOP_CALIBRATION_JSON="${FLOP_CALIBRATION_JSON:-}"
 TRAIN_PERCENT_LABEL="${TRAIN_PERCENT_LABEL:-20%}"
 DATASET_LABEL="${DATASET_LABEL:-CIFAR-10}"
 PLOT_TAG="${PLOT_TAG:-cdro}"
@@ -37,6 +38,10 @@ if [[ ! -f "${BASE_COMPARE_CSV}" ]]; then
 fi
 if [[ ! -f "${PYTORCH_FID_REF}" ]]; then
   echo "[ERROR] Missing pytorch-fid reference stats: ${PYTORCH_FID_REF}"
+  exit 1
+fi
+if [[ -n "${FLOP_CALIBRATION_JSON}" && ! -f "${FLOP_CALIBRATION_JSON}" ]]; then
+  echo "[ERROR] Missing FLOP calibration JSON: ${FLOP_CALIBRATION_JSON}"
   exit 1
 fi
 
@@ -111,11 +116,16 @@ mkdir -p "${LOSS_OUTDIR}" "${FID_OUTDIR}"
 
 LOSS_KIMG_LIST="$(select_snapshot_kimg "${RUN_DIR}" "${LOSS_POINTS_MAX}")"
 FID_KIMG_LIST="$(select_snapshot_kimg "${RUN_DIR}" "${FID_POINTS_MAX}")"
+build_manifest_flop_args=()
+if [[ -n "${FLOP_CALIBRATION_JSON}" ]]; then
+  build_manifest_flop_args=(--flop-calibration-json "${FLOP_CALIBRATION_JSON}")
+fi
 
 echo "[INFO] Starting posthoc compare-curve generation on $(hostname)"
 echo "[INFO] RUN_DIR: ${RUN_DIR}"
 echo "[INFO] EVAL_SWEEP_ROOT: ${EVAL_SWEEP_ROOT}"
 echo "[INFO] PLOT_TAG: ${PLOT_TAG}"
+echo "[INFO] FLOP_CALIBRATION_JSON: ${FLOP_CALIBRATION_JSON:-none}"
 echo "[INFO] LOSS_KIMG_LIST: ${LOSS_KIMG_LIST}"
 echo "[INFO] FID_KIMG_LIST: ${FID_KIMG_LIST}"
 date -u
@@ -131,7 +141,8 @@ python "${ROOT_DIR}/scripts/build_cifar_cdro_fid_manifest.py" \
   --batch-size 1024 \
   --seed 0 \
   --train-percent-label "${TRAIN_PERCENT_LABEL}" \
-  --ref-path "${PYTORCH_FID_REF}"
+  --ref-path "${PYTORCH_FID_REF}" \
+  "${build_manifest_flop_args[@]}"
 
 echo "[INFO] Running dense loss probes"
 python "${ROOT_DIR}/scripts/run_cifar_loss_probe_manifest.py" \
@@ -168,7 +179,8 @@ python "${ROOT_DIR}/scripts/build_cifar_cdro_fid_manifest.py" \
   --batch-size 1024 \
   --seed 0 \
   --train-percent-label "${TRAIN_PERCENT_LABEL}" \
-  --ref-path "${PYTORCH_FID_REF}"
+  --ref-path "${PYTORCH_FID_REF}" \
+  "${build_manifest_flop_args[@]}"
 
 echo "[INFO] Running coarse FID evals"
 python "${ROOT_DIR}/scripts/run_cifar_fid_manifest.py" \

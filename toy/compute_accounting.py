@@ -258,6 +258,79 @@ def _flop_stat_value(payload: Optional[Dict[str, Any]], op_name: str) -> Optiona
     return None
 
 
+DEFAULT_INPUTGRAD_FORWARD_FLOP_MULTIPLIER = 2.0
+DEFAULT_PARAMBACKWARD_FORWARD_FLOP_MULTIPLIER = 3.0
+
+
+def _flop_values_from_group(payload: Dict[str, Any], group_name: str) -> Optional[Dict[str, Any]]:
+    group = payload.get(group_name)
+    if not isinstance(group, dict):
+        return None
+    forward_value = _flop_stat_value(group, "forward_only")
+    inputgrad_value = _flop_stat_value(group, "forward_plus_inputgrad")
+    parambackward_value = _flop_stat_value(group, "forward_plus_parambackward")
+    if (
+        forward_value is None
+        or forward_value <= 0.0
+        or inputgrad_value is None
+        or inputgrad_value <= 0.0
+        or parambackward_value is None
+        or parambackward_value <= 0.0
+    ):
+        return None
+    return {
+        "forward_flops": float(forward_value),
+        "inputgrad_flops": float(inputgrad_value),
+        "parambackward_flops": float(parambackward_value),
+        "flop_cost_group": str(group_name),
+        "flop_cost_source": str(group.get("source", group_name)),
+        "flop_definition": str(group.get("definition", "")),
+    }
+
+
+def _flop_values_from_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for group_name in ("training_flops", "analytical_training_flops", "flop_costs"):
+        values = _flop_values_from_group(payload, group_name)
+        if values is not None:
+            return values
+
+    forward_value = _flop_stat_value(payload, "forward_only")
+    if forward_value is None or forward_value <= 0.0:
+        return None
+
+    # torch.profiler's CUDA FLOP attribution is useful for forward convolutions,
+    # but it commonly undercounts autograd backward kernels. For image
+    # calibration payloads generated before `training_flops` existed, synthesize
+    # the conventional training costs from the measured forward pass: input-grad
+    # is forward+backward-to-input (~2x), and parameter-backward training is
+    # forward+activation/weight backward (~3x).
+    if str(payload.get("format", "")).strip() == "image_flop_calibration_v1":
+        return {
+            "forward_flops": float(forward_value),
+            "inputgrad_flops": float(forward_value) * DEFAULT_INPUTGRAD_FORWARD_FLOP_MULTIPLIER,
+            "parambackward_flops": float(forward_value) * DEFAULT_PARAMBACKWARD_FORWARD_FLOP_MULTIPLIER,
+            "flop_cost_group": "training_flops_synthesized",
+            "flop_cost_source": "analytical_training_from_profiler_forward_legacy_payload",
+            "flop_definition": (
+                "Measured forward-only torch.profiler FLOPs; input-gradient "
+                "primitive = 2x forward; parameter-backward training primitive = 3x forward."
+            ),
+        }
+
+    inputgrad_value = _flop_stat_value(payload, "forward_plus_inputgrad")
+    parambackward_value = _flop_stat_value(payload, "forward_plus_parambackward")
+    if inputgrad_value is None or inputgrad_value <= 0.0 or parambackward_value is None or parambackward_value <= 0.0:
+        return None
+    return {
+        "forward_flops": float(forward_value),
+        "inputgrad_flops": float(inputgrad_value),
+        "parambackward_flops": float(parambackward_value),
+        "flop_cost_group": "flops",
+        "flop_cost_source": "profiler_supported_operator_flops",
+        "flop_definition": "Raw profiler-supported operator FLOPs from the calibration payload.",
+    }
+
+
 def resolve_default_weighted_compute_calibration_path(
     *,
     calibration_path: str = "",
@@ -444,7 +517,12 @@ def load_flop_calibration(
             "forward_flops": float(explicit_forward),
             "inputgrad_flops": float(explicit_inputgrad),
             "parambackward_flops": float(explicit_parambackward),
+            "inputgrad_forward_multiplier": float(explicit_inputgrad) / float(explicit_forward),
+            "parambackward_forward_multiplier": float(explicit_parambackward) / float(explicit_forward),
             "source": "explicit_cli",
+            "flop_cost_group": "explicit_cli",
+            "flop_cost_source": "explicit_cli",
+            "flop_definition": "Explicit per-batch denoiser FLOP costs supplied by the caller.",
             "calibration_path": None,
             "payload": None,
             "compatibility": {
@@ -479,21 +557,12 @@ def load_flop_calibration(
 
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    forward_value = _flop_stat_value(payload, "forward_only")
-    inputgrad_value = _flop_stat_value(payload, "forward_plus_inputgrad")
-    parambackward_value = _flop_stat_value(payload, "forward_plus_parambackward")
-    if (
-        forward_value is None
-        or forward_value <= 0.0
-        or inputgrad_value is None
-        or inputgrad_value <= 0.0
-        or parambackward_value is None
-        or parambackward_value <= 0.0
-    ):
+    flop_values = _flop_values_from_payload(payload)
+    if flop_values is None:
         raise RuntimeError(
             f"Invalid FLOP calibration payload at {path}: "
-            "expected positive per-batch FLOP values for forward_only, "
-            "forward_plus_inputgrad, and forward_plus_parambackward."
+            "expected positive per-batch FLOP values for training_flops "
+            "or profiler forward_only/forward_plus_* entries."
         )
     compatibility = calibration_compatibility_report(
         payload=payload,
@@ -522,10 +591,15 @@ def load_flop_calibration(
         )
     return {
         "available": True,
-        "forward_flops": float(forward_value),
-        "inputgrad_flops": float(inputgrad_value),
-        "parambackward_flops": float(parambackward_value),
+        "forward_flops": float(flop_values["forward_flops"]),
+        "inputgrad_flops": float(flop_values["inputgrad_flops"]),
+        "parambackward_flops": float(flop_values["parambackward_flops"]),
+        "inputgrad_forward_multiplier": float(flop_values["inputgrad_flops"]) / float(flop_values["forward_flops"]),
+        "parambackward_forward_multiplier": float(flop_values["parambackward_flops"]) / float(flop_values["forward_flops"]),
         "source": "calibration_json",
+        "flop_cost_group": str(flop_values["flop_cost_group"]),
+        "flop_cost_source": str(flop_values["flop_cost_source"]),
+        "flop_definition": str(flop_values["flop_definition"]),
         "calibration_path": os.path.abspath(path),
         "payload": payload,
         "compatibility": compatibility,
