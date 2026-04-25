@@ -184,6 +184,21 @@ def parse_ncu_raw_csv(path: str | Path) -> List[Dict[str, str]]:
     return rows
 
 
+def read_text_tail(path: str | Path, *, max_chars: int = 8000) -> str:
+    raw_path = Path(path)
+    if not raw_path.is_file():
+        return ""
+    text = raw_path.read_text(encoding="utf-8", errors="replace")
+    return text[-int(max_chars) :]
+
+
+def ncu_raw_log_flags(text: str) -> Dict[str, bool]:
+    return {
+        "permission_error": "ERR_NVGPUCTRPERM" in str(text),
+        "no_kernels_profiled": "No kernels were profiled" in str(text),
+    }
+
+
 def summarize_ncu_raw_rows(
     rows: List[Dict[str, str]],
     *,
@@ -276,15 +291,18 @@ def build_ncu_command(
     report_path: Path,
     metrics: List[str],
 ) -> List[str]:
+    nvtx_include = str(nvtx_range)
+    if not nvtx_include.endswith("/"):
+        nvtx_include = f"{nvtx_include}/"
     command = [
         str(ncu_bin),
         "--target-processes",
-        "application-only",
+        "all",
         "--profile-from-start",
         "on",
         "--nvtx",
         "--nvtx-include",
-        str(nvtx_range),
+        nvtx_include,
         "--replay-mode",
         str(args.replay_mode),
         "--cache-control",
@@ -297,8 +315,6 @@ def build_ncu_command(
         "--print-units",
         "base",
         "--print-fp",
-        "--print-metric-name",
-        "name",
         "--log-file",
         str(raw_csv_path),
         "-f",
@@ -427,13 +443,27 @@ def main() -> None:
             op_payload["stderr_tail"] = proc.stderr[-4000:]
             if proc.returncode != 0:
                 had_error = True
+            raw_log_tail = read_text_tail(raw_csv_path)
+            raw_log_flags = ncu_raw_log_flags(raw_log_tail)
             rows = parse_ncu_raw_csv(raw_csv_path)
             summary = summarize_ncu_raw_rows(rows, flop_equivalent_metrics=metrics)
             op_payload["summary"] = summary
+            op_payload["raw_log_tail"] = raw_log_tail
+            op_payload["ncu_permission_error"] = bool(raw_log_flags["permission_error"])
+            op_payload["ncu_no_kernels_profiled"] = bool(raw_log_flags["no_kernels_profiled"])
             value = summary.get("kernel_instruction_flop_equivalent_per_profiled_range")
             op_payload["kernel_instruction_flop_equivalent_per_batch"] = (
                 None if value is None else float(value) / float(max(int(args.measure_iters), 1))
             )
+            if raw_log_flags["permission_error"]:
+                op_payload["status"] = "permission_denied"
+                had_error = True
+            elif raw_log_flags["no_kernels_profiled"]:
+                op_payload["status"] = "no_kernels_profiled"
+                had_error = True
+            elif int(summary.get("num_selected_metric_rows", 0)) <= 0:
+                op_payload["status"] = "no_selected_metrics"
+                had_error = True
         payload["operations"][operation] = op_payload
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")

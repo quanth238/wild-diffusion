@@ -4,6 +4,7 @@ from pathlib import Path
 
 from scripts.profile_cifar_ncu_flops import (
     DEFAULT_NCU_FLOP_EQUIVALENT_METRICS,
+    ncu_raw_log_flags,
     parse_ncu_raw_csv,
     summarize_ncu_raw_rows,
 )
@@ -28,6 +29,12 @@ class ProfileCifarNcuFlopsTest(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(summary["num_selected_metric_rows"], 2)
         self.assertEqual(summary["kernel_instruction_flop_equivalent_per_profiled_range"], 2148.0)
+
+    def test_ncu_raw_log_flags_detect_permission_and_empty_profile(self) -> None:
+        text = "==ERROR== ERR_NVGPUCTRPERM\n==WARNING== No kernels were profiled.\n"
+        flags = ncu_raw_log_flags(text)
+        self.assertTrue(flags["permission_error"])
+        self.assertTrue(flags["no_kernels_profiled"])
 
 
 if __name__ == "__main__":
