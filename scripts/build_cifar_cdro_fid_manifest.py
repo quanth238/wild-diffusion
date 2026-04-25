@@ -24,6 +24,7 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     cdro_robust_step_weighted_compute_units,
     flop_calibration_from_path,
     flop_metadata_fields,
+    hardware_flop_diagnostic_metadata_fields,
     load_warmup_summary,
 )
 
@@ -40,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-json", type=str, default=DEFAULT_WDRO_SUMMARY_JSON)
     parser.add_argument("--calibration-json", type=str, default=DEFAULT_CALIBRATION_JSON)
     parser.add_argument("--flop-calibration-json", type=str, default=DEFAULT_FLOP_CALIBRATION_JSON)
+    parser.add_argument("--hardware-flop-diagnostic-json", type=str, default="")
     parser.add_argument("--outdir", type=str, default="")
     parser.add_argument("--manifest-name", type=str, default="cifar10_cdro_budget_manifest.csv")
     parser.add_argument("--summary-name", type=str, default="cifar10_cdro_budget_manifest_summary.json")
@@ -235,6 +237,7 @@ def build_rows(args: argparse.Namespace):
         batch_size=args.batch_size,
     )
     flop_metadata = flop_metadata_fields(flop_calibration)
+    hardware_flop_metadata = hardware_flop_diagnostic_metadata_fields(args.hardware_flop_diagnostic_json)
     warmup_summary = load_warmup_summary(args.summary_json)
     trace = load_stats_trace(cdro_run_dir / "stats.jsonl")
     requested_kimg = parse_kimg_list(args.kimg)
@@ -374,6 +377,7 @@ def build_rows(args: argparse.Namespace):
                     else ""
                 ),
                 **flop_metadata,
+                **hardware_flop_metadata,
                 "weighted_compute_source": "cifar_calibration_cdro_path_primitive_counts",
                 "warmup_steps_fixed": float(warmup_compute_be),
                 "robust_steps_observed": float(robust_steps),
@@ -429,6 +433,11 @@ def build_rows(args: argparse.Namespace):
         "flop_calibration_json": (
             str(Path(args.flop_calibration_json).resolve()) if str(args.flop_calibration_json).strip() else None
         ),
+        "hardware_flop_diagnostic_json": (
+            str(Path(args.hardware_flop_diagnostic_json).resolve())
+            if str(args.hardware_flop_diagnostic_json).strip()
+            else None
+        ),
         "summary_json": str(Path(args.summary_json).resolve()),
         "warmup_summary": warmup_summary,
         "cdro_config": cdro_config,
@@ -440,6 +449,7 @@ def build_rows(args: argparse.Namespace):
         ),
         "robust_step_train_flops": None if robust_step_flops is None else float(robust_step_flops),
         "flop_metadata": flop_metadata,
+        "hardware_flop_metadata": hardware_flop_metadata,
         "snapshot_kimg": [int(value) for value in snapshot_kimg],
         "budget_plan_path": str(budget_plan_path),
         "budget_plan": budget_plan,

@@ -344,3 +344,66 @@ def flop_metadata_fields(calibration: Dict) -> Dict[str, object]:
         "train_flop_inputgrad_forward_multiplier": float(calibration["inputgrad_forward_multiplier"]),
         "train_flop_parambackward_forward_multiplier": float(calibration["parambackward_forward_multiplier"]),
     }
+
+
+def hardware_flop_diagnostic_metadata_fields(diagnostic_json: str = "") -> Dict[str, object]:
+    fields = {
+        "train_hardware_flop_diagnostic_path": "",
+        "train_hardware_flop_diagnostic_source": "",
+        "train_hardware_flop_diagnostic_definition": "",
+        "train_hardware_flop_diagnostic_role": "",
+        "train_hardware_flop_diagnostic_not_primary": "",
+        "train_hardware_flop_diagnostic_ncu_version": "",
+        "train_hardware_forward_flop_equivalent_per_batch": "",
+        "train_hardware_inputgrad_flop_equivalent_per_batch": "",
+        "train_hardware_parambackward_flop_equivalent_per_batch": "",
+    }
+    path_text = str(diagnostic_json).strip()
+    if not path_text:
+        return fields
+
+    path = Path(path_text).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Nsight Compute diagnostic JSON not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if str(payload.get("format", "")).strip() != "image_ncu_hardware_flop_diagnostic_v1":
+        raise RuntimeError(f"Unsupported Nsight Compute diagnostic payload format: {path}")
+
+    semantics = payload.get("semantics", {})
+    ncu = payload.get("ncu", {})
+    operations = payload.get("operations", {})
+    if not isinstance(semantics, dict):
+        semantics = {}
+    if not isinstance(ncu, dict):
+        ncu = {}
+    if not isinstance(operations, dict):
+        operations = {}
+    if bool(semantics.get("not_primary_method_compute")) is not True:
+        raise RuntimeError(
+            "Nsight Compute diagnostic JSON must explicitly set "
+            "semantics.not_primary_method_compute=true before it can be attached to manifests."
+        )
+
+    def _op_value(op_name: str):
+        op_payload = operations.get(op_name, {})
+        if not isinstance(op_payload, dict):
+            return ""
+        value = op_payload.get("kernel_instruction_flop_equivalent_per_batch")
+        if value in (None, ""):
+            return ""
+        return float(value)
+
+    fields.update(
+        {
+            "train_hardware_flop_diagnostic_path": str(path),
+            "train_hardware_flop_diagnostic_source": "nvidia_nsight_compute_kernel_instruction_diagnostic",
+            "train_hardware_flop_diagnostic_definition": str(semantics.get("definition", "")),
+            "train_hardware_flop_diagnostic_role": str(semantics.get("role", "")),
+            "train_hardware_flop_diagnostic_not_primary": True,
+            "train_hardware_flop_diagnostic_ncu_version": str(ncu.get("version_stdout", "")),
+            "train_hardware_forward_flop_equivalent_per_batch": _op_value("forward_only"),
+            "train_hardware_inputgrad_flop_equivalent_per_batch": _op_value("forward_plus_inputgrad"),
+            "train_hardware_parambackward_flop_equivalent_per_batch": _op_value("forward_plus_parambackward"),
+        }
+    )
+    return fields

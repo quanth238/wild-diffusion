@@ -219,5 +219,8 @@ The repo now has separate calibration scripts for the CIFAR image stack:
 
 - Weighted compute ratios: `python scripts/calibrate_cifar_weighted_compute.py --out-json training-runs/compute_calibration/cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_weighted.json`
 - FLOP calibration for `TFLOPs` / `PFLOPs` manifest columns: `python scripts/calibrate_cifar_flops.py --out-json training-runs/compute_calibration/cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_flops.json`
+- Optional Nsight Compute kernel diagnostic: `python scripts/profile_cifar_ncu_flops.py --out-json training-runs/compute_diagnostics/cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_ncu.json`
 
 The FLOP script uses `torch.profiler` operator FLOP accounting on the same three primitive denoiser operations used by the WCU pipeline: `forward_only`, `forward_plus_inputgrad`, and `forward_plus_parambackward`.
+
+Use the FLOP calibration output for paper `TFLOPs` / `PFLOPs`. The Nsight Compute output is a secondary hardware/kernel diagnostic based on selected derived instruction-equivalent metrics inside NVTX-marked ranges; pass it to manifest builders with `--hardware-flop-diagnostic-json` when you want provenance columns in the CSV, not when choosing the main compute axis.

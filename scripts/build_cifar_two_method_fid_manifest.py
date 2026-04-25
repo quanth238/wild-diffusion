@@ -24,6 +24,7 @@ from scripts.cifar_cdro_budget_utils import (  # noqa: E402
     baseline_step_flops,
     flop_calibration_from_path,
     flop_metadata_fields,
+    hardware_flop_diagnostic_metadata_fields,
     wdro_robust_step_flops,
 )
 
@@ -60,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wdro-run-dir", type=str, default=DEFAULT_WDRO_RUN_DIR)
     parser.add_argument("--calibration-json", type=str, default=DEFAULT_CALIBRATION_JSON)
     parser.add_argument("--flop-calibration-json", type=str, default=DEFAULT_FLOP_CALIBRATION_JSON)
+    parser.add_argument("--hardware-flop-diagnostic-json", type=str, default="")
     parser.add_argument("--outdir", type=str, default=DEFAULT_OUTDIR)
     parser.add_argument("--manifest-name", type=str, default="cifar10_baseline_vs_wdro_coarse_manifest.csv")
     parser.add_argument("--summary-name", type=str, default="cifar10_baseline_vs_wdro_coarse_manifest_summary.json")
@@ -198,6 +200,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         batch_size=args.batch_size,
     )
     flop_metadata = flop_metadata_fields(flop_calibration)
+    hardware_flop_metadata = hardware_flop_diagnostic_metadata_fields(args.hardware_flop_diagnostic_json)
 
     baseline_trace = load_stats_trace(baseline_run_dir / "stats.jsonl")
     wdro_trace = load_stats_trace(wdro_run_dir / "stats.jsonl")
@@ -298,6 +301,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                     else ""
                 ),
                 **flop_metadata,
+                **hardware_flop_metadata,
                 "weighted_compute_source": "cifar_calibration_baseline",
                 "warmup_steps_fixed": float(compute_be),
                 "robust_steps_observed": 0.0,
@@ -378,6 +382,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
                     else ""
                 ),
                 **flop_metadata,
+                **hardware_flop_metadata,
                 "weighted_compute_source": "cifar_calibration_expected_wdro",
                 "warmup_steps_fixed": float(warmup_boundary_be),
                 "robust_steps_observed": float(robust_steps),
@@ -405,6 +410,11 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
         "flop_calibration_json": (
             str(Path(args.flop_calibration_json).resolve()) if str(args.flop_calibration_json).strip() else None
         ),
+        "hardware_flop_diagnostic_json": (
+            str(Path(args.hardware_flop_diagnostic_json).resolve())
+            if str(args.hardware_flop_diagnostic_json).strip()
+            else None
+        ),
         "train_percent_label": str(args.train_percent_label),
         "seed": int(args.seed),
         "warmup_boundary_kimg": warmup_boundary_kimg,
@@ -424,6 +434,7 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
             None if robust_flops_per_step is None else float(robust_flops_per_step)
         ),
         "flop_metadata": flop_metadata,
+        "hardware_flop_metadata": hardware_flop_metadata,
         "baseline_kimg_grid": baseline_kimg_grid,
         "wdro_kimg_grid": wdro_kimg_grid,
         "num_rows": len(rows),
