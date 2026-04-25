@@ -193,7 +193,10 @@ def build_manifest_rows(args: argparse.Namespace) -> Tuple[List[Dict[str, object
     calibration = load_weighted_compute_calibration(calibration_path=args.calibration_json)
     if not calibration.get("available", False):
         raise RuntimeError(f"Weighted-compute calibration is unavailable: {args.calibration_json}")
-    flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
+    flop_calibration = flop_calibration_from_path(
+        args.flop_calibration_json,
+        batch_size=args.batch_size,
+    )
     flop_metadata = flop_metadata_fields(flop_calibration)
 
     baseline_trace = load_stats_trace(baseline_run_dir / "stats.jsonl")

@@ -37,7 +37,10 @@ DEFAULT_CALIBRATION_JSON = (
     "/home/bachlc/GM-CDRO/training-runs/compute_calibration/"
     "cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_20260414.json"
 )
-DEFAULT_FLOP_CALIBRATION_JSON = ""
+DEFAULT_FLOP_CALIBRATION_JSON = (
+    "/home/bachlc/GM-CDRO/training-runs/compute_calibration/"
+    "cifar10_32x32_ddpmpp_wdroedm_fp16_b1024_h100_flops_20260425T070824Z.json"
+)
 DEFAULT_PYTORCH_FID_REF = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
     "pytorch_fid_cifar10_train_ref_stats.npz"
@@ -288,14 +291,39 @@ def calibration_from_path(calibration_json: str) -> Dict:
     return calibration
 
 
-def flop_calibration_from_path(calibration_json: str) -> Dict:
-    calibration = load_flop_calibration(calibration_path=calibration_json)
+def flop_calibration_from_path(
+    calibration_json: str,
+    *,
+    batch_size: int | None = 1024,
+    image_backbone: str | None = "ddpmpp",
+    hidden_dim: int | None = 128,
+    image_size: int | None = 32,
+    image_channels: int | None = 3,
+    device: str | None = "cuda",
+    amp_dtype: str | None = "float16",
+    allow_tf32: bool | None = False,
+    cudnn_benchmark: bool | None = True,
+) -> Dict:
+    calibration = load_flop_calibration(
+        calibration_path=calibration_json,
+        training_objective="edm",
+        image_backbone=image_backbone,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        image_size=image_size,
+        image_channels=image_channels,
+        device=device,
+        amp_dtype=amp_dtype,
+        allow_tf32=allow_tf32,
+        cudnn_benchmark=cudnn_benchmark,
+    )
     return calibration if isinstance(calibration, dict) else {"available": False}
 
 
 def flop_metadata_fields(calibration: Dict) -> Dict[str, object]:
     if not isinstance(calibration, dict) or not calibration.get("available", False):
         return {
+            "train_flop_calibration_path": "",
             "train_flop_cost_source": "",
             "train_flop_cost_group": "",
             "train_flop_definition": "",
@@ -306,6 +334,7 @@ def flop_metadata_fields(calibration: Dict) -> Dict[str, object]:
             "train_flop_parambackward_forward_multiplier": "",
         }
     return {
+        "train_flop_calibration_path": str(calibration.get("calibration_path", "")),
         "train_flop_cost_source": str(calibration.get("flop_cost_source", "")),
         "train_flop_cost_group": str(calibration.get("flop_cost_group", "")),
         "train_flop_definition": str(calibration.get("flop_definition", "")),

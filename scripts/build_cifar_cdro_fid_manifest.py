@@ -230,7 +230,10 @@ def build_rows(args: argparse.Namespace):
     budget_plan = json.loads(budget_plan_path.read_text(encoding="utf-8"))
     cdro_config = dict(budget_plan.get("cdro_config", {}))
     calibration = calibration_from_path(args.calibration_json)
-    flop_calibration = flop_calibration_from_path(args.flop_calibration_json)
+    flop_calibration = flop_calibration_from_path(
+        args.flop_calibration_json,
+        batch_size=args.batch_size,
+    )
     flop_metadata = flop_metadata_fields(flop_calibration)
     warmup_summary = load_warmup_summary(args.summary_json)
     trace = load_stats_trace(cdro_run_dir / "stats.jsonl")

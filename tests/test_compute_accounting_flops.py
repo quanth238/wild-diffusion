@@ -9,6 +9,7 @@ from toy.compute_accounting import (
     flops_to_pflops,
     flops_to_tflops,
     load_flop_calibration,
+    load_weighted_compute_calibration,
 )
 
 
@@ -96,6 +97,20 @@ class ComputeAccountingFlopsTest(unittest.TestCase):
         self.assertEqual(calibration["inputgrad_flops"], 202.0)
         self.assertEqual(calibration["parambackward_flops"], 303.0)
         self.assertEqual(calibration["flop_cost_group"], "training_flops")
+
+    def test_weighted_calibration_rejects_flop_payload_ratios(self) -> None:
+        payload = {
+            "format": "image_flop_calibration_v1",
+            "ratios": {
+                "inputgrad_alpha": 1.01,
+                "parambackward_beta": 1.02,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "flops.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "cannot be used as weighted-compute"):
+                load_weighted_compute_calibration(calibration_path=str(path))
 
     def test_denoiser_flops_from_count_record_honors_override_forward_count(self) -> None:
         calibration = load_flop_calibration(

@@ -435,6 +435,10 @@ def load_weighted_compute_calibration(
 
     with open(path, "r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    if str(payload.get("format", "")).strip() == "image_flop_calibration_v1":
+        raise RuntimeError(
+            f"FLOP calibration payload cannot be used as weighted-compute calibration: {os.path.abspath(path)}"
+        )
     ratios = payload.get("ratios", payload)
     alpha = _safe_float(ratios.get("inputgrad_alpha"))
     beta = _safe_float(ratios.get("parambackward_beta"))
