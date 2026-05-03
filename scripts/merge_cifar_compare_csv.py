@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 
+from comparison_outputs import mirror_many
+
 
 DEFAULT_BASE_COMPARE_CSV = (
     "/home/bachlc/GM-CDRO/training-runs/fid-sweeps/cifar10_baseline_vs_wdro_coarse_20260414/"
@@ -24,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cdro-manifest-csv", type=str, required=True)
     parser.add_argument("--out-csv", type=str, required=True)
     parser.add_argument("--out-summary-json", type=str, default="")
+    parser.add_argument("--comparison-graphs-dir", type=str, default="")
+    parser.add_argument("--no-comparison-graph-mirror", action="store_true")
     parser.add_argument(
         "--cdro-row-mode",
         type=str,
@@ -171,6 +175,14 @@ def main() -> None:
         out_summary_json.parent.mkdir(parents=True, exist_ok=True)
         out_summary_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"[merge-compare] wrote {out_summary_json}")
+
+    if not args.no_comparison_graph_mirror:
+        artifacts = [out_csv]
+        if out_summary_json is not None:
+            artifacts.append(out_summary_json)
+        comparison_dir = Path(args.comparison_graphs_dir).resolve() if str(args.comparison_graphs_dir).strip() else None
+        for source, dest in mirror_many(artifacts, comparison_dir=comparison_dir):
+            print(f"[merge-compare] mirrored {source} -> {dest}")
 
 
 if __name__ == "__main__":

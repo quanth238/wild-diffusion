@@ -28,3 +28,18 @@ Compatibility note:
 
 - Root `run_toy_once.sh` and `run_image_once.sh` are compatibility shims. Use the `toy/scripts/` copies as the canonical paths.
 - Root `cli.py`, `experiment.py`, `method.py`, and `registry.py` are legacy copies, not the main path used by the current scripts.
+
+## Lightweight Comparison Graphs
+
+Use `comparison-graphs/` to browse paper/result plots without expanding heavy training outputs.
+
+- Refresh the lightweight graph workspace after new runs:
+
+  ```bash
+  python scripts/sync_comparison_graphs.py
+  ```
+
+- CIFAR comparison merge/plot scripts mirror their PNG/CSV/JSON outputs there automatically.
+- Canonical run artifacts remain under `training-runs/`; `comparison-graphs/by-source/` contains symlinks or small copies only.
+- In VS Code, open `/home/bachlc/GM-CDRO/comparison-graphs` when reviewing plots. Avoid opening or expanding `training-runs/` unless you need raw run artifacts.
+

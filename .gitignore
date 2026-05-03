@@ -144,3 +144,5 @@ toy-runs/
 training-runs/
 toy_data/
 .tmp/simpsons-mnist-src/
+# Lightweight generated comparison browsing workspace
+comparison-graphs/

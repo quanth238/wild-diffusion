@@ -7,6 +7,8 @@ from typing import Dict, List, Sequence
 
 import matplotlib.pyplot as plt
 
+from comparison_outputs import mirror_many
+
 
 STYLE = {
     "baseline": {"label": "Baseline EDM", "color": "tab:blue"},
@@ -48,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-label", type=str, default="CIFAR-10")
     parser.add_argument("--train-percent-label", type=str, default="20%")
     parser.add_argument("--baseline-zoom-start-kimg", type=float, default=20000.0)
+    parser.add_argument("--comparison-graphs-dir", type=str, default="")
+    parser.add_argument("--no-comparison-graph-mirror", action="store_true")
     parser.add_argument(
         "--x-axes",
         type=str,
@@ -272,6 +276,13 @@ def main() -> None:
         x_axes=x_axes,
     )
     print(f"[fid-zoom] wrote {out_png}")
+    if not args.no_comparison_graph_mirror:
+        artifacts = [out_png]
+        if out_csv is not None:
+            artifacts.append(out_csv)
+        comparison_dir = Path(args.comparison_graphs_dir).resolve() if str(args.comparison_graphs_dir).strip() else None
+        for source, dest in mirror_many(artifacts, comparison_dir=comparison_dir):
+            print(f"[fid-zoom] mirrored {source} -> {dest}")
 
 
 if __name__ == "__main__":

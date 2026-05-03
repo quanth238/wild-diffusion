@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 
+from comparison_outputs import mirror_many
+
 
 STYLE = {
     "baseline": {"label": "Baseline EDM", "color": "tab:blue"},
@@ -29,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-label", type=str, default="CIFAR-10")
     parser.add_argument("--train-percent-label", type=str, default="20%")
     parser.add_argument("--baseline-zoom-start-kimg", type=float, default=20000.0)
+    parser.add_argument("--comparison-graphs-dir", type=str, default="")
+    parser.add_argument("--no-comparison-graph-mirror", action="store_true")
     return parser.parse_args()
 
 
@@ -273,6 +277,13 @@ def main() -> None:
         baseline_zoom_start_kimg=float(args.baseline_zoom_start_kimg),
     )
     print(f"[loss-zoom] wrote {out_png}")
+    if not args.no_comparison_graph_mirror:
+        artifacts = [out_png]
+        if out_csv is not None:
+            artifacts.append(out_csv)
+        comparison_dir = Path(args.comparison_graphs_dir).resolve() if str(args.comparison_graphs_dir).strip() else None
+        for source, dest in mirror_many(artifacts, comparison_dir=comparison_dir):
+            print(f"[loss-zoom] mirrored {source} -> {dest}")
 
 
 if __name__ == "__main__":

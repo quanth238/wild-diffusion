@@ -342,6 +342,12 @@ if cdro_loss:
     print(f"[RESULT] Final loss row: kimg={last['snapshot_kimg']} clean_loss={float(loss):.9g}")
 PY
 
+echo "[INFO] Refreshing lightweight comparison graph workspace"
+python "${ROOT_DIR}/scripts/sync_comparison_graphs.py" \
+  --source-root "${FID_OUTDIR}" \
+  --source-root "${LOSS_OUTDIR}" \
+  --source-root "$(dirname "${BASE_COMPARE_CSV}")"
+
 echo "[OK] Completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "[OK] Loss plot: ${LOSS_PLOT_PNG}"
 echo "[OK] FID plot: ${FID_PLOT_PNG}"

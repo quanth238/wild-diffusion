@@ -19,3 +19,12 @@
 - Recheck live Slurm and tmux state before substantial deletions, and avoid touching paths used by active runs or current `/mnt/data` work.
 - Keep curve plots, compare summaries, manifest bookkeeping, and regenerated evaluation metadata unless the user explicitly requests their removal.
 - If it is ambiguous whether a file is disposable output or evaluation or sweep bookkeeping, preserve it by default and ask before deleting.
+
+## Lightweight Comparison Outputs
+
+- Keep canonical training and evaluation outputs in `training-runs/`, but do not use that tree as the browsing or agent workspace for plot review.
+- Mirror lightweight comparison artifacts into `comparison-graphs/` using `python scripts/sync_comparison_graphs.py` or `scripts/comparison_outputs.py`.
+- New comparison plot scripts should call `mirror_artifact()` or `mirror_many()` after writing PNG/PDF/SVG/CSV/JSON outputs, unless the user explicitly disables mirroring.
+- Do not copy checkpoints, arrays, generated samples, datasets, W&B state, or logs into `comparison-graphs/`.
+- For VS Code/Codex review, open `/home/bachlc/GM-CDRO/comparison-graphs` or `/home/bachlc/comparison-graphs.code-workspace` instead of `/home/bachlc` or the full `GM-CDRO` tree.
+
