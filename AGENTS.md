@@ -20,6 +20,13 @@
 - Keep curve plots, compare summaries, manifest bookkeeping, and regenerated evaluation metadata unless the user explicitly requests their removal.
 - If it is ambiguous whether a file is disposable output or evaluation or sweep bookkeeping, preserve it by default and ask before deleting.
 
+## Script Hygiene
+
+- Before moving, deleting, or renaming run scripts, check live Slurm jobs and avoid touching any script referenced by an active or recently submitted job.
+- Keep active sweep and resume scripts in `scripts/` while they are in use, especially scripts referenced by Slurm `Command=` fields or current logs.
+- Archive obsolete one-off run scripts only after their jobs have finished and their command lines are no longer needed for reproducibility.
+- Prefer repo-local script archives such as `scripts/archive/` for old GM-CDRO helpers rather than leaving project-specific scripts in `/home/bachlc`.
+
 ## Lightweight Comparison Outputs
 
 - Keep canonical training and evaluation outputs in `training-runs/`, but do not use that tree as the browsing or agent workspace for plot review.
@@ -27,4 +34,3 @@
 - New comparison plot scripts should call `mirror_artifact()` or `mirror_many()` after writing PNG/PDF/SVG/CSV/JSON outputs, unless the user explicitly disables mirroring.
 - Do not copy checkpoints, arrays, generated samples, datasets, W&B state, or logs into `comparison-graphs/`.
 - For VS Code/Codex review, open `/home/bachlc/GM-CDRO/comparison-graphs` or `/home/bachlc/comparison-graphs.code-workspace` instead of `/home/bachlc` or the full `GM-CDRO` tree.
-
